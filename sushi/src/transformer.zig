@@ -12860,6 +12860,9 @@ pub const ForwardCtx = struct {
     /// position only. Used by the Qwen MTP head, whose committed-history
     /// cache needs the trunk hidden at every verify/prefill position.
     capture_hidden_all: ?*mlx.mlx_array = null,
+    /// R64: false = leave the `capture_hidden` / `capture_hidden_all` copies lazy (an MTP verify evaluates
+    /// them in its round's batched eval); true = settle them at capture (prefill's memory bound).
+    capture_settle: bool = true,
     /// qwen4_exp: receives the PRE-mixer hyper-connection stream `[B, L,
     /// hc*hidden]` (all positions) — what the MTP head consumes.
     capture_stream_all: ?*mlx.mlx_array = null,
@@ -25817,7 +25820,9 @@ const MTP_COARSE_PAIRS_SOURCE =
     \\}
 ;
 var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var mtp_coarse_pairs_cfgs = QsaCfgCache(c_int, 1){};
+// R63: keyed by (rows, vocab rows): a vocab-prefix coarse head has fewer output rows.
+const MtpCoarsePairsKey = struct { rows: c_int, nout: c_int };
+var mtp_coarse_pairs_cfgs = QsaCfgCache(MtpCoarsePairsKey, 1){};
 
 pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, gs: u32) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or bits != 3 or gs != 64) return null;
@@ -25827,7 +25832,11 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
     const ws = mlx.getShape(w);
     const ss = mlx.getShape(sc);
     if (xs.len != 3 or xs[0] < 2 or xs[0] > 8 or xs[1] != 1 or xs[2] != 2560) return null;
-    if (!std.mem.eql(c_int, ws, &.{ 248320, 240 }) or !std.mem.eql(c_int, ss, &.{ 248320, 40 }) or !std.mem.eql(c_int, ss, mlx.getShape(bi))) return null;
+    // R63: any whole number of 8-row tiles (the full 248,320-row head or a vocab prefix).
+    if (ws.len != 2 or ss.len != 2) return null;
+    const nout = ws[0];
+    if (nout < 8 or @rem(nout, 8) != 0) return null;
+    if (ws[1] != 240 or ss[0] != nout or ss[1] != 40 or !std.mem.eql(c_int, ss, mlx.getShape(bi))) return null;
     const kernel = blk: {
         if (mtp_coarse_pairs_kernel) |value| break :blk value;
         const ins = [_][*:0]const u8{ "x", "w", "sc", "bi", "K_size", "N_size" };
@@ -25842,17 +25851,18 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
         break :blk value;
     };
     const cfg = blk: {
-        if (mtp_coarse_pairs_cfgs.get(xs[0])) |hit| break :blk hit[0];
+        const ckey = MtpCoarsePairsKey{ .rows = xs[0], .nout = nout };
+        if (mtp_coarse_pairs_cfgs.get(ckey)) |hit| break :blk hit[0];
         const value = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(value);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ xs[0], 1, 248320 }, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, 32, 248320 / 4, @divTrunc(xs[0] + 1, 2)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ xs[0], 1, nout }, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, 32, @divExact(nout, 4), @divTrunc(xs[0] + 1, 2)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(value, 32, 2, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(value, "T", .bfloat16));
-        mtp_coarse_pairs_cfgs.put(xs[0], .{value});
+        mtp_coarse_pairs_cfgs.put(ckey, .{value});
         break :blk value;
     };
-    const values = [_]mlx.mlx_array{ x, w, sc, bi, cachedScalarInt(2560), cachedScalarInt(248320) };
+    const values = [_]mlx.mlx_array{ x, w, sc, bi, cachedScalarInt(2560), cachedScalarInt(nout) };
     const iv = mlx.mlx_vector_array_new_data(&values, values.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();

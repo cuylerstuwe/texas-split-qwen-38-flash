@@ -1045,10 +1045,25 @@ index 00000000..4867ba77
 +  return avail<total?avail:total;
 +}
 diff --git a/src/generate.zig b/src/generate.zig
-index b026590c..f188dd68 100644
+index b026590c..dcca3d6e 100644
 --- a/src/generate.zig
 +++ b/src/generate.zig
-@@ -1333,6 +1333,82 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
+@@ -1,4 +1,14 @@
+ const std = @import("std");
++var r64_nosettle_env: ?bool = null;
++var r64_chain_ladder_env: ?bool = null;
++var r64_shortconf_env: ?bool = null;
++fn r64EnvOn(cache: *?bool, comptime name: [:0]const u8) bool {
++    if (cache.* == null) {
++        const raw = std.c.getenv(name);
++        cache.* = if (raw) |r| r[0] == '1' else false;
++    }
++    return cache.*.?;
++}
+ const mlx = @import("mlx.zig");
+ const transformer_mod = @import("transformer.zig");
+ const qwen4_forward = @import("qwen4_forward.zig");
+@@ -1333,6 +1343,82 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
      return if (adaptive_width) tailMergeMax(default_chunk) else TAIL_MERGE_MAX;
  }
  
@@ -1131,7 +1146,110 @@ index b026590c..f188dd68 100644
  pub fn nextChunkEnd(
      pos: usize,
      prefix_len: usize,
-@@ -2375,6 +2451,7 @@ pub const Generator = struct {
+@@ -1366,6 +1452,102 @@ pub fn nextChunkEnd(
+     return end;
+ }
+ 
++/// R63: chunk shaping for the RTX 5090 split prefill (Mac layers [0, first) of chunk i+1 overlap the
++/// stage's layers of chunk i). Stalls the plain policy leaves:
++/// - a stride boundary just past a chunk's end forces a sliver chunk next (e.g. 183 rows), far too
++///   short to hide the stage's work on the big chunk before it: extend the chunk to that boundary when
++///   it lies within `frag` rows (a leading sliver right after a prefix restore merges forward instead);
++/// - a big final chunk drains on the stage after the Mac is done (~0.16 ms/row): near the end, size
++///   each chunk to cover the stage's previous one, so the final chunk is short.
++/// Chunk boundaries move (noise-level numerics, as for any prefix-restore position); every row's
++/// arithmetic is the chunked prefill's as before. A shaped chunk never grows past
++/// SPLIT_SHAPE_MAX_ROWS (the stage's 128 MiB per-chunk slot holds 6553 rows).
++/// SUSHI_R63_SPLIT_FRAG / SUSHI_R63_SPLIT_LAST (rows; 0 disables; defaults 1024 / 384).
++pub const SPLIT_SHAPE_MAX_ROWS: usize = 6144;
++pub fn splitChunkEnd(pos: usize, end_in: usize, loop_end: usize, want_ssm_cp: bool, stride: usize, offset: usize, frag: usize, last: usize) usize {
++    return splitChunkEndFull(pos, end_in, loop_end, want_ssm_cp, stride, offset, frag, last, 0, 0, 0);
++}
++
++/// Rows of Mac work (layers [0, first)) that cover the stage's work on a `prev`-row chunk: the stage
++/// runs ~0.16 ms/row, the Mac ~60 ms per chunk + ~0.24 ms/row (M5 Max, measured R63) -> 2/3 prev - 250.
++pub fn splitCoverRows(prev: usize) usize {
++    const need = (prev * 2) / 3;
++    return if (need > 250 + 512) need - 250 else 512;
++}
++
++/// `first`: the prefill's first chunk start (a leading sliver before a checkpoint boundary within
++/// `frag` rows of it merges into the next chunk: that interior checkpoint is skipped, the end-of-prompt
++/// snapshot still lands); `default_chunk`: the plain width (0 = no leading merge); `prev`: the
++/// previous chunk's rows (0 = none in flight). Tail rule (`last` > 0 = minimum final chunk): once the
++/// rest fits about one chunk, each chunk is just long enough for the Mac to cover the stage's work on
++/// the previous one, and a leftover under `last` rows rides with the final chunk.
++pub fn splitChunkEndFull(pos: usize, end_in: usize, loop_end: usize, want_ssm_cp: bool, stride: usize, offset: usize, frag: usize, last: usize, first: usize, default_chunk: usize, prev: usize) usize {
++    var end = end_in;
++    // leading sliver: the plain policy ended the first chunk on a boundary within `frag` rows
++    if (frag > 0 and default_chunk > 0 and pos == first and end < loop_end and end - pos < frag and want_ssm_cp and stride > 0 and (end + offset) % stride == 0) {
++        end = @min(end + default_chunk, loop_end);
++        const nb = ((end_in + offset) / stride + 1) * stride;
++        if (nb - offset < end) end = nb - offset;
++    }
++    // trailing sliver: a boundary just past this chunk's end
++    if (frag > 0 and want_ssm_cp and stride > 0 and end < loop_end) {
++        const abs_end = end + offset;
++        if (abs_end % stride != 0) {
++            const next_b = (abs_end / stride + 1) * stride;
++            if (next_b - abs_end <= frag and next_b - offset <= loop_end) end = next_b - offset;
++        }
++    }
++    // tail (within 1.5 chunks of the end): cover the stage's previous chunk (floored at 1024 rows so
++    // the chain cannot degrade into many tiny chunks), and a leftover under `last` rows rides along
++    if (last > 0 and prev > 0 and default_chunk > 0 and loop_end - pos <= default_chunk + default_chunk / 2) {
++        const want = @max(splitCoverRows(prev), @min(@as(usize, 1024), default_chunk));
++        if (loop_end - pos > want + last) {
++            end = @min(end, pos + want);
++        } else {
++            end = @min(end, loop_end);
++        }
++    }
++    if (end > end_in and end - pos > SPLIT_SHAPE_MAX_ROWS) end = end_in;
++    return end;
++}
++
++fn splitEnvRows(name: [*:0]const u8, comptime default: usize) usize {
++    const raw = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch default;
++}
++var split_frag_rows: ?usize = null;
++var split_last_rows: ?usize = null;
++pub fn splitFragRows() usize {
++    if (split_frag_rows == null) split_frag_rows = splitEnvRows("SUSHI_R63_SPLIT_FRAG", 1024);
++    return split_frag_rows.?;
++}
++pub fn splitLastRows() usize {
++    if (split_last_rows == null) split_last_rows = splitEnvRows("SUSHI_R63_SPLIT_LAST", 384);
++    return split_last_rows.?;
++}
++
++test "R63 split chunk shaping: sliver merge and covered tail" {
++    // warm A1: from abs 20297, chunk 4096 would leave a 183-row sliver before the 24576 boundary
++    try std.testing.expectEqual(@as(usize, 4279), splitChunkEndFull(0, 4096, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 0));
++    // tail after a 4279-row chunk: 2602 rows cover the stage's 4279
++    try std.testing.expectEqual(@as(usize, 4279 + 2602), splitChunkEndFull(4279, 8874, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 4279));
++    // then 1484 cover 2602; the 506 left (> 384) become the final chunk
++    try std.testing.expectEqual(@as(usize, 6881 + 1484), splitChunkEndFull(6881, 8874, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 2602));
++    try std.testing.expectEqual(@as(usize, 8874), splitChunkEndFull(8365, 8874, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 1484));
++    // a small final remainder stays one chunk
++    try std.testing.expectEqual(@as(usize, 1500), splitChunkEndFull(0, 1500, 1500, true, 4096, 0, 1024, 384, 0, 4096, 0));
++    // leading 92-row sliver (restore at 65444, boundary 65536) merges into the next chunk
++    try std.testing.expectEqual(@as(usize, 4188), splitChunkEndFull(0, 92, 11055, true, 4096, 65444, 1024, 384, 0, 4096, 0));
++    // B0-like: 5225 rows left after full chunks -> 2480, then 1403, then the 1342 rest
++    try std.testing.expectEqual(@as(usize, 49152 + 2480), splitChunkEndFull(49152, 53248, 54377, true, 4096, 0, 1024, 384, 0, 4096, 4096));
++    try std.testing.expectEqual(@as(usize, 51632 + 1403), splitChunkEndFull(51632, 54377, 54377, true, 4096, 0, 1024, 384, 0, 4096, 2480));
++    try std.testing.expectEqual(@as(usize, 54377), splitChunkEndFull(53035, 54377, 54377, true, 4096, 0, 1024, 384, 0, 4096, 1403));
++    // disabled
++    try std.testing.expectEqual(@as(usize, 4096), splitChunkEndFull(0, 4096, 8874, true, 4096, 20297, 0, 0, 0, 4096, 0));
++    // an operator-widened 6144-row chunk is never extended past the stage slot bound
++    try std.testing.expectEqual(@as(usize, 6144), splitChunkEndFull(0, 6144, 20000, true, 4096, 2000, 1024, 384, 0, 6144, 0));
++}
++
+ /// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
+ /// absorbs a grid point.
+ pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
+@@ -2375,6 +2557,7 @@ pub const Generator = struct {
          /// runs atomically (pre-interleave behavior, and the
          /// SUSHI_PREFILL_INTERLEAVE=0 kill switch).
          interleave_hook: ?InterleaveHook = null,
@@ -1139,7 +1257,7 @@ index b026590c..f188dd68 100644
          /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
          write_through_hook: ?WriteThroughHook = null,
          /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
-@@ -2386,6 +2463,14 @@ pub const Generator = struct {
+@@ -2386,6 +2569,14 @@ pub const Generator = struct {
          adaptive_chunk_width: bool = false,
      };
  
@@ -1154,7 +1272,17 @@ index b026590c..f188dd68 100644
      pub const InterleaveHook = struct {
          ctx: *anyopaque,
          call: *const fn (ctx: *anyopaque) void,
-@@ -2532,7 +2617,15 @@ pub const Generator = struct {
+@@ -2511,6 +2702,9 @@ pub const Generator = struct {
+         ), options.decode_share_width_cap);
+         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
+         const trace_enabled = log.isDebug();
++        // R63 split chunk shaping: the prefill's first chunk start, the previous chunk's rows
++        var split_first_pos: usize = std.math.maxInt(usize);
++        var split_prev_rows: usize = 0;
+         var prefill_sw = io_util.Stopwatch.init(io);
+         var chunked_ns: u64 = 0;
+         var eval_ns: u64 = 0;
+@@ -2532,7 +2726,15 @@ pub const Generator = struct {
          }
          const has_vision = ctx.vision_embeddings != null;
          const glm_request = ctx.glm5_request;
@@ -1171,7 +1299,7 @@ index b026590c..f188dd68 100644
              options.ssm_checkpoint_stride,
              (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
              has_vision,
-@@ -2612,6 +2705,21 @@ pub const Generator = struct {
+@@ -2612,6 +2814,21 @@ pub const Generator = struct {
          // freshly forwarded tail (`base_pos = ssm_cp_offset`) — sliding-
          // window semantics, same rule as the MTP history.
          const dflash_active = options.dflash_enabled and options.dflash != null;
@@ -1193,7 +1321,24 @@ index b026590c..f188dd68 100644
          var dflash_ctx: ?dflash_mod.DflashCtx = if (!dflash_active)
              null
          else if (options.dflash_ctx_restored) |restored| blk: {
-@@ -2772,12 +2880,18 @@ pub const Generator = struct {
+@@ -2752,10 +2969,15 @@ pub const Generator = struct {
+                 // chunk-locally. Boundary alignment is in ABSOLUTE position
+                 // (pos + offset), so the saved snapshot list is correct for
+                 // the full prompt, not the truncated tail.
+-                const end = if (glm_request != null)
++                const end_base = if (glm_request != null)
+                     glmChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                 else
+                     nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
++                if (split_first_pos == std.math.maxInt(usize)) split_first_pos = pos;
++                const end = if (split_prefill and glm_request == null)
++                    splitChunkEndFull(pos, end_base, loop_end, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, splitFragRows(), splitLastRows(), split_first_pos, cur_chunk, split_prev_rows)
++                else
++                    end_base;
+                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
+                 const chunk_len: c_int = @intCast(end - pos);
+                 const chunk_shape = [_]c_int{ 1, chunk_len };
+@@ -2772,12 +2994,18 @@ pub const Generator = struct {
                  errdefer if (dflash_active) {
                      for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                  };
@@ -1212,7 +1357,7 @@ index b026590c..f188dd68 100644
                  if (dflash_active) {
                      ctx.capture_layers = null;
                      try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
-@@ -2799,7 +2913,7 @@ pub const Generator = struct {
+@@ -2799,7 +3027,7 @@ pub const Generator = struct {
                  // tokens [pos+1, end+1) — prompt_ids[end] always exists since
                  // the chunk loop spans [0, prefix_len) and prompt_ids has
                  // prefix_len + 1 entries.
@@ -1221,7 +1366,7 @@ index b026590c..f188dd68 100644
                      if (!mtp_history_started) {
                          std.debug.assert(mtp_cache.?.step() == 0);
                          mtp_position_base = ssm_cp_offset + pos;
-@@ -2869,6 +2983,7 @@ pub const Generator = struct {
+@@ -2869,6 +3097,7 @@ pub const Generator = struct {
                  }
                  // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
                  _ = mlx.mlx_clear_cache();
@@ -1229,7 +1374,7 @@ index b026590c..f188dd68 100644
                  if (trace_enabled) {
                      const eval_dt = prefill_sw.read() - eval_start_ns;
                      eval_ns += eval_dt;
-@@ -2887,7 +3002,12 @@ pub const Generator = struct {
+@@ -2887,7 +3116,12 @@ pub const Generator = struct {
                  // are realized; the snapshot is just a refcount-share of the
                  // already-resident state.
                  const abs_end_for_cp2 = end + ssm_cp_offset;
@@ -1243,7 +1388,7 @@ index b026590c..f188dd68 100644
                      const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
                      ssm_checkpoints.append(allocator, cp) catch |e| {
                          var doomed = cp;
-@@ -2915,6 +3035,17 @@ pub const Generator = struct {
+@@ -2915,6 +3149,18 @@ pub const Generator = struct {
                      }
                  }
  
@@ -1257,11 +1402,12 @@ index b026590c..f188dd68 100644
 +                    }
 +                    split_pending = .{ .pos = pos, .end = end, .cp = split_cp_new };
 +                    split_cp_new = null;
++                    split_prev_rows = end - pos;
 +                }
                  if (vision_chunked) {
                      vision_rows_consumed += countSpliceRows(
                          ids_i32[pos..end],
-@@ -2927,6 +3058,19 @@ pub const Generator = struct {
+@@ -2927,6 +3173,19 @@ pub const Generator = struct {
                  // Publish progress once per chunk — same cadence discipline as
                  // `inflight_generated_tokens` (once per decode tick), never per token.
                  if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
@@ -1281,7 +1427,7 @@ index b026590c..f188dd68 100644
                  // Persist this chunk now: the KV bytes for [0, pos) are final.
                  if (options.write_through_hook) |wt| {
                      wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
-@@ -2989,6 +3133,14 @@ pub const Generator = struct {
+@@ -2989,6 +3248,14 @@ pub const Generator = struct {
              // With it, the cache restores to position 749 (~99% of the
              // prompt) and only the last token + new tail re-forwards.
              // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
@@ -1296,7 +1442,7 @@ index b026590c..f188dd68 100644
              if (want_ssm_cp and loop_end > 0) {
                  // The snapshot sits at the chunk loop's end — snapshot_backoff
                  // tokens BEFORE the prompt end, where the next turn's prefix
-@@ -3074,6 +3226,7 @@ pub const Generator = struct {
+@@ -3074,6 +3341,7 @@ pub const Generator = struct {
          errdefer if (dflash_active) {
              for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
          };
@@ -1304,7 +1450,7 @@ index b026590c..f188dd68 100644
          const raw_logits = if (tail_mtp_capture) blk: {
              has_captured_hidden = true;
              break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
-@@ -3081,6 +3234,7 @@ pub const Generator = struct {
+@@ -3081,6 +3349,7 @@ pub const Generator = struct {
              has_captured_hidden = true;
              break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
          } else try xfm.forwardWith(&ctx, last_input);
@@ -1312,7 +1458,7 @@ index b026590c..f188dd68 100644
          // History entries for the held-back span: (hidden[j], token[j+1]) for
          // j in [final_start, prefix_len) — same pairing as the chunk loop.
          // The last row's pair (hidden[last], t1) is appended by the first
-@@ -3995,7 +4149,11 @@ pub const Generator = struct {
+@@ -3995,7 +4264,11 @@ pub const Generator = struct {
      /// rollback without being counted.
      fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
          self.partial_rounds += 1;
@@ -1325,7 +1471,72 @@ index b026590c..f188dd68 100644
              try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
          }
      }
-@@ -6267,6 +6425,10 @@ pub const Generator = struct {
+@@ -5060,10 +5333,17 @@ pub const Generator = struct {
+             // Rerank drafts skip the head's own logits projection entirely:
+             // the token comes off the coarse readout's re-scored shortlist,
+             // greedily (argmax) or sampled from a q over those 32 rows.
++            const conf_needed = chain.conf_arrs != null and i < chain.plan.m_lo;
++            // R64 (SUSHI_R64_SHORTLIST_CONF=1): the extension gate's ln p_head(draft) comes from the
++            // rerank shortlist (exact logits of the 32 candidates) instead of a full 248K head readout
++            // per step. The gate only sizes the draft; acceptance stays exact.
++            const shortconf = conf_needed and rerank_drafts and chain.q_probs != null and
++                r64EnvOn(&r64_shortconf_env, "SUSHI_R64_SHORTLIST_CONF");
++            var conf_done = false;
+             const path = mtpDraftStepPath(
+                 rerank_drafts,
+                 !isGreedyTemperature(draft_sampling.temperature),
+-                chain.conf_arrs != null and i < chain.plan.m_lo,
++                conf_needed and !shortconf,
+             );
+             const use_rerank = path != .full_logits;
+             // `want_logits: bool` could not tell a rerank draft from a history
+@@ -5117,6 +5397,14 @@ pub const Generator = struct {
+             defer if (step_out.rerank_x.ctx != null) {
+                 _ = mlx.mlx_array_free(step_out.rerank_x);
+             };
++            // R64 chain ladder (SUSHI_R64_CHAIN_LADDER=1): start this step on the GPU while the CPU
++            // builds the next one (same graph, same order).
++            if (r64EnvOn(&r64_chain_ladder_env, "SUSHI_R64_CHAIN_LADDER") and i + 1 < to) {
++                const arrs = [_]mlx.mlx_array{step_out.hidden_next};
++                const vec = mlx.mlx_vector_array_new_data(&arrs, arrs.len);
++                defer _ = mlx.mlx_vector_array_free(vec);
++                _ = mlx.mlx_async_eval(vec);
++            }
+             if (use_rerank and chain.q_probs != null) {
+                 const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
+                 const slots = chain.q_probs.?;
+@@ -5126,6 +5414,11 @@ pub const Generator = struct {
+                     const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
+                     chain.draft_arrs[i] = prop.id;
+                     slots[i] = prop.q;
++                    if (shortconf) {
++                        chain.conf_arrs.?[i] = try shortlistConfidenceGraph(sl, prop.id, s);
++                        chain.n_conf = i + 1;
++                        conf_done = true;
++                    }
+                 } else {
+                     // The coarse head just retired: propose greedily and hand
+                     // the verify the one-hot q that proposal really has.
+@@ -5147,11 +5440,16 @@ pub const Generator = struct {
+                 chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
+             }
+             chain.n_drafted = i + 1;
+-            if (chain.conf_arrs != null and i < chain.plan.m_lo) {
++            if (chain.conf_arrs != null and i < chain.plan.m_lo and !conf_done) {
+                 // Chunk-A confidence: log p_head(draft) — built from the
+                 // step's own logits BEFORE they're freed (lazy graphs
+                 // hold their inputs internally).
+-                chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
++                if (step_out.logits.ctx != null) {
++                    chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
++                } else {
++                    // a shortconf step whose shortlist was refused: no confidence, no extension
++                    chain.conf_arrs.?[i] = mlx.mlx_array_new_float(-std.math.inf(f32));
++                }
+                 chain.n_conf = i + 1;
+             }
+             if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
+@@ -6267,6 +6565,10 @@ pub const Generator = struct {
      pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState, open: MtpRoundOpen };
  
      pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -1336,7 +1547,18 @@ index b026590c..f188dd68 100644
          var st = switch (try self.mtpRoundBegin(allocator)) {
              .done => |r| return r,
              .verify => |v| v,
-@@ -9390,6 +9552,10 @@ pub const Generator = struct {
+@@ -6592,6 +6894,10 @@ pub const Generator = struct {
+         self.ctx.ple_defer = true;
+         self.ctx.verify_rows = xfm.config.isMimo();
+         defer self.ctx.verify_rows = false;
++        // R64: the verify's hidden captures ride the round's batched eval (Phase 4b) instead of two
++        // blocking settles right after the forward (SUSHI_R64_VERIFY_NOSETTLE=1).
++        self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
++        defer self.ctx.capture_settle = true;
+         var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+             self.ctx.ple_defer = false;
+             self.ctx.capture_ssm_seq = false;
+@@ -9390,6 +9696,10 @@ pub const Generator = struct {
      pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
          var tick_prof = TickProf.begin();
          defer tick_prof.finish();
@@ -1347,6 +1569,66 @@ index b026590c..f188dd68 100644
          if (self.done) return null;
          if (self.sampling.constraint != null) return self.nextConstrained(allocator);
  
+@@ -10142,6 +10452,59 @@ fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx
+ /// = log p_head(draft). Two vocab reductions on the head's own (draft-head)
+ /// logits — must be built BEFORE the caller frees the logits handle (lazy
+ /// graphs hold their inputs internally). Returns a `[1]`-shaped lazy array.
++/// R64: ln softmax(shortlist exact logits) at the draft's candidate slot — `draftConfidenceGraph` over
++/// the 32 re-scored candidates instead of the whole head (it overstates confidence by the head mass
++/// outside the shortlist, which is small exactly when the gate would extend).
++fn shortlistConfidenceGraph(sl: mtp_mod.Shortlist, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
++    const flat = [_]c_int{-1};
++    const one = [_]c_int{1};
++    var ex = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(ex);
++    {
++        var r = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(r);
++        try mlx.check(mlx.mlx_reshape(&r, sl.exact, &flat, 1, s));
++        try mlx.check(mlx.mlx_astype(&ex, r, .float32, s));
++    }
++    var lse = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(lse);
++    try mlx.check(mlx.mlx_logsumexp_axis(&lse, ex, -1, false, s));
++    var cands = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(cands);
++    {
++        var r = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(r);
++        try mlx.check(mlx.mlx_reshape(&r, sl.cands, &flat, 1, s));
++        try mlx.check(mlx.mlx_astype(&cands, r, .int32, s));
++    }
++    var did = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(did);
++    {
++        var r = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(r);
++        try mlx.check(mlx.mlx_reshape(&r, draft_id, &one, 1, s));
++        try mlx.check(mlx.mlx_astype(&did, r, .int32, s));
++    }
++    var eq = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(eq);
++    try mlx.check(mlx.mlx_equal(&eq, cands, did, s));
++    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
++    defer _ = mlx.mlx_array_free(neg_inf);
++    var sel = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(sel);
++    try mlx.check(mlx.mlx_where(&sel, eq, ex, neg_inf, s));
++    var lg = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(lg);
++    try mlx.check(mlx.mlx_max_axis(&lg, sel, -1, false, s));
++    var diff = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(diff);
++    try mlx.check(mlx.mlx_subtract(&diff, lg, lse, s));
++    var out = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(out);
++    try mlx.check(mlx.mlx_reshape(&out, diff, &one, 1, s));
++    return out;
++}
++
+ fn draftConfidenceGraph(logits: mlx.mlx_array, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+     var lse = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(lse);
 diff --git a/src/kld.zig b/src/kld.zig
 index 1fd85276..765954cf 100644
 --- a/src/kld.zig
@@ -1377,11 +1659,247 @@ index 1fd85276..765954cf 100644
  
          var prompt_kld: f64 = 0;
          var prompt_nll: f64 = 0;
+diff --git a/src/mtp.zig b/src/mtp.zig
+index 3595ba4d..10639ac7 100644
+--- a/src/mtp.zig
++++ b/src/mtp.zig
+@@ -378,7 +378,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
+         .head_kv_bits = if (head.cache.config.scheme == .affine) head.cache.config.bits else 0,
+         .head_kv_group = head.cache.config.group_size,
+     };
+-    const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.rows == 248320 else false;
++    const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.vocabRows() == 248320 else false;
+     const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.verifyQmmNaxAvailable());
+     if (mixed != .generic) {
+         if (!qwen4_mixed_profile_logged) {
+@@ -973,13 +973,32 @@ pub const RerankCoarse = struct {
+     q: QLinear,
+     bits: u32,
+     group_size: u32,
++    /// Coarse readout width: the first `rows` vocab ids (R63: a prefix when
++    /// SUSHI_MTP_DRAFT_HEAD_ROWS trims it).
+     rows: c_int,
++    /// The full vocab width every dense proposal row keeps (0 = `rows`).
++    vocab: c_int = 0,
++
++    pub fn vocabRows(self: RerankCoarse) c_int {
++        return if (self.vocab != 0) self.vocab else self.rows;
++    }
+ 
+     pub fn deinit(self: *RerankCoarse) void {
+         self.q.deinit();
+     }
+ };
+ 
++/// R63: SUSHI_MTP_DRAFT_HEAD_ROWS=N keeps only vocab ids [0, N) in the coarse readout (BPE ids are
++/// roughly in merge order, so a prefix holds the common tokens). An id past the prefix never enters
++/// the shortlist: like any coarse miss it costs acceptance, never output (verification still reads
++/// the trunk forward's full logits and the residual is exact). Unset/0/>= vocab keeps every row.
++pub fn draftHeadRowsFrom(raw: ?[]const u8, vocab: c_int) c_int {
++    const v = std.fmt.parseInt(c_int, raw orelse return vocab, 10) catch return vocab;
++    if (v <= 0 or v >= vocab) return vocab;
++    // A whole number of 1024-row blocks, never under the top-32 kernel's floor.
++    return @min(vocab, @max(TOP32_MIN_ROWS, @divTrunc(v + 1023, 1024) * 1024));
++}
++
+ /// The coarse readout head: a low-bit/gs64 requantized copy of the target's
+ /// lm_head, materialized so the first draft does not pay for it. Infallible —
+ /// every refusal returns null and the caller keeps its full-readout path.
+@@ -991,11 +1010,23 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?Re
+     const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+     if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
+ 
++    const vocab: c_int = w_shape[0];
++    const keep = draftHeadRowsFrom(if (std.c.getenv("SUSHI_MTP_DRAFT_HEAD_ROWS")) |r| std.mem.sliceTo(r, 0) else null, vocab);
++    var hw = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(hw);
++    var hs = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(hs);
++    var hb = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(hb);
++    sliceRows(&hw, target.lm_head_w, 0, keep, s) catch return null;
++    sliceRows(&hs, target.lm_head_s, 0, keep, s) catch return null;
++    if (target.lm_head_b.ctx != null) sliceRows(&hb, target.lm_head_b, 0, keep, s) catch return null;
++
+     var rc = requantizeRows(
+         s,
+-        target.lm_head_w,
+-        target.lm_head_s,
+-        target.lm_head_b,
++        hw,
++        hs,
++        if (target.lm_head_b.ctx != null) hb else target.lm_head_b,
+         head_qp.group_size,
+         head_qp.bits,
+         head_qp.mode.cstr(),
+@@ -1016,7 +1047,97 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?Re
+         log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
+         return null;
+     };
+-    return .{ .q = rc, .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = w_shape[0] };
++    if (keep < vocab) log.info("[mtp] draft rerank: coarse head keeps vocab ids [0, {d}) of {d} (SUSHI_MTP_DRAFT_HEAD_ROWS)\n", .{ keep, vocab });
++    const built = RerankCoarse{ .q = rc, .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = keep, .vocab = vocab };
++    coarseSelfCheck(s, &built);
++    return built;
++}
++
++/// R63 diagnostic (SUSHI_R63_COARSE_CHECK=1): the batched coarse readouts (`mtpCoarsePairs`,
++/// `msvQmvRows`) against per-row `mlx_quantized_matmul` on a deterministic 4-row input, logged once
++/// at build. Pure check: the head is untouched.
++pub fn coarseSelfCheck(s: mlx.mlx_stream, rc: *const RerankCoarse) void {
++    const e = std.c.getenv("SUSHI_R63_COARSE_CHECK") orelse return;
++    if (e[0] != '1') return;
++    coarseSelfCheckInner(s, rc) catch |err| log.warn("[r63] coarse self-check failed: {s}\n", .{@errorName(err)});
++}
++
++fn coarseSelfCheckInner(s: mlx.mlx_stream, rc: *const RerankCoarse) !void {
++    const n: c_int = 4;
++    const hidden: c_int = 2560;
++    var buf: [4 * 2560]f32 = undefined;
++    for (&buf, 0..) |*v, i| {
++        const f: f32 = @floatFromInt(i % 977);
++        v.* = @sin(f * 0.37 + @as(f32, @floatFromInt(i / 2560)) * 1.3) * 2.0;
++    }
++    const x32 = mlx.mlx_array_new_data(&buf, &[_]c_int{ n, 1, hidden }, 3, .float32);
++    defer _ = mlx.mlx_array_free(x32);
++    var x = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(x);
++    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
++    var reference = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(reference);
++    try mlx.check(mlx.mlx_quantized_matmul(&reference, x, rc.q.w, rc.q.s, rc.q.b, true, mlx.mlx_optional_int.some(@intCast(rc.group_size)), mlx.mlx_optional_int.some(@intCast(rc.bits)), "affine", s));
++    const arms = [_][]const u8{ "pairs", "msv" };
++    for (arms, 0..) |name, ai| {
++        const got = (if (ai == 0)
++            try transformer_mod.mtpCoarsePairs(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)
++        else
++            try @import("transformer.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) orelse {
++            log.info("[r63] coarse self-check {s}: declined (rows={d})\n", .{ name, rc.rows });
++            continue;
++        };
++        defer _ = mlx.mlx_array_free(got);
++        var g32 = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(g32);
++        var r32 = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(r32);
++        var gr = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(gr);
++        try mlx.check(mlx.mlx_reshape(&gr, got, &[_]c_int{ n, rc.rows }, 2, s));
++        try mlx.check(mlx.mlx_astype(&g32, gr, .float32, s));
++        var rr = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(rr);
++        try mlx.check(mlx.mlx_reshape(&rr, reference, &[_]c_int{ n, rc.rows }, 2, s));
++        try mlx.check(mlx.mlx_astype(&r32, rr, .float32, s));
++        var d = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(d);
++        try mlx.check(mlx.mlx_subtract(&d, g32, r32, s));
++        var ad = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ad);
++        try mlx.check(mlx.mlx_abs(&ad, d, s));
++        var mx_ = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(mx_);
++        try mlx.check(mlx.mlx_max(&mx_, ad, false, s));
++        var ra = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ra);
++        try mlx.check(mlx.mlx_abs(&ra, r32, s));
++        var rmax = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(rmax);
++        try mlx.check(mlx.mlx_max(&rmax, ra, false, s));
++        // top-1 agreement per row
++        var ag = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ag);
++        try mlx.check(mlx.mlx_argmax_axis(&ag, g32, 1, false, s));
++        var ar = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ar);
++        try mlx.check(mlx.mlx_argmax_axis(&ar, r32, 1, false, s));
++        try mlx.check(mlx.mlx_array_eval(mx_));
++        try mlx.check(mlx.mlx_array_eval(rmax));
++        try mlx.check(mlx.mlx_array_eval(ag));
++        try mlx.check(mlx.mlx_array_eval(ar));
++        var vmax: f32 = 0;
++        var vref: f32 = 0;
++        try mlx.check(mlx.mlx_array_item_float32(&vmax, mx_));
++        try mlx.check(mlx.mlx_array_item_float32(&vref, rmax));
++        const pa = mlx.mlx_array_data_uint32(ag) orelse return error.Unreadable;
++        const pr = mlx.mlx_array_data_uint32(ar) orelse return error.Unreadable;
++        var same: usize = 0;
++        for (0..4) |i| {
++            if (pa[i] == pr[i]) same += 1;
++        }
++        log.info("[r63] coarse self-check {s}: rows={d} max|diff|={d:.5} (max|ref|={d:.3}), argmax agree {d}/4\n", .{ name, rc.rows, vmax, vref, same });
++    }
+ }
+ 
+ /// Resident bytes of a coarse head over `rows` x `hidden` at `bits`/gs64:
+@@ -1090,9 +1211,19 @@ pub fn fullReadoutArgmax(
+ fn rerankMaskCoarse(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !void {
+     // The mask goes on the COARSE row: a reserved id that never enters the
+     // shortlist cannot be re-scored back into the draft.
+-    const m = suppress_mask orelse return;
++    const m0 = suppress_mask orelse return;
+     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+     defer _ = mlx.mlx_array_free(neg_inf);
++    // R63: a prefix coarse head reads the first `width` ids only.
++    const lsh = mlx.getShape(logits.*);
++    const width = lsh[lsh.len - 1];
++    var m_cut = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(m_cut);
++    const msh = mlx.getShape(m0);
++    const m = if (msh.len == 1 and msh[0] > width) blk: {
++        try mlx.check(mlx.mlx_slice(&m_cut, m0, &[_]c_int{0}, 1, &[_]c_int{width}, 1, &[_]c_int{1}, 1, s));
++        break :blk m_cut;
++    } else m0;
+     var masked = mlx.mlx_array_new();
+     try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits.*, s));
+     _ = mlx.mlx_array_free(logits.*);
+@@ -1126,6 +1257,7 @@ fn rerankShortlistRow(
+     flat: mlx.mlx_array,
+     rows: c_int,
+     x_row: mlx.mlx_array,
++    vocab: c_int,
+ ) !?Shortlist {
+     const cands = draftTop32(s, flat, rows) catch |err| {
+         log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
+@@ -1165,7 +1297,7 @@ fn rerankShortlistRow(
+         qp.mode.cstr(),
+         s,
+     ));
+-    return .{ .cands = cands, .exact = exact, .rows = rows };
++    return .{ .cands = cands, .exact = exact, .rows = vocab };
+ }
+ 
+ /// The greedy draft's tail: argmax over the re-scored shortlist, mapped back to
+@@ -1234,7 +1366,7 @@ pub fn rerankShortlist(
+     const flat = try rerankCoarseFlat(s, rc, x, suppress_mask);
+     defer _ = mlx.mlx_array_free(flat);
+ 
+-    const sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x)) orelse return null;
++    const sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x, rc.vocabRows())) orelse return null;
+     if (!logged.*) {
+         log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{coarse_bits});
+         logged.* = true;
+@@ -1322,6 +1454,7 @@ pub fn rerankShortlistsBatched(
+     }
+ 
+     const rows = rc.rows;
++    const vocab = rc.vocabRows();
+     var built: usize = 0;
+     errdefer for (out[0..built]) |*sl| sl.deinit();
+     const csh = mlx.getShape(coarse_logits);
+@@ -1343,7 +1476,7 @@ pub fn rerankShortlistsBatched(
+         try mlx.check(mlx.mlx_slice(&xi, x, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+         // A shortlist failure retires the coarse head mid-loop; the caller's
+         // fallback answers for the whole group, so the rows already built go.
+-        out[i] = (try rerankShortlistRow(s, target, coarse, flat, rows, xi)) orelse {
++        out[i] = (try rerankShortlistRow(s, target, coarse, flat, rows, xi, vocab)) orelse {
+             for (out[0..built]) |*sl| sl.deinit();
+             return false;
+         };
 diff --git a/src/qwen4_forward.zig b/src/qwen4_forward.zig
-index 3ab27c9f..1fa8f71a 100644
+index 3ab27c9f..b80fa28d 100644
 --- a/src/qwen4_forward.zig
 +++ b/src/qwen4_forward.zig
-@@ -1,6 +1,218 @@
+@@ -1,6 +1,227 @@
  //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
  
  const trf = @import("transformer.zig");
@@ -1393,6 +1911,15 @@ index 3ab27c9f..1fa8f71a 100644
 +extern "c" fn stage_split_seed_recurrent(conv: mlx.mlx_array, ssm: mlx.mlx_array, s: mlx.mlx_stream) c_int;
 +extern "c" fn stage_split_seed_attention(keys: mlx.mlx_array, ks: mlx.mlx_array, kb: mlx.mlx_array, values: mlx.mlx_array, vs: mlx.mlx_array, vb: mlx.mlx_array, pooled: mlx.mlx_array, raw: mlx.mlx_array, len: u64, s: mlx.mlx_stream) c_int;
 +extern "c" fn stage_split_seed_end(position: u64) c_int;
++var r64_vladder: ?u32 = null;
++fn r64VerifyLadder() u32 {
++    if (r64_vladder == null) {
++        const raw = std.c.getenv("SUSHI_R64_VERIFY_LADDER");
++        r64_vladder = if (raw) |r| (std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 0) else 0;
++        if (r64_vladder.? != 0) log.info("[r64] verify ladder: stride {d}\n", .{r64_vladder.?});
++    }
++    return r64_vladder.?;
++}
 +extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
 +extern "c" fn stage_split_prefill_begin(owner: u64) void;
 +extern "c" fn stage_split_bind(owner: u64) void;
@@ -1600,7 +2127,7 @@ index 3ab27c9f..1fa8f71a 100644
  const Transformer = trf.Transformer;
  const std = @import("std");
  const sushi_exl3 = @import("sushi_exl3");
-@@ -1444,6 +1656,7 @@ pub fn forwardQwen4VerifyRows(
+@@ -1444,6 +1665,7 @@ pub fn forwardQwen4VerifyRows(
      out_last: []mlx.mlx_array,
      out_all: []mlx.mlx_array,
  ) !void {
@@ -1608,7 +2135,7 @@ index 3ab27c9f..1fa8f71a 100644
      const previous_hc_prepared = mtp_verify_hc_prepared_active;
      mtp_verify_hc_prepared_active = true;
      defer mtp_verify_hc_prepared_active = previous_hc_prepared;
-@@ -1694,6 +1907,7 @@ pub fn forwardQwen4DecodeRows(
+@@ -1694,6 +1916,7 @@ pub fn forwardQwen4DecodeRows(
      ctxs: []const *ForwardCtx,
      hidden_rows: ?*?[]mlx.mlx_array,
  ) ![]mlx.mlx_array {
@@ -1616,7 +2143,7 @@ index 3ab27c9f..1fa8f71a 100644
      const n = ctxs.len;
      std.debug.assert(n == next_tokens.len and n >= 1 and n <= MAX_BATCH_ROWS);
      if (!qwen4_rows_logged) {
-@@ -1969,9 +2183,54 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -1969,9 +2192,61 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
          !diagEnvOnCached(&trf.expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
      var deferred: ?DeferredQwenMoe = null;
      defer if (deferred) |*d| d.deinit();
@@ -1634,12 +2161,19 @@ index 3ab27c9f..1fa8f71a 100644
 +    // scheduler's stage recovery), never Mac-only from stale caches.
 +    if (stage_first == null and stage_split_resident(stageOwner(ctx)) != 0) return error.StageSplitForward;
 +    if (stage_first != null) stage_split_bind(stageOwner(ctx));
++    // R64: verify ladder for split MTP verify forwards (rows 2..16), SUSHI_R64_VERIFY_LADDER=<stride>.
++    const vladder: u32 = if (seq_len > 1 and seq_len <= 16 and stage_first != null and ctx.stage_prefill == 0 and
++        ctx.batch_slots == null and !prof.timing and !dt.on) r64VerifyLadder() else 0;
      var layer_idx: usize = 0;
      while (layer_idx < layerCap(cfg.num_hidden_layers)) {
          const li: u32 = @intCast(layer_idx);
 +        if (stage_first) |first| if (layer_idx == first) {
 +            // R60 pipeline split: layers [first, 48) on the RTX 5090; resume after layer 47.
 +            try self.hcFlush(&h, batch, seq_len, &pending);
++            // The stage send below evaluates layers [0, first). A deferred PLE leaf (an MTP verify's
++            // lazy draft ids) must be filled before that, or layer 1 reads its zero initialization
++            // (R64: every split verify round did until 2026-11-09; see plePreEval). Same gather, earlier.
++            try self.plePreEval(ctx);
 +            std.debug.assert(deferred == null);
 +            if (ctx.stage_prefill != 0) {
 +                // R60 S4 (prefill v2): the chunk's rows through the stage's prefill path.
@@ -1671,6 +2205,155 @@ index 3ab27c9f..1fa8f71a 100644
          if (dumping) trf.moe_dump_layer = li;
          const lw = &ml[layer_idx];
          const entry = &entries[layer_idx];
+@@ -2083,6 +2358,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+             }
+         }
+ 
++        // R64 verify ladder: hand the finished layers to the GPU while the CPU builds the rest of the
++        // verify graph. Layer 0 precedes the PLE leaf (trunk layer 1), so it can start right behind the
++        // draft chain; at later points the deferred leaf is filled first (a blocking wait on the draft
++        // ids, then the host gather). Same graph, same order, started earlier: bit-identical.
++        if (vladder != 0 and layer_idx + 1 < stage_first.? and (layer_idx == 0 or (layer_idx + 1) % vladder == 0)) {
++            if (ctx.ple_pending != null) try self.plePreEval(ctx);
++            const arrs = [_]mlx.mlx_array{ h, mlp_out };
++            const vec = mlx.mlx_vector_array_new_data(&arrs, arrs.len);
++            defer _ = mlx.mlx_vector_array_free(vec);
++            _ = mlx.mlx_async_eval(vec);
++        }
++
+         if (ctx.capture_layers) |cl| {
+             for (cl.ids, cl.out) |cid, *slot| {
+                 if (cid == li) {
+@@ -2119,9 +2406,9 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+     // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
+     // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
+     if (ctx.capture_hidden) |target| {
+-        try capturePrefillHiddenLast(self.s, target, h, true);
++        try capturePrefillHiddenLast(self.s, target, h, ctx.capture_settle);
+     }
+-    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, true);
++    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, ctx.capture_settle);
+ 
+     const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
+     // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
+@@ -3055,6 +3342,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
+         switch (which) {
+             0 => "sushi_hc_read_n",
+             1 => "sushi_hc_read_d",
++            3 => "sushi_hc_read_u2",
+             else => "sushi_hc_read_u",
+         },
+         in_vec,
+@@ -3062,6 +3350,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
+         switch (which) {
+             0 => HC_FUSED_N_SOURCE,
+             1 => HC_FUSED_D_SOURCE,
++            3 => qwen4_hc.HC_FUSED_U2_SOURCE,
+             else => HC_FUSED_U_SOURCE,
+         },
+         "",
+diff --git a/src/qwen4_hc.zig b/src/qwen4_hc.zig
+index e366a11d..1d96d861 100644
+--- a/src/qwen4_hc.zig
++++ b/src/qwen4_hc.zig
+@@ -759,9 +759,87 @@ pub const HC_FUSED_U_SOURCE =
+     \\}
+ ;
+ 
++// R63: U with every weight word, scale and bias of the four streams issued before any arithmetic
++// (more loads in flight per simdgroup); the per-element arithmetic and accumulation order are U's,
++// so the output is bit-identical (checked rows 1-8). SUSHI_HC_U2=0 keeps U.
++pub const HC_FUSED_U2_SOURCE =
++    \\uint lane = thread_index_in_simdgroup;
++    \\uint j = thread_position_in_grid.y;
++    \\const uint row0 = thread_position_in_grid.z * uint(ROWS);
++    \\const int VPW = 32 / BITS;
++    \\const int R_by_p = R / VPW;
++    \\const int R_by_gs = R / GS;
++    \\const int RIT = (R_by_p + 31) / 32;
++    \\uint mask = (1u << BITS) - 1u;
++    \\// All weight words, scales and biases of the four streams issued up front; arithmetic unchanged.
++    \\uint32_t pw[HC][RIT];
++    \\float sjv[HC][RIT], bjv[HC][RIT];
++    \\for (int h = 0; h < HC; ++h) {
++    \\  size_t row = (size_t)h * (size_t)H + (size_t)j;
++    \\  size_t wbase = row * (size_t)R_by_p;
++    \\  size_t gbase = row * (size_t)R_by_gs;
++    \\  for (int i = 0; i < RIT; ++i) {
++    \\    int pack = int(lane) + 32 * i;
++    \\    if (pack < R_by_p) {
++    \\      pw[h][i] = uw_q[wbase + (size_t)pack];
++    \\      int gi = (pack * VPW) / GS;
++    \\      sjv[h][i] = float(uw_s[gbase + (size_t)gi]);
++    \\      bjv[h][i] = float(uw_b[gbase + (size_t)gi]);
++    \\    } else { pw[h][i] = 0u; sjv[h][i] = 0.0f; bjv[h][i] = 0.0f; }
++    \\  }
++    \\}
++    \\float sum[ROWS];
++    \\for (int r = 0; r < ROWS; ++r) sum[r] = 0.0f;
++    \\for (int h = 0; h < HC; ++h) {
++    \\  size_t row = (size_t)h * (size_t)H + (size_t)j;
++    \\  float a0[ROWS], a1[ROWS], a2[ROWS], a3[ROWS];
++    \\  for (int r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; a2[r] = 0.0f; a3[r] = 0.0f; }
++    \\  for (int i = 0; i < RIT; ++i) {
++    \\    int pack = int(lane) + 32 * i;
++    \\    if (pack < R_by_p) {
++    \\      uint32_t pwv = pw[h][i];
++    \\      int k_base = pack * VPW;
++    \\      float sj = sjv[h][i];
++    \\      float bj = bjv[h][i];
++    \\      for (int ki = 0; ki < VPW; ki += 4) {
++    \\        int k = k_base + ki;
++    \\        uint32_t q = pwv >> (ki * BITS);
++    \\        for (int r = 0; r < ROWS; ++r) {
++    \\          const device T* act = act_in + (size_t)metal::min(row0 + uint(r), uint(NROWS - 1)) * (size_t)R;
++    \\          a0[r] += float(act[k + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
++    \\          a1[r] += float(act[k + 1]) * (float((q >> (1 * BITS)) & mask) * sj + bj);
++    \\          a2[r] += float(act[k + 2]) * (float((q >> (2 * BITS)) & mask) * sj + bj);
++    \\          a3[r] += float(act[k + 3]) * (float((q >> (3 * BITS)) & mask) * sj + bj);
++    \\        }
++    \\      }
++    \\    }
++    \\  }
++    \\  for (int r = 0; r < ROWS; ++r) {
++    \\    const device T* xn = xn_in + (size_t)metal::min(row0 + uint(r), uint(NROWS - 1)) * (size_t)(HC * H);
++    \\    float acc = simd_sum((a0[r] + a1[r]) + (a2[r] + a3[r]));
++    \\    T u = T(acc);
++    \\    T sg = T(1.0f / (1.0f + metal::exp(-float(u))));
++    \\    sum[r] += float(T(float(sg) * float(xn[row])));
++    \\  }
++    \\}
++    \\for (int r = 0; r < ROWS; ++r) {
++    \\  if (lane == 0 && row0 + uint(r) < uint(NROWS)) mixed_out[(size_t)(row0 + uint(r)) * (size_t)H + j] = T(float(T(sum[r])) * float(T(1.0f / float(HC))));
++    \\}
++;
++
++pub var hc_u2_override: ?bool = null;
++var hc_u2_env: ?bool = null;
++pub fn hcU2On() bool {
++    if (hc_u2_override) |v| return v;
++    if (hc_u2_env) |v| return v;
++    const v = if (std.c.getenv("SUSHI_HC_U2")) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
++    hc_u2_env = v;
++    return v;
++}
++
+ pub const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
+ 
+-pub var hc_fused_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
++pub var hc_fused_kernels: [4]?mlx.mlx_fast_metal_kernel = .{ null, null, null, null };
+ 
+ /// One config set per row count, inject and pending write: MTP alternates widths every round, a
+ /// forward's first read and any read after a flush have no pending write, and the mixer no inject.
+@@ -1095,7 +1173,7 @@ pub fn hcReadFused(
+             defer _ = mlx.mlx_vector_array_free(vec);
+             var res = mlx.mlx_vector_array_new();
+             defer _ = mlx.mlx_vector_array_free(res);
+-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(which), vec, cfg, st));
++            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(if (which == 2 and hcU2On()) 3 else which), vec, cfg, st));
+             if (mlx.mlx_vector_array_size(res) != n_out) return error.MetalKernelBadOutputCount;
+             var got: usize = 0;
+             errdefer {
 diff --git a/src/scheduler.zig b/src/scheduler.zig
 index 8adeb60a..9c9a059f 100644
 --- a/src/scheduler.zig
@@ -2498,10 +3181,20 @@ index 00000000..a2a64000
 +    try std.testing.expect(!restoreFits(128*gib,std.math.maxInt(u64)));
 +}
 diff --git a/src/transformer.zig b/src/transformer.zig
-index c90ff413..0e8652d5 100644
+index c90ff413..04c43d34 100644
 --- a/src/transformer.zig
 +++ b/src/transformer.zig
-@@ -12891,6 +12891,15 @@ pub const ForwardCtx = struct {
+@@ -12860,6 +12860,9 @@ pub const ForwardCtx = struct {
+     /// position only. Used by the Qwen MTP head, whose committed-history
+     /// cache needs the trunk hidden at every verify/prefill position.
+     capture_hidden_all: ?*mlx.mlx_array = null,
++    /// R64: false = leave the `capture_hidden` / `capture_hidden_all` copies lazy (an MTP verify evaluates
++    /// them in its round's batched eval); true = settle them at capture (prefill's memory bound).
++    capture_settle: bool = true,
+     /// qwen4_exp: receives the PRE-mixer hyper-connection stream `[B, L,
+     /// hc*hidden]` (all positions) — what the MTP head consumes.
+     capture_stream_all: ?*mlx.mlx_array = null,
+@@ -12891,6 +12894,15 @@ pub const ForwardCtx = struct {
      /// for the verify pass on a GDN model; the flag reaches the layers via
      /// `Transformer.spec_capture_ssm`.
      capture_ssm_seq: bool = false,
@@ -2517,3 +3210,51 @@ index c90ff413..0e8652d5 100644
      /// MiMo spec verify: every row of this multi-row forward computes with its
      /// own decode tick's arithmetic (`mimoVerifyRowsAttn`), so greedy MTP is serial.
      verify_rows: bool = false,
+@@ -25808,7 +25820,9 @@ const MTP_COARSE_PAIRS_SOURCE =
+     \\}
+ ;
+ var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
+-var mtp_coarse_pairs_cfgs = QsaCfgCache(c_int, 1){};
++// R63: keyed by (rows, vocab rows): a vocab-prefix coarse head has fewer output rows.
++const MtpCoarsePairsKey = struct { rows: c_int, nout: c_int };
++var mtp_coarse_pairs_cfgs = QsaCfgCache(MtpCoarsePairsKey, 1){};
+ 
+ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, gs: u32) !?mlx.mlx_array {
+     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or bits != 3 or gs != 64) return null;
+@@ -25818,7 +25832,11 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
+     const ws = mlx.getShape(w);
+     const ss = mlx.getShape(sc);
+     if (xs.len != 3 or xs[0] < 2 or xs[0] > 8 or xs[1] != 1 or xs[2] != 2560) return null;
+-    if (!std.mem.eql(c_int, ws, &.{ 248320, 240 }) or !std.mem.eql(c_int, ss, &.{ 248320, 40 }) or !std.mem.eql(c_int, ss, mlx.getShape(bi))) return null;
++    // R63: any whole number of 8-row tiles (the full 248,320-row head or a vocab prefix).
++    if (ws.len != 2 or ss.len != 2) return null;
++    const nout = ws[0];
++    if (nout < 8 or @rem(nout, 8) != 0) return null;
++    if (ws[1] != 240 or ss[0] != nout or ss[1] != 40 or !std.mem.eql(c_int, ss, mlx.getShape(bi))) return null;
+     const kernel = blk: {
+         if (mtp_coarse_pairs_kernel) |value| break :blk value;
+         const ins = [_][*:0]const u8{ "x", "w", "sc", "bi", "K_size", "N_size" };
+@@ -25833,17 +25851,18 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
+         break :blk value;
+     };
+     const cfg = blk: {
+-        if (mtp_coarse_pairs_cfgs.get(xs[0])) |hit| break :blk hit[0];
++        const ckey = MtpCoarsePairsKey{ .rows = xs[0], .nout = nout };
++        if (mtp_coarse_pairs_cfgs.get(ckey)) |hit| break :blk hit[0];
+         const value = mlx.mlx_fast_metal_kernel_config_new();
+         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(value);
+-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ xs[0], 1, 248320 }, 3, .bfloat16));
+-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, 32, 248320 / 4, @divTrunc(xs[0] + 1, 2)));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ xs[0], 1, nout }, 3, .bfloat16));
++        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, 32, @divExact(nout, 4), @divTrunc(xs[0] + 1, 2)));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(value, 32, 2, 1));
+         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(value, "T", .bfloat16));
+-        mtp_coarse_pairs_cfgs.put(xs[0], .{value});
++        mtp_coarse_pairs_cfgs.put(ckey, .{value});
+         break :blk value;
+     };
+-    const values = [_]mlx.mlx_array{ x, w, sc, bi, cachedScalarInt(2560), cachedScalarInt(248320) };
++    const values = [_]mlx.mlx_array{ x, w, sc, bi, cachedScalarInt(2560), cachedScalarInt(nout) };
+     const iv = mlx.mlx_vector_array_new_data(&values, values.len);
+     defer _ = mlx.mlx_vector_array_free(iv);
+     var ov = mlx.mlx_vector_array_new();

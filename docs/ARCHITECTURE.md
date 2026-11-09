@@ -30,14 +30,20 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
 - **Decode** — Sushi decodes with its MTP head: each round verifies 1 + k drafted tokens, so a stage
   forward carries 1–16 rows. When fewer drafts are accepted, the next forward's position tells the stage
   how many rows to keep (a COMMIT folded into the next submission). The stage replays one captured CUDA
-  graph per row count, re-targeted with the new parameters each time.
+  graph per row count, re-targeted with the new parameters each time. On the Mac, a round's work starts
+  in pieces: finished layers of the verify go to the GPU while the CPU builds the rest of the graph, each
+  draft step starts as soon as it is built, and the verify's captured hidden states are read in the
+  round's one batched eval ([sushi/FORK.md](../sushi/FORK.md) §5). The n-gram embedding a verify gathers
+  late is filled before the rows go to the stage (§3).
 - **Prefill** — prompt chunks (up to 2,048 rows) are pipelined two deep: while the 5090 runs chunk *n*, the
   Mac runs layers 0–27 of chunk *n+1*. With each chunk the stage returns its layer state for those rows
   (the "pull-back"), so Sushi's caches stay complete. The prefix cache, MTP history and SSM checkpoints
   work as without the split, and a later request can seed the stage from them. The stage prefills about
   2K rows per 324 ms (~6.3K tok/s); the Mac's layers 0–27 are the bottleneck: 2.8–3.4K tok/s on cold
   64K–192K-token prompts, and 1.5× stock Sushi on the same cold 54K-token prompt. A split at layer 28 can
-  reach at most ~1.6× (the Mac's share of stock prefill time is ~62–65%).
+  reach at most ~1.6× (the Mac's share of stock prefill time is ~62–65%). Chunk ends are shaped so the
+  pipeline rarely waits: no sliver chunks next to SSM checkpoint boundaries, and a tail sized so the Mac's
+  chunk covers the stage's previous one, leaving a short final chunk to drain (§4).
 - **Seeding** — when the stage does not hold the request's sequence (a new request with a prefix-cache hit,
   say), Sushi uploads its exact committed state for layers 28–47 (about 5.9 KB per position plus 48 MB of
   recurrent state; up to 1.56 GB at full context, through a 2 GiB shared file).
@@ -98,7 +104,9 @@ One Python process: the OpenAI-compatible endpoint and request normalization (Qw
 thinking mode), the priority controller (`priority_control.py`), and supervision of the stage server and
 Sushi. It starts the stage server through macuda's preflight launcher, starts Sushi, and restarts both with
 backoff if Sushi crashes. On shutdown it stops Sushi first, so the stage server exits by itself when its
-socket closes; signals come only after 90 s. It keeps the memory/thermal guard (stops the engine below 12
+socket closes; signals come only after 90 s. `texas-split stop` signals the host itself and waits for this
+teardown before unloading the launchd job (`launchctl bootout` alone kills the job about 20 s after its
+SIGTERM, which could leave the GPU lock behind). It keeps the memory/thermal guard (stops the engine below 12
 GiB reclaimable memory, on swap or compression growth, or at critical thermal pressure), holds the display
 awake around the GPU's cold boot, keeps the Mac awake while running, and pins every binary it runs by
 SHA-256.

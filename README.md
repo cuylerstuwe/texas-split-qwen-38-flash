@@ -24,6 +24,10 @@ Measured on an M5 Max (128 GB) with an RTX 5090, macOS 27.2. Speedups come from 
 5090 runs its 20 at ~6.3K tok/s). Details in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/VALIDATION.md](docs/VALIDATION.md).
 
+**Update 2026-11-09:** a correctness fix for MTP decoding on the split, exact decode-round and prefill
+speedups. See [CHANGELOG.md](CHANGELOG.md); existing installs: `git pull`, `./install.sh sushi pins`,
+`bin/texas-split restart`.
+
 ## What you need
 
 - An **Apple Silicon Mac with 128 GB** of unified memory, macOS 26.2 or later (tested: M5 Max, macOS 27.2).
@@ -76,7 +80,7 @@ curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/
 |---|---|
 | `install.sh`, `bin/texas-split` | installer and CLI |
 | `host/` | the HTTP host and supervisor (`texas_split.py`), priority controller, tests |
-| `sushi/` | Sushi v1.3.0 with this project's changes: the pipeline split, 5090 stage client, background parking and the native-priority overlay ([sushi/FORK.md](sushi/FORK.md)) |
+| `sushi/` | Sushi v1.3.0 with this project's changes: the pipeline split, 5090 stage client, background parking, the native-priority overlay, and exact prefill/decode speedups ([sushi/FORK.md](sushi/FORK.md)) |
 | `stage/` | the 5090 stage server (Rust + CUDA kernels; prebuilt cubins included) |
 | `driver/` | macuda's `libtinynv` with this project's patches |
 | `third_party/macuda` | macuda (submodule, pinned): the GPU preflight and launch tooling |

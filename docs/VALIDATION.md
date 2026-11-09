@@ -75,6 +75,34 @@ calls (including parallel calls) and a tool-result turn; a non-streaming tool ca
 35,577-token prompt (correct answer); a concurrent stream waits for the first; a queued client that leaves
 is dropped; a cancelled stream frees the engine.
 
+## 2026-11-09 update (see CHANGELOG.md)
+
+- **Verify fix.** The forward now fills the deferred n-gram embedding before the stage send. Greedy MTP
+  continuations (256 tokens, cold 20K- and 54K-token agentic prompts) match a Mac-only run for 498 / 743
+  characters, against 37 / 136 before the fix.
+- **Bit-identical changes** (kernels, verify and draft scheduling) were checked in the fixed-depth MTP
+  mode, where every run is deterministic: whole two-session replays and greedy continuations came out
+  byte-identical with each change on and off. Per-round costs from the same runs: −0.5 ms (verify layers
+  handed to the GPU early, stride 4), −0.5 ms more (lazy captures plus early draft steps).
+- **Drafter-side changes** cannot change the output distribution (acceptance is exact). The vocab-prefix
+  draft head drafted the same tokens on the same text at lower cost. The extension-gate confidence
+  measured +2.0% decode throughput under the adaptive controller (three seeds: 103.3 → 107.9,
+  109.7 → 110.9, 107.9 → 108.5 tok/s).
+- **Chunk shaping.** Same-prompt runs are deterministic. Against the plain policy, end-of-prefill and
+  greedy-decode logprobs (top 20) differ by about 1e-3 mean KL per position at 20–54K tokens, with greedy
+  text identical for 24/24 tokens. Switching the chunk width from 4096 to 2048 rows moves them more (2.5e-3
+  to 4.3e-3). Pipeline stalls on the agentic replays: 4.8–4.9 → 2.8–2.9 s per session pair.
+- **Qualification of the final build.**
+  - Priority suite 8/8 exact in the fixed-depth mode, with SSD parking.
+  - smoke.py 10/10.
+  - `fault.py term`: the stream finished on the Mac.
+  - `FAULT_NONCE=x fault.py prefill`: the stage was killed 4 s into a cold 124K-token split prefill, and
+    the Mac finished it with the correct answer.
+  - The split came back when idle.
+- **Disk.** Sushi parks a background request only when the SSD has the checkpoint size plus 32 GiB free.
+  With less, the pause holds the request in RAM instead: resume is still exact, `park_error` shows in the
+  priority status, and the engine log says `checkpoint SSD reserve unavailable`.
+
 ## Not covered
 
 Sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated by

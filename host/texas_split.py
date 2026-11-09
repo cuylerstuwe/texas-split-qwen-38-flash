@@ -538,6 +538,19 @@ class Host:
                    DYLD_LIBRARY_PATH=str(LIBS), TEXAS_PRIORITY_IPC=str(self.ipc.path),
                    TEXAS_PRIORITY_CHECKPOINTS=str(self.checkpoint_dir))
         env.update(stage_env)
+        # Exact or noise-level speedups (sushi/FORK.md sections 3-4; each switch '0' restores the old path):
+        # - bit-identical 4-row router/gate kernels, and a coarse MTP draft head over vocab ids [0, 98304)
+        #   (proposal side only: acceptance stays exact, so the output distribution is unchanged);
+        env.update(SUSHI_MTP_DENSE_ROWS='1', SUSHI_MTP_DRAFT_HEAD_ROWS='98304')
+        # - split-prefill chunk shaping: no sliver chunks at checkpoint boundaries, and a tail sized so the
+        #   Mac covers the 5090's previous chunk (chunk placement only, like any prefix-restore point);
+        env.update(SUSHI_R63_SPLIT_FRAG='1024', SUSHI_R63_SPLIT_LAST='384')
+        # - MTP verify rounds: hand finished Mac layers to the GPU while the CPU builds the rest, keep the
+        #   verify's hidden captures lazy, start each draft step as soon as it is built (bit-identical);
+        env.update(SUSHI_R64_VERIFY_LADDER='4', SUSHI_R64_VERIFY_NOSETTLE='1', SUSHI_R64_CHAIN_LADDER='1')
+        # - the adaptive draft controller's extension gate reads its confidence from the 32-candidate rerank
+        #   shortlist instead of a full 248K-row head per draft step (drafter side only).
+        env.update(SUSHI_R64_SHORTLIST_CONF='1')
         # qualification only: extra Sushi variables as a JSON object (e.g. a fixed MTP width)
         extra = json.loads(CFG.get('TEXAS_SPLIT_SUSHI_ENV') or '{}')
         env.update({k: str(v) for k, v in extra.items() if k.startswith('SUSHI_')})
@@ -1051,6 +1064,12 @@ def loaded(label=LABEL):
     return call('launchctl', 'print', f'{DOMAIN}/{label}', check=False).returncode == 0
 
 
+def job_pid(label=LABEL):
+    r = call('launchctl', 'print', f'{DOMAIN}/{label}', check=False)
+    m = re.search(r'^\s*pid = (\d+)', r.stdout, re.M) if r.returncode == 0 else None
+    return int(m.group(1)) if m else None
+
+
 def host_health():
     try:
         with urllib.request.urlopen(f'http://127.0.0.1:{PORT}/health', timeout=2) as r:
@@ -1118,6 +1137,16 @@ def cli_start(mac_only=False, wait=True):
 
 def cli_stop():
     if loaded():
+        # Stop the host ourselves and wait for it first: its teardown (Sushi, then the stage server's card
+        # put-down, then the GPU lock) can outlast `launchctl bootout`, which kills the job ~20 s after its
+        # SIGTERM whatever ExitTimeOut says, leaving the lock behind with a dead owner. A clean exit (0) is
+        # not restarted (KeepAlive: SuccessfulExit false); bootout then only unloads the job.
+        pid = job_pid()
+        if pid and pid_alive(pid):
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 330
+            while pid_alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.5)
         call('launchctl', 'bootout', f'{DOMAIN}/{LABEL}', check=False)
         deadline = time.monotonic() + 330
         while (loaded() or port_open(PORT) or port_open(ENGINE_PORT)) and time.monotonic() < deadline:

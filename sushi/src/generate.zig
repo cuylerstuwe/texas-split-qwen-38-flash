@@ -1,4 +1,14 @@
 const std = @import("std");
+var r64_nosettle_env: ?bool = null;
+var r64_chain_ladder_env: ?bool = null;
+var r64_shortconf_env: ?bool = null;
+fn r64EnvOn(cache: *?bool, comptime name: [:0]const u8) bool {
+    if (cache.* == null) {
+        const raw = std.c.getenv(name);
+        cache.* = if (raw) |r| r[0] == '1' else false;
+    }
+    return cache.*.?;
+}
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
@@ -1442,6 +1452,102 @@ pub fn nextChunkEnd(
     return end;
 }
 
+/// R63: chunk shaping for the RTX 5090 split prefill (Mac layers [0, first) of chunk i+1 overlap the
+/// stage's layers of chunk i). Stalls the plain policy leaves:
+/// - a stride boundary just past a chunk's end forces a sliver chunk next (e.g. 183 rows), far too
+///   short to hide the stage's work on the big chunk before it: extend the chunk to that boundary when
+///   it lies within `frag` rows (a leading sliver right after a prefix restore merges forward instead);
+/// - a big final chunk drains on the stage after the Mac is done (~0.16 ms/row): near the end, size
+///   each chunk to cover the stage's previous one, so the final chunk is short.
+/// Chunk boundaries move (noise-level numerics, as for any prefix-restore position); every row's
+/// arithmetic is the chunked prefill's as before. A shaped chunk never grows past
+/// SPLIT_SHAPE_MAX_ROWS (the stage's 128 MiB per-chunk slot holds 6553 rows).
+/// SUSHI_R63_SPLIT_FRAG / SUSHI_R63_SPLIT_LAST (rows; 0 disables; defaults 1024 / 384).
+pub const SPLIT_SHAPE_MAX_ROWS: usize = 6144;
+pub fn splitChunkEnd(pos: usize, end_in: usize, loop_end: usize, want_ssm_cp: bool, stride: usize, offset: usize, frag: usize, last: usize) usize {
+    return splitChunkEndFull(pos, end_in, loop_end, want_ssm_cp, stride, offset, frag, last, 0, 0, 0);
+}
+
+/// Rows of Mac work (layers [0, first)) that cover the stage's work on a `prev`-row chunk: the stage
+/// runs ~0.16 ms/row, the Mac ~60 ms per chunk + ~0.24 ms/row (M5 Max, measured R63) -> 2/3 prev - 250.
+pub fn splitCoverRows(prev: usize) usize {
+    const need = (prev * 2) / 3;
+    return if (need > 250 + 512) need - 250 else 512;
+}
+
+/// `first`: the prefill's first chunk start (a leading sliver before a checkpoint boundary within
+/// `frag` rows of it merges into the next chunk: that interior checkpoint is skipped, the end-of-prompt
+/// snapshot still lands); `default_chunk`: the plain width (0 = no leading merge); `prev`: the
+/// previous chunk's rows (0 = none in flight). Tail rule (`last` > 0 = minimum final chunk): once the
+/// rest fits about one chunk, each chunk is just long enough for the Mac to cover the stage's work on
+/// the previous one, and a leftover under `last` rows rides with the final chunk.
+pub fn splitChunkEndFull(pos: usize, end_in: usize, loop_end: usize, want_ssm_cp: bool, stride: usize, offset: usize, frag: usize, last: usize, first: usize, default_chunk: usize, prev: usize) usize {
+    var end = end_in;
+    // leading sliver: the plain policy ended the first chunk on a boundary within `frag` rows
+    if (frag > 0 and default_chunk > 0 and pos == first and end < loop_end and end - pos < frag and want_ssm_cp and stride > 0 and (end + offset) % stride == 0) {
+        end = @min(end + default_chunk, loop_end);
+        const nb = ((end_in + offset) / stride + 1) * stride;
+        if (nb - offset < end) end = nb - offset;
+    }
+    // trailing sliver: a boundary just past this chunk's end
+    if (frag > 0 and want_ssm_cp and stride > 0 and end < loop_end) {
+        const abs_end = end + offset;
+        if (abs_end % stride != 0) {
+            const next_b = (abs_end / stride + 1) * stride;
+            if (next_b - abs_end <= frag and next_b - offset <= loop_end) end = next_b - offset;
+        }
+    }
+    // tail (within 1.5 chunks of the end): cover the stage's previous chunk (floored at 1024 rows so
+    // the chain cannot degrade into many tiny chunks), and a leftover under `last` rows rides along
+    if (last > 0 and prev > 0 and default_chunk > 0 and loop_end - pos <= default_chunk + default_chunk / 2) {
+        const want = @max(splitCoverRows(prev), @min(@as(usize, 1024), default_chunk));
+        if (loop_end - pos > want + last) {
+            end = @min(end, pos + want);
+        } else {
+            end = @min(end, loop_end);
+        }
+    }
+    if (end > end_in and end - pos > SPLIT_SHAPE_MAX_ROWS) end = end_in;
+    return end;
+}
+
+fn splitEnvRows(name: [*:0]const u8, comptime default: usize) usize {
+    const raw = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch default;
+}
+var split_frag_rows: ?usize = null;
+var split_last_rows: ?usize = null;
+pub fn splitFragRows() usize {
+    if (split_frag_rows == null) split_frag_rows = splitEnvRows("SUSHI_R63_SPLIT_FRAG", 1024);
+    return split_frag_rows.?;
+}
+pub fn splitLastRows() usize {
+    if (split_last_rows == null) split_last_rows = splitEnvRows("SUSHI_R63_SPLIT_LAST", 384);
+    return split_last_rows.?;
+}
+
+test "R63 split chunk shaping: sliver merge and covered tail" {
+    // warm A1: from abs 20297, chunk 4096 would leave a 183-row sliver before the 24576 boundary
+    try std.testing.expectEqual(@as(usize, 4279), splitChunkEndFull(0, 4096, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 0));
+    // tail after a 4279-row chunk: 2602 rows cover the stage's 4279
+    try std.testing.expectEqual(@as(usize, 4279 + 2602), splitChunkEndFull(4279, 8874, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 4279));
+    // then 1484 cover 2602; the 506 left (> 384) become the final chunk
+    try std.testing.expectEqual(@as(usize, 6881 + 1484), splitChunkEndFull(6881, 8874, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 2602));
+    try std.testing.expectEqual(@as(usize, 8874), splitChunkEndFull(8365, 8874, 8874, true, 4096, 20297, 1024, 384, 0, 4096, 1484));
+    // a small final remainder stays one chunk
+    try std.testing.expectEqual(@as(usize, 1500), splitChunkEndFull(0, 1500, 1500, true, 4096, 0, 1024, 384, 0, 4096, 0));
+    // leading 92-row sliver (restore at 65444, boundary 65536) merges into the next chunk
+    try std.testing.expectEqual(@as(usize, 4188), splitChunkEndFull(0, 92, 11055, true, 4096, 65444, 1024, 384, 0, 4096, 0));
+    // B0-like: 5225 rows left after full chunks -> 2480, then 1403, then the 1342 rest
+    try std.testing.expectEqual(@as(usize, 49152 + 2480), splitChunkEndFull(49152, 53248, 54377, true, 4096, 0, 1024, 384, 0, 4096, 4096));
+    try std.testing.expectEqual(@as(usize, 51632 + 1403), splitChunkEndFull(51632, 54377, 54377, true, 4096, 0, 1024, 384, 0, 4096, 2480));
+    try std.testing.expectEqual(@as(usize, 54377), splitChunkEndFull(53035, 54377, 54377, true, 4096, 0, 1024, 384, 0, 4096, 1403));
+    // disabled
+    try std.testing.expectEqual(@as(usize, 4096), splitChunkEndFull(0, 4096, 8874, true, 4096, 20297, 0, 0, 0, 4096, 0));
+    // an operator-widened 6144-row chunk is never extended past the stage slot bound
+    try std.testing.expectEqual(@as(usize, 6144), splitChunkEndFull(0, 6144, 20000, true, 4096, 2000, 1024, 384, 0, 6144, 0));
+}
+
 /// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
 /// absorbs a grid point.
 pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
@@ -2596,6 +2702,9 @@ pub const Generator = struct {
         ), options.decode_share_width_cap);
         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
         const trace_enabled = log.isDebug();
+        // R63 split chunk shaping: the prefill's first chunk start, the previous chunk's rows
+        var split_first_pos: usize = std.math.maxInt(usize);
+        var split_prev_rows: usize = 0;
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
@@ -2860,10 +2969,15 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = if (glm_request != null)
+                const end_base = if (glm_request != null)
                     glmChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                 else
                     nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                if (split_first_pos == std.math.maxInt(usize)) split_first_pos = pos;
+                const end = if (split_prefill and glm_request == null)
+                    splitChunkEndFull(pos, end_base, loop_end, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, splitFragRows(), splitLastRows(), split_first_pos, cur_chunk, split_prev_rows)
+                else
+                    end_base;
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3045,6 +3159,7 @@ pub const Generator = struct {
                     }
                     split_pending = .{ .pos = pos, .end = end, .cp = split_cp_new };
                     split_cp_new = null;
+                    split_prev_rows = end - pos;
                 }
                 if (vision_chunked) {
                     vision_rows_consumed += countSpliceRows(
@@ -5218,10 +5333,17 @@ pub const Generator = struct {
             // Rerank drafts skip the head's own logits projection entirely:
             // the token comes off the coarse readout's re-scored shortlist,
             // greedily (argmax) or sampled from a q over those 32 rows.
+            const conf_needed = chain.conf_arrs != null and i < chain.plan.m_lo;
+            // R64 (SUSHI_R64_SHORTLIST_CONF=1): the extension gate's ln p_head(draft) comes from the
+            // rerank shortlist (exact logits of the 32 candidates) instead of a full 248K head readout
+            // per step. The gate only sizes the draft; acceptance stays exact.
+            const shortconf = conf_needed and rerank_drafts and chain.q_probs != null and
+                r64EnvOn(&r64_shortconf_env, "SUSHI_R64_SHORTLIST_CONF");
+            var conf_done = false;
             const path = mtpDraftStepPath(
                 rerank_drafts,
                 !isGreedyTemperature(draft_sampling.temperature),
-                chain.conf_arrs != null and i < chain.plan.m_lo,
+                conf_needed and !shortconf,
             );
             const use_rerank = path != .full_logits;
             // `want_logits: bool` could not tell a rerank draft from a history
@@ -5275,6 +5397,14 @@ pub const Generator = struct {
             defer if (step_out.rerank_x.ctx != null) {
                 _ = mlx.mlx_array_free(step_out.rerank_x);
             };
+            // R64 chain ladder (SUSHI_R64_CHAIN_LADDER=1): start this step on the GPU while the CPU
+            // builds the next one (same graph, same order).
+            if (r64EnvOn(&r64_chain_ladder_env, "SUSHI_R64_CHAIN_LADDER") and i + 1 < to) {
+                const arrs = [_]mlx.mlx_array{step_out.hidden_next};
+                const vec = mlx.mlx_vector_array_new_data(&arrs, arrs.len);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                _ = mlx.mlx_async_eval(vec);
+            }
             if (use_rerank and chain.q_probs != null) {
                 const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
                 const slots = chain.q_probs.?;
@@ -5284,6 +5414,11 @@ pub const Generator = struct {
                     const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
                     chain.draft_arrs[i] = prop.id;
                     slots[i] = prop.q;
+                    if (shortconf) {
+                        chain.conf_arrs.?[i] = try shortlistConfidenceGraph(sl, prop.id, s);
+                        chain.n_conf = i + 1;
+                        conf_done = true;
+                    }
                 } else {
                     // The coarse head just retired: propose greedily and hand
                     // the verify the one-hot q that proposal really has.
@@ -5305,11 +5440,16 @@ pub const Generator = struct {
                 chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
             }
             chain.n_drafted = i + 1;
-            if (chain.conf_arrs != null and i < chain.plan.m_lo) {
+            if (chain.conf_arrs != null and i < chain.plan.m_lo and !conf_done) {
                 // Chunk-A confidence: log p_head(draft) — built from the
                 // step's own logits BEFORE they're freed (lazy graphs
                 // hold their inputs internally).
-                chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
+                if (step_out.logits.ctx != null) {
+                    chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
+                } else {
+                    // a shortconf step whose shortlist was refused: no confidence, no extension
+                    chain.conf_arrs.?[i] = mlx.mlx_array_new_float(-std.math.inf(f32));
+                }
                 chain.n_conf = i + 1;
             }
             if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
@@ -6754,6 +6894,10 @@ pub const Generator = struct {
         self.ctx.ple_defer = true;
         self.ctx.verify_rows = xfm.config.isMimo();
         defer self.ctx.verify_rows = false;
+        // R64: the verify's hidden captures ride the round's batched eval (Phase 4b) instead of two
+        // blocking settles right after the forward (SUSHI_R64_VERIFY_NOSETTLE=1).
+        self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
+        defer self.ctx.capture_settle = true;
         var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
@@ -10308,6 +10452,59 @@ fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx
 /// = log p_head(draft). Two vocab reductions on the head's own (draft-head)
 /// logits — must be built BEFORE the caller frees the logits handle (lazy
 /// graphs hold their inputs internally). Returns a `[1]`-shaped lazy array.
+/// R64: ln softmax(shortlist exact logits) at the draft's candidate slot — `draftConfidenceGraph` over
+/// the 32 re-scored candidates instead of the whole head (it overstates confidence by the head mass
+/// outside the shortlist, which is small exactly when the gate would extend).
+fn shortlistConfidenceGraph(sl: mtp_mod.Shortlist, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const flat = [_]c_int{-1};
+    const one = [_]c_int{1};
+    var ex = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ex);
+    {
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, sl.exact, &flat, 1, s));
+        try mlx.check(mlx.mlx_astype(&ex, r, .float32, s));
+    }
+    var lse = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lse);
+    try mlx.check(mlx.mlx_logsumexp_axis(&lse, ex, -1, false, s));
+    var cands = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cands);
+    {
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, sl.cands, &flat, 1, s));
+        try mlx.check(mlx.mlx_astype(&cands, r, .int32, s));
+    }
+    var did = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(did);
+    {
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, draft_id, &one, 1, s));
+        try mlx.check(mlx.mlx_astype(&did, r, .int32, s));
+    }
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_equal(&eq, cands, did, s));
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var sel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel);
+    try mlx.check(mlx.mlx_where(&sel, eq, ex, neg_inf, s));
+    var lg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lg);
+    try mlx.check(mlx.mlx_max_axis(&lg, sel, -1, false, s));
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, lg, lse, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, diff, &one, 1, s));
+    return out;
+}
+
 fn draftConfidenceGraph(logits: mlx.mlx_array, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var lse = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lse);

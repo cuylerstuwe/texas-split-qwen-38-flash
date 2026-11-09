@@ -31,7 +31,10 @@ def main():
     print(json.dumps({'stage_server_pid': pid, 'health': {k: health()[k] for k in ('status', 'mode')}}), flush=True)
     if MODE == 'prefill':
         filler = '\n'.join(f'Record {i}: sensor {i % 17} read {(i * 37) % 1000} units at minute {i}.' for i in range(5000))
-        messages = [{'role': 'user', 'content': filler + '\n\nWhich sensor reading is on Record 4321? Answer with the number of units only.'}]
+        # FAULT_NONCE (optional) changes the first tokens, so a rerun misses the prefix cache and prefills cold
+        nonce = os.environ.get('FAULT_NONCE')
+        head = f'[run {nonce}]\n' if nonce else ''
+        messages = [{'role': 'user', 'content': head + filler + '\n\nWhich sensor reading is on Record 4321? Answer with the number of units only.'}]
         max_tokens, think = 200, 'none'
     else:
         messages = [{'role': 'user', 'content': 'Write a detailed, numbered list of 40 practical tips for maintaining a home vegetable garden.'}]

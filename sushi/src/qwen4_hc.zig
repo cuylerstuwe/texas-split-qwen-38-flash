@@ -759,9 +759,87 @@ pub const HC_FUSED_U_SOURCE =
     \\}
 ;
 
+// R63: U with every weight word, scale and bias of the four streams issued before any arithmetic
+// (more loads in flight per simdgroup); the per-element arithmetic and accumulation order are U's,
+// so the output is bit-identical (checked rows 1-8). SUSHI_HC_U2=0 keeps U.
+pub const HC_FUSED_U2_SOURCE =
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint j = thread_position_in_grid.y;
+    \\const uint row0 = thread_position_in_grid.z * uint(ROWS);
+    \\const int VPW = 32 / BITS;
+    \\const int R_by_p = R / VPW;
+    \\const int R_by_gs = R / GS;
+    \\const int RIT = (R_by_p + 31) / 32;
+    \\uint mask = (1u << BITS) - 1u;
+    \\// All weight words, scales and biases of the four streams issued up front; arithmetic unchanged.
+    \\uint32_t pw[HC][RIT];
+    \\float sjv[HC][RIT], bjv[HC][RIT];
+    \\for (int h = 0; h < HC; ++h) {
+    \\  size_t row = (size_t)h * (size_t)H + (size_t)j;
+    \\  size_t wbase = row * (size_t)R_by_p;
+    \\  size_t gbase = row * (size_t)R_by_gs;
+    \\  for (int i = 0; i < RIT; ++i) {
+    \\    int pack = int(lane) + 32 * i;
+    \\    if (pack < R_by_p) {
+    \\      pw[h][i] = uw_q[wbase + (size_t)pack];
+    \\      int gi = (pack * VPW) / GS;
+    \\      sjv[h][i] = float(uw_s[gbase + (size_t)gi]);
+    \\      bjv[h][i] = float(uw_b[gbase + (size_t)gi]);
+    \\    } else { pw[h][i] = 0u; sjv[h][i] = 0.0f; bjv[h][i] = 0.0f; }
+    \\  }
+    \\}
+    \\float sum[ROWS];
+    \\for (int r = 0; r < ROWS; ++r) sum[r] = 0.0f;
+    \\for (int h = 0; h < HC; ++h) {
+    \\  size_t row = (size_t)h * (size_t)H + (size_t)j;
+    \\  float a0[ROWS], a1[ROWS], a2[ROWS], a3[ROWS];
+    \\  for (int r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; a2[r] = 0.0f; a3[r] = 0.0f; }
+    \\  for (int i = 0; i < RIT; ++i) {
+    \\    int pack = int(lane) + 32 * i;
+    \\    if (pack < R_by_p) {
+    \\      uint32_t pwv = pw[h][i];
+    \\      int k_base = pack * VPW;
+    \\      float sj = sjv[h][i];
+    \\      float bj = bjv[h][i];
+    \\      for (int ki = 0; ki < VPW; ki += 4) {
+    \\        int k = k_base + ki;
+    \\        uint32_t q = pwv >> (ki * BITS);
+    \\        for (int r = 0; r < ROWS; ++r) {
+    \\          const device T* act = act_in + (size_t)metal::min(row0 + uint(r), uint(NROWS - 1)) * (size_t)R;
+    \\          a0[r] += float(act[k + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
+    \\          a1[r] += float(act[k + 1]) * (float((q >> (1 * BITS)) & mask) * sj + bj);
+    \\          a2[r] += float(act[k + 2]) * (float((q >> (2 * BITS)) & mask) * sj + bj);
+    \\          a3[r] += float(act[k + 3]) * (float((q >> (3 * BITS)) & mask) * sj + bj);
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\  for (int r = 0; r < ROWS; ++r) {
+    \\    const device T* xn = xn_in + (size_t)metal::min(row0 + uint(r), uint(NROWS - 1)) * (size_t)(HC * H);
+    \\    float acc = simd_sum((a0[r] + a1[r]) + (a2[r] + a3[r]));
+    \\    T u = T(acc);
+    \\    T sg = T(1.0f / (1.0f + metal::exp(-float(u))));
+    \\    sum[r] += float(T(float(sg) * float(xn[row])));
+    \\  }
+    \\}
+    \\for (int r = 0; r < ROWS; ++r) {
+    \\  if (lane == 0 && row0 + uint(r) < uint(NROWS)) mixed_out[(size_t)(row0 + uint(r)) * (size_t)H + j] = T(float(T(sum[r])) * float(T(1.0f / float(HC))));
+    \\}
+;
+
+pub var hc_u2_override: ?bool = null;
+var hc_u2_env: ?bool = null;
+pub fn hcU2On() bool {
+    if (hc_u2_override) |v| return v;
+    if (hc_u2_env) |v| return v;
+    const v = if (std.c.getenv("SUSHI_HC_U2")) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
+    hc_u2_env = v;
+    return v;
+}
+
 pub const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
 
-pub var hc_fused_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
+pub var hc_fused_kernels: [4]?mlx.mlx_fast_metal_kernel = .{ null, null, null, null };
 
 /// One config set per row count, inject and pending write: MTP alternates widths every round, a
 /// forward's first read and any read after a flush have no pending write, and the mixer no inject.
@@ -1095,7 +1173,7 @@ pub fn hcReadFused(
             defer _ = mlx.mlx_vector_array_free(vec);
             var res = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(res);
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(which), vec, cfg, st));
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(if (which == 2 and hcU2On()) 3 else which), vec, cfg, st));
             if (mlx.mlx_vector_array_size(res) != n_out) return error.MetalKernelBadOutputCount;
             var got: usize = 0;
             errdefer {

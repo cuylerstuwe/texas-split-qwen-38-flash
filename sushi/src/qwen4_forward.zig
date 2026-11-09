@@ -9,6 +9,15 @@ extern "c" fn stage_split_seed_begin(position: u64) c_int;
 extern "c" fn stage_split_seed_recurrent(conv: mlx.mlx_array, ssm: mlx.mlx_array, s: mlx.mlx_stream) c_int;
 extern "c" fn stage_split_seed_attention(keys: mlx.mlx_array, ks: mlx.mlx_array, kb: mlx.mlx_array, values: mlx.mlx_array, vs: mlx.mlx_array, vb: mlx.mlx_array, pooled: mlx.mlx_array, raw: mlx.mlx_array, len: u64, s: mlx.mlx_stream) c_int;
 extern "c" fn stage_split_seed_end(position: u64) c_int;
+var r64_vladder: ?u32 = null;
+fn r64VerifyLadder() u32 {
+    if (r64_vladder == null) {
+        const raw = std.c.getenv("SUSHI_R64_VERIFY_LADDER");
+        r64_vladder = if (raw) |r| (std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 0) else 0;
+        if (r64_vladder.? != 0) log.info("[r64] verify ladder: stride {d}\n", .{r64_vladder.?});
+    }
+    return r64_vladder.?;
+}
 extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
 extern "c" fn stage_split_prefill_begin(owner: u64) void;
 extern "c" fn stage_split_bind(owner: u64) void;
@@ -2197,12 +2206,19 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     // scheduler's stage recovery), never Mac-only from stale caches.
     if (stage_first == null and stage_split_resident(stageOwner(ctx)) != 0) return error.StageSplitForward;
     if (stage_first != null) stage_split_bind(stageOwner(ctx));
+    // R64: verify ladder for split MTP verify forwards (rows 2..16), SUSHI_R64_VERIFY_LADDER=<stride>.
+    const vladder: u32 = if (seq_len > 1 and seq_len <= 16 and stage_first != null and ctx.stage_prefill == 0 and
+        ctx.batch_slots == null and !prof.timing and !dt.on) r64VerifyLadder() else 0;
     var layer_idx: usize = 0;
     while (layer_idx < layerCap(cfg.num_hidden_layers)) {
         const li: u32 = @intCast(layer_idx);
         if (stage_first) |first| if (layer_idx == first) {
             // R60 pipeline split: layers [first, 48) on the RTX 5090; resume after layer 47.
             try self.hcFlush(&h, batch, seq_len, &pending);
+            // The stage send below evaluates layers [0, first). A deferred PLE leaf (an MTP verify's
+            // lazy draft ids) must be filled before that, or layer 1 reads its zero initialization
+            // (R64: every split verify round did until 2026-11-09; see plePreEval). Same gather, earlier.
+            try self.plePreEval(ctx);
             std.debug.assert(deferred == null);
             if (ctx.stage_prefill != 0) {
                 // R60 S4 (prefill v2): the chunk's rows through the stage's prefill path.
@@ -2342,6 +2358,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             }
         }
 
+        // R64 verify ladder: hand the finished layers to the GPU while the CPU builds the rest of the
+        // verify graph. Layer 0 precedes the PLE leaf (trunk layer 1), so it can start right behind the
+        // draft chain; at later points the deferred leaf is filled first (a blocking wait on the draft
+        // ids, then the host gather). Same graph, same order, started earlier: bit-identical.
+        if (vladder != 0 and layer_idx + 1 < stage_first.? and (layer_idx == 0 or (layer_idx + 1) % vladder == 0)) {
+            if (ctx.ple_pending != null) try self.plePreEval(ctx);
+            const arrs = [_]mlx.mlx_array{ h, mlp_out };
+            const vec = mlx.mlx_vector_array_new_data(&arrs, arrs.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_async_eval(vec);
+        }
+
         if (ctx.capture_layers) |cl| {
             for (cl.ids, cl.out) |cid, *slot| {
                 if (cid == li) {
@@ -2378,9 +2406,9 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
     // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
     if (ctx.capture_hidden) |target| {
-        try capturePrefillHiddenLast(self.s, target, h, true);
+        try capturePrefillHiddenLast(self.s, target, h, ctx.capture_settle);
     }
-    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, true);
+    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, ctx.capture_settle);
 
     const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
     // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
@@ -3314,6 +3342,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
         switch (which) {
             0 => "sushi_hc_read_n",
             1 => "sushi_hc_read_d",
+            3 => "sushi_hc_read_u2",
             else => "sushi_hc_read_u",
         },
         in_vec,
@@ -3321,6 +3350,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
         switch (which) {
             0 => HC_FUSED_N_SOURCE,
             1 => HC_FUSED_D_SOURCE,
+            3 => qwen4_hc.HC_FUSED_U2_SOURCE,
             else => HC_FUSED_U_SOURCE,
         },
         "",
