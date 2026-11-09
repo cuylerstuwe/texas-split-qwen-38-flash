@@ -15,11 +15,13 @@ driver (`libtinynv`, a C port of tinygrad's NVIDIA driver) through tinygrad's si
 |---|---|---|
 | Decode, agentic coding sessions | ~79–84 tok/s | **~98–111 tok/s** |
 | Total task time, same sessions | 1.00× | **1.28–1.34× faster** |
-| Prefill, cold 192K-token prompt (pipelined Mac → 5090) | — | 2.8K tok/s |
+| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **18.2 s (~3.0K tok/s), 1.5× faster** |
+| Prefill, cold 64K / 192K-token prompts | not measured at these lengths | 3.1–3.4K / 2.8–3.3K tok/s |
 | Quality vs. a teacher model (KL, short panel) | .00458 | .00446 (same level) |
 
 Measured on an M5 Max (128 GB) with an RTX 5090, macOS 27.2. Speedups come from the 5090 taking 20 of the
-48 layers' decode work; prefill is pipelined between the two machines. Details in
+48 layers' work; prefill is pipelined between the two machines and limited by the Mac's 28 layers (the
+5090 runs its 20 at ~6.3K tok/s). Details in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## What you need

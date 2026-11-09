@@ -8,6 +8,21 @@ revision `f25c0c4`. Evidence files are in [evidence/](evidence/); the tests are 
 - **Total task time** on recorded agentic coding sessions, replayed request by request (prefill + decode +
   queueing, the thinking sampler): 1.28×, 1.33× and 1.34× faster than stock Sushi on the same pack (pooled
   1.32×). Decode ~98–111 tok/s vs ~79–84 tok/s.
+- **Prefill** (cold prompts, nothing cached):
+
+  | Prompt | Stock Sushi, Mac only | texas-split |
+  |---|---|---|
+  | 54K tokens, first turn of a recorded agent session (time to first token, same prompt) | 27.5 s (~2.0K tok/s) | 18.2 s (~3.0K tok/s): 1.52× |
+  | 63,596 tokens (two runs) | not run | 3,443 and 3,101 tok/s |
+  | 192,008 tokens (two runs) | not run | 2,814 and 3,289 tok/s |
+  | 8K / 32K tokens, separate runs with prefix caching off | 2,048–2,714 / 2,105–2,539 tok/s | — |
+
+  Across the multi-turn sessions (later turns mostly cached), summed time to first token fell from 15.3 to
+  11.4 s (1.34×) in one session and from 38.7 to 25.8 s (1.50×) in the other. The 5090 runs its 20 layers'
+  prefill at ~6,300 tok/s (324 ms per 2,048 rows), so the Mac's 28 layers set the pace: a split at layer 28
+  can reach at most ~1.6×, and the 54K turn was within ~1.1 s of that. Run-to-run spread is about ±10%
+  (heat, and whether the 95 GiB n-gram table is in the page cache). Two 63.6K runs that were parked
+  mid-prefill by the priority tests (2,692 and 2,943 tok/s, pause included) are left out above.
 - **Quality**: mean KL divergence to a teacher model on a fixed prompt panel: 0.004463 split vs 0.004581
   Mac-only (short panel). Split vs Mac-only directly: KL 0.00052 per token, the two disagreeing on the top
   token 35 times in 5,765. Paired by prompt, split minus Mac-only is −0.000117 (bootstrap 95% CI

@@ -35,7 +35,9 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
   Mac runs layers 0–27 of chunk *n+1*. With each chunk the stage returns its layer state for those rows
   (the "pull-back"), so Sushi's caches stay complete. The prefix cache, MTP history and SSM checkpoints
   work as without the split, and a later request can seed the stage from them. The stage prefills about
-  2K rows per 324 ms; the Mac is the bottleneck (2.8K tok/s on a cold 192K-token prompt).
+  2K rows per 324 ms (~6.3K tok/s); the Mac's layers 0–27 are the bottleneck: 2.8–3.4K tok/s on cold
+  64K–192K-token prompts, and 1.5× stock Sushi on the same cold 54K-token prompt. A split at layer 28 can
+  reach at most ~1.6× (the Mac's share of stock prefill time is ~62–65%).
 - **Seeding** — when the stage does not hold the request's sequence (a new request with a prefix-cache hit,
   say), Sushi uploads its exact committed state for layers 28–47 (about 5.9 KB per position plus 48 MB of
   recurrent state; up to 1.56 GB at full context, through a 2 GiB shared file).
