@@ -1,0 +1,86 @@
+diff --git a/driver-r38/libtinynv/src/exec.c b/driver-r38/libtinynv/src/exec.c
+index a81accb..b9562b0 100644
+--- a/driver-r38/libtinynv/src/exec.c
++++ b/driver-r38/libtinynv/src/exec.c
+@@ -1829,6 +1829,10 @@ int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out) {
+   *out = NULL;
+   if (!r) return tinynv_fail("no token is being recorded");
+   ex->rec = NULL;
++  if (ex->pdl_mode == 64 && (r->n != 5 || r->nchains != 1)) {
++    r->failed=1;
++    tinynv_fail("R44 side probe requires exactly A/side/B/C/join in one chain");
++  }
+   int failed = r->failed, n = (int)r->n;
+   if (failed || !n) {
+     tinynv_exec_graph_free(ex, r);
+@@ -2269,6 +2273,14 @@ static int build_qmd(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_ke
+ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_kernel_desc_t *k, const uint32_t grid[3],
+                       const uint32_t block[3], uint32_t dyn_smem, const void *params, size_t params_len, uint32_t cbuf0_bytes) {
+   tinynv_graph_rec_t *r = ex->rec;
++  if (ex->pdl_mode == 64) {
++    const char *names[]={"r44_a","r44_side","r44_b","r44_c","r44_join"};
++    if (r->n>=5 || ex->chain_max<5 || (strcmp(k->name,names[r->n]) &&
++        !(r->n==2 && !strcmp(k->name,"r44_b_nowait")))) {
++      r->failed=1;
++      return tinynv_fail("R44 accepts only the bounded five-node side probe");
++    }
++  }
+   const uint64_t slot = TINYNV_QMD_SLOT_BYTES, need = slot + cbuf0_bytes;
+   uint64_t off = (r->used + 255) & ~255ull;
+   if (off + need > r->size) {
+@@ -2289,7 +2301,16 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+   }
+   if (ch) {
+     // R38 experiment: early dependent launch fields, written before the link and before either descriptor is copied
+-    if (ex->pdl_mode && (!(ex->pdl_mode & 32) || !strncmp(k->name, "r39pdl_", 7)) && tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), ex->pdl_mode)) {
++    if (ex->pdl_mode == 64) {
++      // A arrives1; side has no shader wait and can run independently.
++      // side arrives2; B waits1 (A), not2 (side). B->C stays serialized.
++      // C->join is NOT early; join waits2, draining side before tail release.
++      int bad=0;
++      if (r->n==1) bad=tinynv_qmd_r44_edge(&r->prev_qmd,&q,1,1,1);
++      if (r->n==2) bad=tinynv_qmd_r44_edge(&r->prev_qmd,&q,2,1,1);
++      if (r->n==4) bad=tinynv_qmd_r44_edge(&r->prev_qmd,&q,4,2,0);
++      if (bad) {r->failed=1;return -1;}
++    } else if (ex->pdl_mode && (!(ex->pdl_mode & 32) || !strncmp(k->name, "r39pdl_", 7)) && tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), ex->pdl_mode)) {
+       r->failed = 1; return -1;
+     }
+     // the previous descriptor schedules this one; its bytes are written again with the link in them
+diff --git a/driver-r38/libtinynv/src/qmd.c b/driver-r38/libtinynv/src/qmd.c
+index 29ad4e9..2e93053 100644
+--- a/driver-r38/libtinynv/src/qmd.c
++++ b/driver-r38/libtinynv/src/qmd.c
+@@ -399,3 +399,18 @@ int tinynv_qmd_r38_pdl(tinynv_qmd_t *prev, tinynv_qmd_t *next, uint32_t latch, i
+ #undef R38_SET
+   return 0;
+ }
++
++int tinynv_qmd_r44_edge(tinynv_qmd_t *prev, tinynv_qmd_t *next,
++                       uint32_t arrive, uint32_t wait, int early) {
++  if (prev->v3 || next->v3) return tinynv_fail("R44 requires Blackwell QMD V05");
++#define R44_SET(q,f,v) do { if (tinynv_qmd_set((q),TINYNV_QMD_##f##_LO,TINYNV_QMD_##f##_HI,(v))) return -1; } while (0)
++  if (early) R44_SET(prev,PRE_EXIT_AT_LAST_CTA_LAUNCH,1);
++  R44_SET(prev,ARRIVE_AT_LATCH_ID,arrive);
++  R44_SET(prev,ARRIVE_AT_LATCH_VALID,1);
++  R44_SET(next,WAIT_ON_LATCH_ID,wait);
++  R44_SET(next,WAIT_ON_LATCH_VALID,1);
++  R44_SET(next,LATCH_ACQUIRE_INVALIDATE_SHADER_DATA_CACHE,1);
++  R44_SET(next,LATCH_ACQUIRE_INVALIDATE_TEXTURE_DATA_CACHE,1);
++#undef R44_SET
++  return 0;
++}
+diff --git a/driver-r38/libtinynv/src/qmd.h b/driver-r38/libtinynv/src/qmd.h
+index ccd3319..1c81701 100644
+--- a/driver-r38/libtinynv/src/qmd.h
++++ b/driver-r38/libtinynv/src/qmd.h
+@@ -127,6 +127,10 @@ int tinynv_qmd_chain(tinynv_qmd_t *prev, uint64_t next_qmd_addr, int prefetch);
+ // WAIT_ON_LATCH (id = latch) with the latch-acquire L1/texture invalidates, 8 next HOLD_CTA_LAUNCH_UNTIL_PARENT_LATCH_
+ // ACQUIRE_AND_CTA_COMPLETE, 16 next HOLD_MEMBAR_UNTIL_LATCH_ACQUIRE.
+ int tinynv_qmd_r38_pdl(tinynv_qmd_t *prev, tinynv_qmd_t *next, uint32_t latch, int mode);
++// R44 isolated five-node synthetic probe. Explicit arrive/wait IDs permit a
++// side node and a later mandatory drain; not enabled in ordinary graphs.
++int tinynv_qmd_r44_edge(tinynv_qmd_t *prev, tinynv_qmd_t *next,
++                       uint32_t arrive, uint32_t wait, int early);
+ 
+ // Constant buffer 0's driver parameters, which are where a kernel finds the windows its shared and local memory live in.
+ // Returns how many dwords were written, or 0 if the buffer is too short for them.

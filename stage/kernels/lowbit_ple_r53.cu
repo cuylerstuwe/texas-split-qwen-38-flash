@@ -1,0 +1,120 @@
+// Native PLE component, grounded in Sushi qwen4_hc.zig/transformer.zig (MIT,
+// NOTICE.txt). Packed host-selected ngram rows, original affine4 projections,
+// grouped norms, signed-root gate, dilated convolution and prefix ownership.
+typedef unsigned short bf;
+enum {H=2560,HC=4,F=10240,HISTORY=9,DIM=160};
+__device__ __forceinline__ float load(bf x) {return __uint_as_float((unsigned)x<<16);}
+__device__ __forceinline__ bf store(float x) {bf b;asm("cvt.rn.bf16.f32 %0, %1;":"=h"(b):"f"(x));return b;}
+__device__ __forceinline__ float rb(float x) {return load(store(x));}
+__device__ __forceinline__ float sigmoid(float x) {return rb(1.f/(1.f+expf(-x)));}
+__device__ __forceinline__ float sum(float v,float* partial) {
+  int t=threadIdx.x;
+  for(int s=16;s;s>>=1)v+=__shfl_down_sync(0xffffffffU,v,s);
+  if((t&31)==0)partial[t/32]=v;
+  __syncthreads();
+  float out=0;for(int i=0;i<8;i++)out+=partial[i];
+  // All readers finish before another reduction reuses the shared storage.
+  __syncthreads();return out;
+}
+extern "C" __global__ void ple_unpack(const unsigned char* raw,bf* embedding,int rows) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*H)return;
+  int head=i/DIM,j=i%DIM,heads=rows*16;
+  const bf* scales=(const bf*)(raw+heads*80);
+  const bf* biases=(const bf*)(raw+heads*90);
+  unsigned q=(raw[head*80+j/2]>>((j&1)*4))&15;
+  embedding[i]=store(float(q)*load(scales[head*5+j/32])+load(biases[head*5+j/32]));
+}
+__device__ __forceinline__ void norm_pair(const bf* key,const bf* x,
+ const bf* kw,const bf* qw,bf* kn,bf* qn,float* a,float* b,float* partial) {
+  int row=blockIdx.y,h=blockIdx.x,t=threadIdx.x;float ka=0,qa=0;
+  for(int j=0;j<10;j++) {int at=row*F+h*H+t+j*256;
+    a[j]=load(key[at]);b[j]=load(x[at]);ka=fmaf(a[j],a[j],ka);qa=fmaf(b[j],b[j],qa);}
+  float ki=rsqrtf(sum(ka,partial)/float(H)+1e-6f);
+  float qi=rsqrtf(sum(qa,partial)/float(H)+1e-6f);
+  for(int j=0;j<10;j++) {int d=h*H+t+j*256,at=row*F+d;
+    a[j]=rb(rb(a[j]*ki)*load(kw[d]));b[j]=rb(rb(b[j]*qi)*load(qw[d]));
+    kn[at]=store(a[j]);qn[at]=store(b[j]);}
+}
+__device__ __forceinline__ void gate_value(const bf* value,float* a,float* b,
+ bf* dots,bf* scaled,bf* roots,bf* gates,bf* gated,float* partial) {
+  int row=blockIdx.y,h=blockIdx.x,t=threadIdx.x;float dot=0;
+  for(int j=0;j<10;j++)dot+=rb(a[j]*b[j]);
+  dot=rb(sum(dot,partial));float sc=rb(dot*rb(rsqrtf(float(H))));
+  float root=rb(rb(sqrtf(fmaxf(fabsf(sc),rb(1e-6f))))*(sc==0?0.f:(sc<0?-1.f:1.f)));
+  float g=sigmoid(root);
+  if(t==0){int at=row*HC+h;dots[at]=store(dot);scaled[at]=store(sc);roots[at]=store(root);gates[at]=store(g);}
+  for(int j=0;j<10;j++){int d=t+j*256;gated[row*F+h*H+d]=store(g*load(value[row*H+d]));}
+}
+extern "C" __global__ void ple_norm_pair(const bf* key,const bf* x,const bf* kw,
+ const bf* qw,bf* kn,bf* qn) {
+  __shared__ float partial[8];float a[10],b[10];norm_pair(key,x,kw,qw,kn,qn,a,b,partial);
+}
+extern "C" __global__ void ple_gate(const bf* kn,const bf* qn,const bf* value,
+ bf* dots,bf* scaled,bf* roots,bf* gates,bf* gated) {
+  __shared__ float partial[8];float a[10],b[10];
+  for(int j=0;j<10;j++){int at=blockIdx.y*F+blockIdx.x*H+threadIdx.x+j*256;a[j]=load(kn[at]);b[j]=load(qn[at]);}
+  gate_value(value,a,b,dots,scaled,roots,gates,gated,partial);
+}
+extern "C" __global__ void ple_norm_gate(const bf* key,const bf* x,const bf* kw,
+ const bf* qw,const bf* value,bf* kn,bf* qn,bf* dots,bf* scaled,bf* roots,bf* gates,bf* gated) {
+  __shared__ float partial[8];float a[10],b[10];
+  norm_pair(key,x,kw,qw,kn,qn,a,b,partial);
+  gate_value(value,a,b,dots,scaled,roots,gates,gated,partial);
+}
+extern "C" __global__ void ple_norm(const bf* x,const bf* w,bf* y) {
+  __shared__ float partial[8];float a[10],s=0;int t=threadIdx.x,row=blockIdx.y,h=blockIdx.x;
+  for(int j=0;j<10;j++){a[j]=load(x[row*F+h*H+t+j*256]);s=fmaf(a[j],a[j],s);}
+  float inv=rsqrtf(sum(s,partial)/float(H)+1e-6f);
+  for(int j=0;j<10;j++){int d=h*H+t+j*256;y[row*F+d]=store(rb(a[j]*inv)*load(w[d]));}
+}
+extern "C" __global__ void ple_conv(const bf* x,const bf* gated,const bf* norm,
+ const bf* initial,const bf* w,bf* conv,bf* activated,bf* addend,bf* output,int rows) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*F)return;
+  int row=i/F,d=i%F;float c=0;
+  for(int j=0;j<4;j++){int r=row+3*j;float v=load(r<HISTORY?initial[r*F+d]:norm[(r-HISTORY)*F+d]);c=fmaf(v,load(w[d*4+j]),c);}
+  c=rb(c);float a=rb(c*sigmoid(c)),y=rb(load(gated[i])+a);
+  conv[i]=store(c);activated[i]=store(a);addend[i]=store(y);output[i]=store(load(x[i])+y);
+}
+extern "C" __global__ void ple_commit(const bf* initial,const bf* norm,bf* next,int accepted) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=HISTORY*F)return;
+  int r=i/F+accepted,d=i%F;next[i]=r<HISTORY?initial[r*F+d]:norm[(r-HISTORY)*F+d];
+}
+extern "C" __global__ void ple_restore(const bf* next,bf* initial) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<HISTORY*F)initial[i]=next[i];
+}
+
+// GENERATED by tools/build_r53_tail_source.py
+extern "C" __global__ void ple_normx(const bf* x,const bf* w,bf* y) {
+  __shared__ float partial[8];float a[10],s=0,wv[10];int t=threadIdx.x,row=blockIdx.y,h=blockIdx.x;
+  for(int j=0;j<10;j++){a[j]=load(x[row*F+h*H+t+j*256]);s=fmaf(a[j],a[j],s);wv[j]=load(w[h*H+t+j*256]);}
+  float inv=rsqrtf(sum(s,partial)/float(H)+1e-6f);
+  for(int j=0;j<10;j++){int d=h*H+t+j*256;y[row*F+d]=store(rb(a[j]*inv)*wv[j]);}
+}
+__device__ __forceinline__ void norm_pairx(const bf* key,const bf* x,
+ const bf* kw,const bf* qw,bf* kn,bf* qn,float* a,float* b,float* partial) {
+  int row=blockIdx.y,h=blockIdx.x,t=threadIdx.x;float ka=0,qa=0,kv[10],qv[10];
+  for(int j=0;j<10;j++) {int at=row*F+h*H+t+j*256;
+    a[j]=load(key[at]);b[j]=load(x[at]);ka=fmaf(a[j],a[j],ka);qa=fmaf(b[j],b[j],qa);kv[j]=load(kw[h*H+t+j*256]);qv[j]=load(qw[h*H+t+j*256]);}
+  float ki=rsqrtf(sum(ka,partial)/float(H)+1e-6f);
+  float qi=rsqrtf(sum(qa,partial)/float(H)+1e-6f);
+  for(int j=0;j<10;j++) {int d=h*H+t+j*256,at=row*F+d;
+    a[j]=rb(rb(a[j]*ki)*kv[j]);b[j]=rb(rb(b[j]*qi)*qv[j]);
+    kn[at]=store(a[j]);qn[at]=store(b[j]);}
+}
+__device__ __forceinline__ void gate_valuex(const float* vv,float* a,float* b,
+ bf* dots,bf* scaled,bf* roots,bf* gates,bf* gated,float* partial) {
+  int row=blockIdx.y,h=blockIdx.x,t=threadIdx.x;float dot=0;
+  for(int j=0;j<10;j++)dot+=rb(a[j]*b[j]);
+  dot=rb(sum(dot,partial));float sc=rb(dot*rb(rsqrtf(float(H))));
+  float root=rb(rb(sqrtf(fmaxf(fabsf(sc),rb(1e-6f))))*(sc==0?0.f:(sc<0?-1.f:1.f)));
+  float g=sigmoid(root);
+  if(t==0){int at=row*HC+h;dots[at]=store(dot);scaled[at]=store(sc);roots[at]=store(root);gates[at]=store(g);}
+  for(int j=0;j<10;j++){int d=t+j*256;gated[row*F+h*H+d]=store(g*vv[j]);}
+}
+extern "C" __global__ void ple_norm_gatex(const bf* key,const bf* x,const bf* kw,
+ const bf* qw,const bf* value,bf* kn,bf* qn,bf* dots,bf* scaled,bf* roots,bf* gates,bf* gated) {
+  __shared__ float partial[8];float a[10],b[10],vv[10];
+  {int row=blockIdx.y,t=threadIdx.x;for(int j=0;j<10;j++)vv[j]=load(value[row*H+t+j*256]);}
+  norm_pairx(key,x,kw,qw,kn,qn,a,b,partial);
+  gate_valuex(vv,a,b,dots,scaled,roots,gates,gated,partial);
+}

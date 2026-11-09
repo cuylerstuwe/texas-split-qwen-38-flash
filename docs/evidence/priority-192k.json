@@ -1,0 +1,135 @@
+[
+ {
+  "case": "large-context-decode-greedy-lease",
+  "exact": true,
+  "switch_s": 1.5201856670028064,
+  "in_prefill": false,
+  "lease": true,
+  "paused_tokens": 53,
+  "paused_phase": 2,
+  "checkpoint_bytes": 2121662464,
+  "pauses": 1,
+  "frozen": true,
+  "usage": {
+   "prompt_tokens": 192008,
+   "completion_tokens": 191,
+   "total_tokens": 192199,
+   "prompt_tokens_details": {
+    "cached_tokens": 191977
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference_usage": {
+   "prompt_tokens": 192008,
+   "completion_tokens": 191,
+   "total_tokens": 192199,
+   "prompt_tokens_details": {
+    "cached_tokens": 191977
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference": {
+   "role": "assistant",
+   "content": "Entry 0: station 0 logged 0 units, status check.\nEntry 7: station 7 logged 371 units, status check.\nEntry 14: station 14 logged 742 units, status check.\nEntry 21: station 21 logged 116 units, status check.\nEntry 28: station 5 logged 487 units, status check.\nEntry 35: station 12 logged 858 units, status check.\nEntry 42: station 19 logged 232 units, status check.\nEntry 49: station 3 logged 603 units, status check.\nEntry 56: station 10 logged 974 units, status check.\nEntry 63: station 17 logged 348 units, status check."
+  },
+  "resumed": {
+   "role": "assistant",
+   "content": "Entry 0: station 0 logged 0 units, status check.\nEntry 7: station 7 logged 371 units, status check.\nEntry 14: station 14 logged 742 units, status check.\nEntry 21: station 21 logged 116 units, status check.\nEntry 28: station 5 logged 487 units, status check.\nEntry 35: station 12 logged 858 units, status check.\nEntry 42: station 19 logged 232 units, status check.\nEntry 49: station 3 logged 603 units, status check.\nEntry 56: station 10 logged 974 units, status check.\nEntry 63: station 17 logged 348 units, status check."
+  },
+  "foreground": [
+   "A compiler is a program that translates source code written in a high-level programming language into machine code that a computer can execute."
+  ],
+  "before": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "8bfbc69efa6848f899697babe6f9f6eb",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 53,
+     "prompt_tokens": 192008,
+     "paused": true,
+     "pauses": 1,
+     "checkpoint_bytes": 2121662464,
+     "checkpoint_freed_bytes": 2121662464,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 5,
+    "hold": 1,
+    "state": 3,
+    "ack": 5,
+    "bytes": 2121662464,
+    "pauses": 1,
+    "tokens": 53,
+    "prompt": 192008,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 2121662464,
+    "available": 28191375360
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  },
+  "after": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "8bfbc69efa6848f899697babe6f9f6eb",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 53,
+     "prompt_tokens": 192008,
+     "paused": true,
+     "pauses": 1,
+     "checkpoint_bytes": 2121662464,
+     "checkpoint_freed_bytes": 2121662464,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 6,
+    "hold": 1,
+    "state": 3,
+    "ack": 6,
+    "bytes": 2121662464,
+    "pauses": 1,
+    "tokens": 53,
+    "prompt": 192008,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 2121662464,
+    "available": 31002247168
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  }
+ }
+]

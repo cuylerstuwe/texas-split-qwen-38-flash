@@ -1,0 +1,139 @@
+diff --git a/driver-r38/libtinynv/src/exec.c b/driver-r38/libtinynv/src/exec.c
+index 980b474..47896fc 100644
+--- a/driver-r38/libtinynv/src/exec.c
++++ b/driver-r38/libtinynv/src/exec.c
+@@ -1044,7 +1044,9 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
+     // shared location for "the last value anyone asked for" was the bug: that number may have been written and then
+     // overwritten by the other engine finishing something older, and the acquire then waits for it forever.
+     int other = !qi;
+-    if (ex->q_last[other]) {
++    // R53 (TINYNV_R53_SKIP_DONE_ACQUIRE=1): a value the host has already read back from that queue's own slot is
++    // already satisfied - the slot is released only after the work it reports - so the acquire is left out.
++    if (ex->q_last[other] && !(ex->r53_skip_done_acquire && sem_read_slot(ex, other) >= ex->q_last[other])) {
+       if (tinynv_cmd_wait(c, ex->sem.va + SEM_SLOT(other), ex->q_last[other])) return -1;
+       ex->pending_acquire_other = ex->q_last[other];
+     }
+@@ -1055,7 +1057,9 @@ static int batch_begin(tinynv_exec_t *ex, tinynv_queue_t *q, uint32_t dwords, ti
+   // chain's kernels could still be executing: bytes the guest issued AFTER those launches, underneath them. The standalone
+   // batches that carry held bytes on their own (a copy's, a full list's) had no same-queue acquire at all. Now all of
+   // them take it, and the chain flush no longer emits a second one.
+-  if (sq) {
++  // R53: left out under TINYNV_R53_SKIP_DONE_ACQUIRE only when the host has already seen the compute slot reach the
++  // value, i.e. every launch before this batch has finished, which is what the acquire exists to ensure (H4).
++  if (sq && !(ex->r53_skip_done_acquire && sem_read_slot(ex, 0) >= ex->q_last[0])) {
+     if (tinynv_cmd_wait(c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) return -1;
+     ex->pending_acquire = ex->q_last[0];
+   }
+@@ -1802,7 +1806,7 @@ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+     if (k == 0)
+       for (int i = 0; i < r->nchains; i++)
+         if (tinynv_cmd_inline_upload(&c, r->chains[i].tail_va, tails[i].b, TINYNV_QMD_BYTES)) { ex->defer_ring = 0; return -1; }
+-    if (!ex->sync && ex->q_last[0]) {
++    if (!ex->sync && ex->q_last[0] && !(ex->r53_skip_done_acquire && sem_read_slot(ex, 0) >= ex->q_last[0])) {
+       if (tinynv_cmd_wait(&c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) { ex->defer_ring = 0; return -1; }
+       ex->pending_acquire = ex->q_last[0];
+     }
+@@ -2330,6 +2334,11 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+       int mode = ex->pdl_mode;
+       if ((mode & 128) && r->prev_trig) mode = (mode & ~1) | 2;
+       if (tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), mode)) { r->failed = 1; return -1; }
++      // R53 barrier (bit 256): on an edge whose successor waits on this predecessor's latch (bit 4), the predecessor
++      // ends without its end-of-grid barrier (CWD_MEMBAR_TYPE none). What orders the two grids is the latch the
++      // successor's griddepcontrol.wait acquires, with its L1/texture invalidates; serialized edges, chain tails and
++      // releasing ordering are untouched. Priced on replay-probe, qualified on pdl-stress and hop-stress first.
++      if ((mode & 256) && (mode & 4) && tinynv_qmd_membar(&r->prev_qmd, TINYNV_QMD_MEMBAR_NONE)) { r->failed = 1; return -1; }
+     }
+     // the previous descriptor schedules this one; its bytes are written again with the link in them
+     if (tinynv_qmd_chain(&r->prev_qmd, qmd_va, ex->chain_prefetch)) { r->failed = 1; return -1; }
+@@ -2880,6 +2889,7 @@ int tinynv_exec_init(tinynv_gpu_t *g, tinynv_exec_t *ex) {
+   { const char *e5 = getenv("TINYNV_LAUNCH_PROFILE"); ex->profile = e5 && *e5 && *e5 != '0'; }
+   ex->kprof = tinynv_exec_kernel_profile(getenv("TINYNV_KERNEL_PROFILE"));
+   ex->ring_async = tinynv_exec_ring_async(getenv("TINYNV_RING_ASYNC"));
++  { const char *e = getenv("TINYNV_R53_SKIP_DONE_ACQUIRE"); ex->r53_skip_done_acquire = e && *e && *e != '0'; }
+   ex->dtod_via_compute = tinynv_exec_dtod_via_compute(getenv("TINYNV_DTOD_VIA_COMPUTE"));
+   fprintf(stderr, "libtinynv: device-to-device copies are served by a caller's kernel on the compute queue (%s), so they join "
+                   "the launch chain instead of handing it over%s\n",
+diff --git a/driver-r38/libtinynv/src/exec.h b/driver-r38/libtinynv/src/exec.h
+index 4c2feed..884bfc3 100644
+--- a/driver-r38/libtinynv/src/exec.h
++++ b/driver-r38/libtinynv/src/exec.h
+@@ -411,6 +411,7 @@ typedef struct {
+   // - sixteen launches into the next chain, or at the next wait or announcement, whichever comes first. The round
+   // trip (~25 us to the server process) then overlaps descriptor building instead of blocking it.
+   int ring_async;
++  int r53_skip_done_acquire;   // R53 (TINYNV_R53_SKIP_DONE_ACQUIRE): omit acquires the host has seen satisfied
+   // TINYNV_DTOD_VIA_COMPUTE: serve device-to-device copies with the lent copy kernel so they join the launch chain
+   // instead of handing it over. See dtod_by_kernel in tinynv.c for the measurement that motivated it.
+   int dtod_via_compute;
+diff --git a/driver-r38/libtinynv/src/gpu.h b/driver-r38/libtinynv/src/gpu.h
+index 862f6c4..1598516 100644
+--- a/driver-r38/libtinynv/src/gpu.h
++++ b/driver-r38/libtinynv/src/gpu.h
+@@ -23,6 +23,8 @@ struct tinynv_gpu {
+   int ring_pending, ring_n;
+   uint32_t ring_want;
+   tinynv_queue_t *ring_q[64];
++  // R53 (TINYNV_R53_RING_PIPELINE): the doorbells already went out right behind the fence read.
++  int ring_doorbelled;
+   tinynv_flcn_t flcn;
+   tinynv_gsp_t gsp;
+ };
+diff --git a/driver-r38/libtinynv/src/submit.c b/driver-r38/libtinynv/src/submit.c
+index 892f439..22fa91f 100644
+--- a/driver-r38/libtinynv/src/submit.c
++++ b/driver-r38/libtinynv/src/submit.c
+@@ -18,6 +18,7 @@
+ #include "internal.h"
+ #include "nv_regs.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #define NV_METHOD(subc, mthd, n) ((2u << 28) | ((uint32_t)(n) << 16) | ((uint32_t)(subc) << 13) | ((uint32_t)(mthd) >> 2))
+@@ -329,6 +330,24 @@ int tinynv_submit_stage(tinynv_gpu_t *g, tinynv_queue_t *q, uint64_t cmdbuf_va,
+   return 0;
+ }
+ 
++// R53 project-local experiment, TINYNV_R53_RING_PIPELINE=1: send the doorbells immediately behind the fence read
++// instead of after its reply. The socket backend's helper performs one connection's requests in order and its read
++// blocks until the device answers, so the write pointer still lands before the doorbell; the client only stops waiting
++// for the answer before saying "look", and the engine hears it one helper round trip sooner. The reply is drained and
++// checked exactly as before, at the next request or wait. Unset: unchanged.
++static int r53_ring_pipeline(void) {
++  static int on = -1;
++  if (on < 0) { const char *e = getenv("TINYNV_R53_RING_PIPELINE"); on = e && *e && *e != '0'; }
++  return on;
++}
++static void ring_doorbells(tinynv_gpu_t *g) {
++  for (int i = 0; i < g->ring_n; i++) {
++    int seen = 0;
++    for (int j = 0; j < i; j++) if (g->ring_q[j] == g->ring_q[i]) { seen = 1; break; }
++    if (!seen) tinynv_wr32(&g->dev, TINYNV_DOORBELL, g->ring_q[i]->token);
++  }
++}
++
+ int tinynv_submit_ring_send(tinynv_gpu_t *g) {
+   if (!g->nstaged) return 0;
+   // One in flight at a time: the socket carries one conversation, and an announcement owed must be paid first.
+@@ -362,6 +381,7 @@ int tinynv_submit_ring_send(tinynv_gpu_t *g) {
+   g->ring_n = g->nstaged;
+   g->nstaged = 0;
+   g->ring_pending = 1;
++  if (r53_ring_pipeline()) { ring_doorbells(g); g->ring_doorbelled = 1; }
+   return 0;
+ }
+ 
+@@ -378,11 +398,8 @@ int tinynv_submit_ring_complete(tinynv_gpu_t *g) {
+             "device\n");
+   }
+   // one doorbell per queue, however many of its batches were staged: the doorbell says "look", not "how many"
+-  for (int i = 0; i < g->ring_n; i++) {
+-    int seen = 0;
+-    for (int j = 0; j < i; j++) if (g->ring_q[j] == g->ring_q[i]) { seen = 1; break; }
+-    if (!seen) tinynv_wr32(&g->dev, TINYNV_DOORBELL, g->ring_q[i]->token);
+-  }
++  if (!g->ring_doorbelled) ring_doorbells(g);
++  g->ring_doorbelled = 0;
+   g->ring_n = 0;
+   g->ring_pending = 0;
+   return 0;

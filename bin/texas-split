@@ -1,0 +1,6 @@
+#!/bin/sh
+# texas-split CLI: start|stop|restart|status|health|logs [--follow]|serve|install-plist|uninstall|write-pins|check
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PY=${TEXAS_SPLIT_PYTHON:-$(sed -n 's/^TEXAS_SPLIT_PYTHON=//p' "$ROOT/texas-split.env" 2>/dev/null | tail -1)}
+[ -n "$PY" ] || PY=$(command -v python3.13 || command -v python3.12 || command -v python3)
+exec "$PY" "$ROOT/host/texas_split.py" "$@"

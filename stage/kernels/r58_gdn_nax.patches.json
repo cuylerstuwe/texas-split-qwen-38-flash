@@ -1,0 +1,12 @@
+[
+  {
+    "why": "R58: gated_delta_fused_nax gains a GateT template parameter for g and beta (FP32 gates)",
+    "old": "template <typename InT, int Dk, int Dv, int Hk, int Hv, int C>\n[[kernel]] void gated_delta_fused_nax(",
+    "new": "template <typename InT, typename GateT, int Dk, int Dv, int Hk, int Hv, int C>\n[[kernel]] void gated_delta_fused_nax("
+  },
+  {
+    "why": "R58: g is read as GateT",
+    "old": "    const device InT* g [[buffer(4)]],\n    const device InT* beta [[buffer(5)]],\n    device InT* y [[buffer(6)]],\n    device float* state_out [[buffer(7)]],\n    constant int& T [[buffer(8)]],\n    uint3 thread_position_in_grid [[thread_position_in_grid]],\n    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],\n    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n  auto n = thread_position_in_grid.z;",
+    "new": "    const device GateT* g [[buffer(4)]],\n    const device GateT* beta [[buffer(5)]],\n    device InT* y [[buffer(6)]],\n    device float* state_out [[buffer(7)]],\n    constant int& T [[buffer(8)]],\n    uint3 thread_position_in_grid [[thread_position_in_grid]],\n    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],\n    uint thread_index_in_simdgroup [[thread_index_in_simdgroup]]) {\n  auto n = thread_position_in_grid.z;"
+  }
+]

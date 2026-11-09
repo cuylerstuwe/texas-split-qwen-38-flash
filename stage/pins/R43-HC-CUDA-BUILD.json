@@ -1,0 +1,15 @@
+{
+  "cubin": "kernels/lowbit_hc_r43.sm120.cubin",
+  "cubin_bytes": 602080,
+  "cubin_sha256": "950b1ebcc12590558f2e9e0f8457e5b1fbeccbf86bb34838023710140c9defc6",
+  "source": "kernels/lowbit_hc_r43.cu",
+  "nvrtc_version": [
+    13,
+    0
+  ],
+  "options": [
+    "--gpu-architecture=sm_120",
+    "--std=c++17",
+    "--fmad=false"
+  ]
+}

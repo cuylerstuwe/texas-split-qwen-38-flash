@@ -1,0 +1,35 @@
+diff --git a/driver-r38/include/tinynv.h b/driver-r38/include/tinynv.h
+index 0743c8b..77b6ea4 100644
+--- a/driver-r38/include/tinynv.h
++++ b/driver-r38/include/tinynv.h
+@@ -143,6 +143,8 @@ tinynv_status_t tinynv_set_keepalive_kernel(tinynv_device_t, tinynv_kernel_t);
+ // device, a chain shape a recording cannot rely on): the caller then replays launch by launch.
+ typedef struct tinynv_graph *tinynv_graph_t;
+ tinynv_status_t tinynv_graph_begin(tinynv_stream_t);
++// Isolated R45 build only: 0(serial) or64(five-node R44 protocol), outside capture.
++tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t, int mode);
+ tinynv_status_t tinynv_graph_end(tinynv_stream_t, tinynv_graph_t *out);
+ tinynv_status_t tinynv_graph_launch(tinynv_stream_t, tinynv_graph_t);
+ void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);
+diff --git a/driver-r38/libtinynv/src/tinynv.c b/driver-r38/libtinynv/src/tinynv.c
+index 8ce7ade..49978dd 100644
+--- a/driver-r38/libtinynv/src/tinynv.c
++++ b/driver-r38/libtinynv/src/tinynv.c
+@@ -814,6 +814,17 @@ static void keepalive_launch(tinynv_stream_t s) {
+   }
+ }
+ 
++// R45 project-local capture control. Only descriptor construction reads this
++// mode; sealed graphs retain their own immutable dependency fields. This lets
++// one owner interleave serial and skip-edge controls without another client.
++tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t s, int mode) {
++  if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
++  NEED_GPU(s);
++  if (mode != 0 && mode != 64) return TINYNV_ERR_INVALID;
++  tinynv_exec_t *ex = &s->dev->exec;
++  return WITH_LOCK(ex->rec ? TINYNV_ERR_INVALID : (ex->pdl_mode = mode, TINYNV_OK));
++}
++
+ tinynv_status_t tinynv_graph_begin(tinynv_stream_t s) {
+   if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
+   NEED_GPU(s);

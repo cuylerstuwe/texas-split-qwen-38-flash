@@ -1,0 +1,2519 @@
+diff --git a/build.zig b/build.zig
+index ba868813..c31662ba 100644
+--- a/build.zig
++++ b/build.zig
+@@ -317,6 +317,12 @@ fn addEncoderModule(b: *std.Build, host: *std.Build.Module, exl3: *std.Build.Mod
+ /// Release packaging rewrites their @rpath install names to @executable_path.
+ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
+     module.addIncludePath(b.path("lib/mlx/include"));
++    module.addIncludePath(b.path("lib/mlx-src"));
++    module.addCSourceFile(.{ .file = b.path("native/texas_ipc.c"), .flags = &.{ "-O2", "-std=c11" } });
++    module.addObjectFile(b.path("native/texas_checkpoint.o"));
++    // R60 pipeline split (isolated experiment): the RTX 5090 stage client.
++    module.addObjectFile(b.path("native/stage_split.o"));
++    module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
+     module.addLibraryPath(b.path("lib/mlx/lib"));
+     // Prevent Homebrew's mlx-c.pc from overriding the staged libraries.
+     module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+diff --git a/docs/envvar.md b/docs/envvar.md
+index 53e17cee..ef43ff39 100644
+--- a/docs/envvar.md
++++ b/docs/envvar.md
+@@ -178,3 +178,7 @@ Read by `scripts/` and `tests/` (shell and Python), not by the engine. Engine va
+ | `SUSHI_QSA_NAX_PRECISION` | `qsa_nax_precision.py` | verbose mode of the Python precision harness; not read by the engine |
+ | `QWEN4_REF_DTYPE`, `QWEN4_TEACHER_FIXTURE`, `MIMO_V2_REF`, `MIMO_V2_FIXTURE_DEBUG`, `HF_HUB_OFFLINE`, `PYTHONPATH`, `KLD_JSON`, `QWEN_PREPROCESS_FIXTURE`-family (`QWEN_PREPROCESS_MIN_PIXELS`, `_MAX_PIXELS`, `_DOWNSCALE_*`) | `tests/dump_*_fixtures.py`, parity scripts | oracle dumpers and preprocessing parity inputs |
+ | `MLX_SRC`, `MLX_SHA`, `MLXC_SRC`, `MLXC_SHA`, `MLXC_PATCH`, `MLX_DEPLOYMENT_TARGET`, `MLX_STAGE`, `ZIG`, `ZIG_VERSION`, `GH_REPO` | `scripts/build-mlx.sh`, `fetch-zig.sh`, `release.sh` | pinned build inputs and release plumbing |
++
++## Local Texas overlay
++
++`TEXAS_PRIORITY_IPC` and `TEXAS_PRIORITY_CHECKPOINTS` are private host-supplied paths, read once when the inference owner opens its native controller and when it parks a request. They select the isolated native overlay, not a quantization or quality setting. See [Texas native priority](server-texas-priority.md).
+diff --git a/docs/server-texas-priority.md b/docs/server-texas-priority.md
+new file mode 100644
+index 00000000..0db980ca
+--- /dev/null
++++ b/docs/server-texas-priority.md
+@@ -0,0 +1,48 @@
++# Texas native foreground/background overlay
++
++This local overlay ports Texas's live-process priority contract onto Sushi 1.3.0.
++The OpenAI-facing supervisor owns authenticated, independent controller leases
++and direct foreground tickets. A private atomic IPC page connects those holds to
++the sole inference owner. No MLX operation runs in the supervisor or a control
++thread. Without the private IPC environment, ordinary Sushi behavior remains.
++
++The owner suspends one background stack at a completed prefill chunk or decode
++boundary, drains the MLX stream, releases per-request MTP/SSM ownership from shared
++modules, and pumps foreground work on that same owner. Texas uses one foreground
++request at a time. A queued direct foreground request or media encode also holds
++the local gate. Background work never joins a foreground batch.
++
++All logical request state, grammar, RNG, stream state and unfinished prefill
++locals remain live. Large materialized request allocations, including ancestors of pending lazy
++request graphs, may park losslessly on SSD. Symbolic leaves remain untouched.
++Protection traverses model/private/published-cache roots and their lazy
++dependencies without evaluating symbolic leaves. Published roots are retained
++while nested foreground work runs, and unfinished background write-through
++publication is deferred until completion/cancellation.
++
++Parking preserves MLX Data identity, offsets, strides and aliases. Every write
++and fsync completes before any buffer is released. Each allocation carries a
++SHA-256 checksum verified before restored data is published. Write failure keeps
++the original RAM. Truncation, corruption or unrecoverable allocation failure
++terminates before incomplete tensors execute. Checkpoints are exclusive 0600,
++cache-bypassed files beneath a locked 0700 directory, with a 24 GiB request cap
++and 32 GiB additional disk reserve.
++
++Restoration waits for 12 GiB reclaimable supply plus parked bytes. New holds
++during restoration require re-parking before a drained acknowledgement. Owner
++acknowledgements carry the current IPC sequence; an idle observation by a
++controller is not sufficient. Native idle waits retain foreground wakeup,
++residency keepalive and sleep-inhibition policy.
++
++MLX's hidden per-dylib random TLS is not the helper's inline `default_()` state.
++The checkpoint helper resolves the pinned library's TLV descriptors by symbol
++name and saves/restores its actual live KeySequence. This is a private MLX ABI
++dependency, like Data buffer mutation; a changed or stripped library requires
++requalification. Missing symbols fail closed. Native fixtures exercise the real
++library RNG, alias/stride/weight protection, partial writes, truncated reads and
++checksum corruption.
++
++Deployment pins, limits and watchdogs belong to the isolated Texas host. The
++canonical model and original Sushi MLX dylibs/metallib are reused in place.
++Crash/reboot recovery of an in-flight request and background media are outside
++this live-process contract.
+diff --git a/native/stage_split.cpp b/native/stage_split.cpp
+new file mode 100644
+index 00000000..6bee66e5
+--- /dev/null
++++ b/native/stage_split.cpp
+@@ -0,0 +1,600 @@
++// R60 pipeline split (isolated experiment): Sushi's side of the RTX 5090 stage, which runs the
++// canonical target's layers [first, 48) in qwen-hybrid-rs canon-stage-server. One Unix socket
++// (SUSHI_STAGE_SOCKET) carries 32-byte messages; one shared file (SUSHI_STAGE_SHM) carries the
++// BF16 HC stream rows and state seeds. Enabled only when both variables are set.
++//
++// Commits are inferred from positions: a forward at P with the previous forward covering
++// [base, base+rows) commits P-base rows first (all of them after a full accept or a serial step,
++// fewer after a speculative partial accept whose trunk Sushi already rolled back). A normal full
++// forward (prefill) invalidates the stage; the next split forward re-seeds it from Sushi's caches.
++//
++// Sequences (texas-split background parking): the stage holds one sequence's state, named by its
++// owner (Sushi's slot: the address of its KV cache). A different owner's first stage call re-seeds
++// (or restores). A sequence that decoded on the stage is "resident": its layers [first, 48) exist
++// only on the stage, so it must never continue Mac-only from Sushi's caches (the forward errors and
++// the scheduler re-runs it from its tokens). Parking (op 7) writes the stage's committed state of
++// the owner to an SSD file; its next stage call restores it (op 8) instead of re-seeding.
++#include <mlx/c/mlx.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace {
++// 2 GiB: the largest state seed (262160 rows: 5 attention layers x 1152 B/row + 15 recurrent states,
++// ~1.56 GB) fits whole; canon-stage-server maps the same size.
++constexpr size_t kShmBytes = size_t(2) << 30;
++constexpr uint32_t kMagic = 0x31534451;  // "QDS1"
++constexpr int kF = 10240;
++int g_fd = -1;
++int g_first = -2;  // -2 unopened, -1 disabled
++uint8_t* g_shm = nullptr;
++bool g_valid = false;   // the stage holds this sequence's state
++uint64_t g_base = 0;    // first position of the last forward
++uint64_t g_rows = 0;    // rows of the last forward (uncommitted)
++size_t g_at = 0;        // seed blob cursor
++uint64_t g_forwards = 0, g_seeds = 0, g_partials = 0;
++double g_rpc_us = 0, g_copy_us = 0;
++// R60 S4 (prefill v2): pipelined chunk prefill through the stage (op 6). Two shm slots after the
++// forward/seed area; replies arrive in send order. While chunks are in flight no other op may run.
++constexpr size_t kSlotBase = size_t(256) << 20;
++constexpr size_t kSlotStride = size_t(256) << 20;  // per slot: stream area, then the pull-back blob
++constexpr size_t kSlotBytes = size_t(128) << 20;   // stream area (the blob starts here)
++uint64_t g_pf_export_len = 0;
++int g_pf_export_slot = -1;
++int g_pullback = -1;
++int g_inflight = 0, g_pf_head = 0;
++uint32_t g_pf_rows[2] = {0, 0};
++uint64_t g_pf_pos[2] = {0, 0};
++uint64_t g_pf_next = 0, g_pf_chunks = 0;
++double g_pf_send_us = 0, g_pf_wait_us = 0;
++
++double now_us() {
++  return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++// Fatal-stage fallback: a stage that fails, closes or stops answering is dead for the rest of this
++// process. Every split entry point then refuses, stage_split_first() reports the split disabled
++// (every layer runs on the Mac), and the scheduler re-runs the request it was serving Mac-only.
++// SUSHI_STAGE_TIMEOUT_MS bounds each socket wait (default 60 s; a prefill reply gets twice that);
++// SUSHI_STAGE_DEAD_FILE receives the reason, for the host.
++bool g_dead = false;
++int g_timeout_ms = -1;
++uint64_t g_reply_arg = 0;  // the last reply's arg word
++uint64_t g_owner = 0;      // the sequence whose state the stage holds (valid when g_valid)
++uint64_t g_resident[16] = {};
++struct Park {
++  uint64_t owner, position;
++  char path[1024];
++};
++Park g_parks[8] = {};
++uint64_t g_parked = 0, g_restored = 0;
++bool resident_has(uint64_t o) {
++  for (uint64_t r : g_resident)
++    if (o && r == o) return true;
++  return false;
++}
++void resident_add(uint64_t o) {
++  if (!o || resident_has(o)) return;
++  for (uint64_t& r : g_resident)
++    if (!r) { r = o; return; }
++  fprintf(stderr, "[stage] residency table full\n");
++}
++void resident_del(uint64_t o) {
++  for (uint64_t& r : g_resident)
++    if (r == o) r = 0;
++}
++Park* park_find(uint64_t o) {
++  for (Park& e : g_parks)
++    if (o && e.owner == o) return &e;
++  return nullptr;
++}
++void park_drop(Park* e) {
++  if (!e || !e->owner) return;
++  unlink(e->path);
++  e->owner = 0;
++  e->position = 0;
++  e->path[0] = 0;
++}
++int timeout_ms() {
++  if (g_timeout_ms < 0) {
++    const char* t = getenv("SUSHI_STAGE_TIMEOUT_MS");
++    g_timeout_ms = t ? atoi(t) : 60000;
++    if (g_timeout_ms < 100) g_timeout_ms = 60000;
++  }
++  return g_timeout_ms;
++}
++void mark_dead(const char* why) {
++  if (g_dead) return;
++  g_dead = true;
++  g_valid = false;
++  g_inflight = 0;
++  for (Park& e : g_parks) park_drop(&e);  // a re-run from tokens replaces every parked state
++  if (g_fd >= 0) {
++    shutdown(g_fd, SHUT_RDWR);
++    close(g_fd);
++    g_fd = -1;
++  }
++  fprintf(stderr, "[stage] DEAD: %s; every layer runs on the Mac from now on\n", why);
++  if (const char* f = getenv("SUSHI_STAGE_DEAD_FILE")) {
++    if (FILE* o = fopen(f, "w")) {
++      fprintf(o, "%s\n", why);
++      fclose(o);
++    }
++  }
++}
++bool io(void* p, size_t n, bool wr, int limit_ms = -1) {
++  if (g_fd < 0) return false;
++  auto* b = static_cast<uint8_t*>(p);
++  const double deadline = now_us() + 1000.0 * (limit_ms > 0 ? limit_ms : timeout_ms());
++  while (n) {
++    const int left = int((deadline - now_us()) / 1000.0);
++    if (left <= 0) return false;
++    pollfd pfd{g_fd, short(wr ? POLLOUT : POLLIN), 0};
++    const int r = poll(&pfd, 1, left);
++    if (r < 0 && errno == EINTR) continue;
++    if (r <= 0) return false;
++    ssize_t k = wr ? write(g_fd, b, n) : read(g_fd, b, n);
++    if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
++    if (k <= 0) return false;
++    b += k;
++    n -= size_t(k);
++  }
++  return true;
++}
++int rpc(uint32_t op, uint32_t rows, uint64_t position, uint64_t arg, uint32_t aux = 0) {
++  if (g_dead) return -1;
++  if (g_inflight) {
++    fprintf(stderr, "[stage] op %u with %d prefill chunks in flight\n", op, g_inflight);
++    return -1;
++  }
++  uint8_t m[32] = {};
++  memcpy(m, &op, 4);
++  memcpy(m + 8, &rows, 4);
++  memcpy(m + 12, &aux, 4);
++  memcpy(m + 16, &position, 8);
++  memcpy(m + 24, &arg, 8);
++  if (!io(m, 32, true) || !io(m, 32, false)) {
++    char why[96];
++    snprintf(why, sizeof why, "socket failure or timeout on op %u", op);
++    mark_dead(why);
++    return -1;
++  }
++  uint32_t status;
++  memcpy(&status, m + 4, 4);
++  memcpy(&g_reply_arg, m + 24, 8);
++  if (status) {
++    char why[480];
++    snprintf(why, sizeof why, "op %u failed: %.400s", op, reinterpret_cast<const char*>(g_shm));
++    mark_dead(why);
++    return -1;
++  }
++  return 0;
++}
++void align16() { g_at = (g_at + 15) & ~size_t(15); }
++bool g_put_overflow = false;  // a seed blob outgrew shm: the seed fails instead of writing past it
++void put(const void* p, size_t n) {
++  if (g_put_overflow || g_at + n > kShmBytes) {
++    g_put_overflow = true;
++    return;
++  }
++  memcpy(g_shm + g_at, p, n);
++  g_at += n;
++}
++// A contiguous evaluated copy of `a` (optionally cast); caller frees.
++int materialize(mlx_array* out, mlx_array a, int cast, mlx_dtype dt, mlx_stream s) {
++  mlx_array c = mlx_array_new();
++  if (cast) {
++    mlx_array t = mlx_array_new();
++    if (mlx_astype(&t, a, dt, s)) return -1;
++    if (mlx_contiguous(&c, t, false, s)) return -1;
++    mlx_array_free(t);
++  } else if (mlx_contiguous(&c, a, false, s)) {
++    return -1;
++  }
++  if (mlx_array_eval(c)) return -1;
++  *out = c;
++  return 0;
++}
++// [1, H, T, W] -> [T, H, W] (rows 0..len of axis 2), appended to the blob.
++int put_token_major(mlx_array a, uint64_t len, mlx_stream s) {
++  const int* sh = mlx_array_shape(a);
++  if (mlx_array_ndim(a) != 4 || uint64_t(sh[2]) < len) return -1;
++  mlx_array cut = mlx_array_new(), tr = mlx_array_new(), c = mlx_array_new();
++  const int start[4] = {0, 0, 0, 0}, stop[4] = {sh[0], sh[1], int(len), sh[3]}, strides[4] = {1, 1, 1, 1};
++  const int axes[4] = {0, 2, 1, 3};
++  if (mlx_slice(&cut, a, start, 4, stop, 4, strides, 4, s)) return -1;
++  if (mlx_transpose_axes(&tr, cut, axes, 4, s)) return -1;
++  if (materialize(&c, tr, 0, MLX_UINT8, s)) return -1;
++  const size_t bytes = mlx_array_size(c) * mlx_array_itemsize(c);
++  const void* data = nullptr;
++  switch (mlx_array_dtype(c)) {
++    case MLX_UINT32: data = mlx_array_data_uint32(c); break;
++    case MLX_BFLOAT16: data = mlx_array_data_bfloat16(c); break;
++    case MLX_UINT8: data = mlx_array_data_uint8(c); break;
++    default: fprintf(stderr, "[stage] KV dtype %d\n", int(mlx_array_dtype(c))); return -1;
++  }
++  put(data, bytes);
++  align16();
++  mlx_array_free(cut);
++  mlx_array_free(tr);
++  mlx_array_free(c);
++  return 0;
++}
++}  // namespace
++
++extern "C" {
++// Layer index where the stage begins, or -1 when the split is disabled (lazy open).
++int stage_split_first(void) {
++  if (g_dead) return -1;
++  if (g_first != -2) return g_first;
++  g_first = -1;
++  const char* sock = getenv("SUSHI_STAGE_SOCKET");
++  const char* shm = getenv("SUSHI_STAGE_SHM");
++  if (!sock || !shm) return -1;
++  const char* f = getenv("SUSHI_STAGE_FIRST");
++  int fd = open(shm, O_RDWR);
++  if (fd < 0) { fprintf(stderr, "[stage] cannot open %s\n", shm); return -1; }
++  void* p = mmap(nullptr, kShmBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++  close(fd);
++  if (p == MAP_FAILED) { fprintf(stderr, "[stage] mmap failed\n"); return -1; }
++  g_shm = static_cast<uint8_t*>(p);
++  g_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++  sockaddr_un addr{};
++  addr.sun_family = AF_UNIX;
++  strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1);
++  // a write to a stage that died must fail, not raise SIGPIPE in the server
++  int one = 1;
++  setsockopt(g_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
++  if (connect(g_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
++    fprintf(stderr, "[stage] cannot connect %s\n", sock);
++    close(g_fd);
++    g_fd = -1;
++    return -1;
++  }
++  g_first = f ? atoi(f) : 28;
++  fprintf(stderr, "[stage] connected: layers %d..47 on the RTX 5090\n", g_first);
++  return g_first;
++}
++// The stage no longer mirrors Sushi's caches (a normal full forward ran).
++void stage_split_invalidate(void) { g_valid = false; }
++int stage_split_valid_at(uint64_t position) {
++  return !g_dead && g_valid && position >= g_base && position <= g_base + g_rows;
++}
++// 1 once the stage has been given up on (see mark_dead).
++int stage_split_dead(void) { return g_dead ? 1 : 0; }
++// The scheduler gives up on the stage after any split error it cannot attribute to the socket.
++void stage_split_give_up(const char* why) { mark_dead(why); }
++// The sequence the next stage calls serve. A different one than the stage holds re-seeds (or
++// restores) first; switching with a prefill chunk in flight would mix two sequences' replies.
++void stage_split_bind(uint64_t owner) {
++  if (owner == g_owner) return;
++  if (g_inflight) {
++    mark_dead("sequence switch with a prefill chunk in flight");
++    return;
++  }
++  g_owner = owner;
++  g_valid = false;
++}
++// 1 when the sequence's layers [first, 48) live on the stage (it decoded or prefilled there).
++int stage_split_resident(uint64_t owner) { return resident_has(owner) ? 1 : 0; }
++// Park the sequence's stage state at its committed length `position` into `path` (op 7). 1 parked,
++// 0 nothing to park (the stage holds no state of it), -1 the stage failed (given up).
++int stage_split_park(uint64_t owner, uint64_t position, const char* path) {
++  if (g_dead) return -1;
++  if (!g_valid || g_owner != owner) return 0;
++  if (g_inflight) { fprintf(stderr, "[stage] park with a prefill chunk in flight\n"); return -1; }
++  if (position < g_base || position > g_base + g_rows) {
++    fprintf(stderr, "[stage] park at %llu outside the last forward [%llu, %llu]\n", (unsigned long long)position,
++            (unsigned long long)g_base, (unsigned long long)(g_base + g_rows));
++    return -1;
++  }
++  const size_t n = strlen(path);
++  if (n + 1 > sizeof(Park::path)) return -1;
++  Park* e = park_find(owner);
++  if (!e)
++    for (Park& f : g_parks)
++      if (!f.owner) { e = &f; break; }
++  if (!e) { fprintf(stderr, "[stage] park table full\n"); return -1; }
++  const double t = now_us();
++  memcpy(g_shm, path, n + 1);
++  if (rpc(7, 0, position, 0)) return -1;
++  e->owner = owner;
++  e->position = position;
++  memcpy(e->path, path, n + 1);
++  g_base = position;
++  g_rows = 0;
++  g_parked++;
++  fprintf(stderr, "[stage] parked at %llu (%.1f MB, %.1f ms)\n", (unsigned long long)position, g_reply_arg / 1e6,
++          (now_us() - t) / 1e3);
++  return 1;
++}
++// Restore the sequence's parked stage state if it was parked at `position` (op 8; the file is removed
++// either way). 1 restored, 0 nothing parked there (the caller seeds), -1 the stage failed.
++int stage_split_unpark(uint64_t owner, uint64_t position) {
++  Park* e = park_find(owner);
++  if (!e) return 0;
++  if (g_dead) { park_drop(e); return -1; }
++  if (e->position != position) {
++    fprintf(stderr, "[stage] parked at %llu, resumed at %llu: dropped\n", (unsigned long long)e->position,
++            (unsigned long long)position);
++    park_drop(e);
++    return 0;
++  }
++  const double t = now_us();
++  memcpy(g_shm, e->path, strlen(e->path) + 1);
++  const int rc = rpc(8, 0, position, 0);
++  park_drop(e);
++  if (rc) return -1;
++  g_owner = owner;
++  g_valid = true;
++  g_base = position;
++  g_rows = 0;
++  resident_add(owner);
++  g_restored++;
++  fprintf(stderr, "[stage] restored at %llu (%.1f ms)\n", (unsigned long long)position, (now_us() - t) / 1e3);
++  return 1;
++}
++// The sequence is finished or re-runs from its tokens: drop its parked state and residency.
++void stage_split_forget(uint64_t owner) {
++  park_drop(park_find(owner));
++  resident_del(owner);
++}
++// Seed: begin / per layer / end (sends op 3). conv [1,3,10240], ssm [1,48,128,128].
++int stage_split_seed_begin(uint64_t position) {
++  if (g_dead) return -1;
++  g_at = 0;
++  g_put_overflow = false;
++  const uint32_t hdr[4] = {kMagic, 1, uint32_t(g_first), uint32_t(48 - g_first)};
++  put(hdr, 16);
++  put(&position, 8);
++  align16();
++  return 0;
++}
++int stage_split_seed_recurrent(mlx_array conv, mlx_array ssm, mlx_stream s) {
++  const uint32_t tag[2] = {1, 0};
++  put(tag, 8);
++  align16();
++  mlx_array c = mlx_array_new(), st = mlx_array_new();
++  if (materialize(&c, conv, 1, MLX_BFLOAT16, s) || materialize(&st, ssm, 1, MLX_FLOAT32, s)) return -1;
++  if (mlx_array_size(c) != size_t(3 * kF) || mlx_array_size(st) != size_t(48 * 128 * 128)) {
++    fprintf(stderr, "[stage] recurrent seed sizes %zu %zu\n", mlx_array_size(c), mlx_array_size(st));
++    return -1;
++  }
++  put(mlx_array_data_bfloat16(c), mlx_array_size(c) * 2);
++  align16();
++  put(mlx_array_data_float32(st), mlx_array_size(st) * 4);
++  align16();
++  mlx_array_free(c);
++  mlx_array_free(st);
++  return 0;
++}
++// keys/values [1,2,T,64] uint32 codes, scales/biases [1,2,T,4] BF16 (T >= len),
++// pooled [1,len/4,128] BF16, raw [1,R,128] BF16 (the last len%4 rows are the open group).
++int stage_split_seed_attention(mlx_array keys, mlx_array ks, mlx_array kb, mlx_array values, mlx_array vs,
++                               mlx_array vb, mlx_array pooled, mlx_array raw, uint64_t len, mlx_stream s) {
++  const uint32_t tag[2] = {2, 0};
++  put(tag, 8);
++  align16();
++  put(&len, 8);
++  align16();
++  for (mlx_array a : {keys, ks, kb, values, vs, vb})
++    if (put_token_major(a, len, s)) { fprintf(stderr, "[stage] KV seed layout\n"); return -1; }
++  const uint64_t groups = len / 4, open = len % 4;
++  if (groups) {
++    mlx_array p = mlx_array_new();
++    if (materialize(&p, pooled, 1, MLX_BFLOAT16, s)) return -1;
++    if (mlx_array_size(p) < groups * 128) { fprintf(stderr, "[stage] pooled %zu < %llu\n", mlx_array_size(p), (unsigned long long)groups * 128); return -1; }
++    put(mlx_array_data_bfloat16(p), groups * 128 * 2);
++    align16();
++    mlx_array_free(p);
++  }
++  if (open) {
++    mlx_array r = mlx_array_new();
++    if (materialize(&r, raw, 1, MLX_BFLOAT16, s)) return -1;
++    const size_t rows = mlx_array_size(r) / 128;
++    if (rows < open) { fprintf(stderr, "[stage] raw keys %zu < %llu\n", rows, (unsigned long long)open); return -1; }
++    put(mlx_array_data_bfloat16(r) + (rows - open) * 128, open * 128 * 2);
++    align16();
++    mlx_array_free(r);
++  }
++  return 0;
++}
++int stage_split_seed_end(uint64_t position) {
++  if (g_put_overflow) {
++    fprintf(stderr, "[stage] seed at %llu does not fit the %zu-byte shm\n", (unsigned long long)position, kShmBytes);
++    return -1;
++  }
++  const double t = now_us();
++  if (rpc(3, 0, position, g_at)) return -1;
++  g_valid = true;
++  g_base = position;
++  g_rows = 0;
++  g_seeds++;
++  fprintf(stderr, "[stage] seeded at %llu (%.1f MB, %.1f ms)\n", (unsigned long long)position, g_at / 1e6, (now_us() - t) / 1e3);
++  return 0;
++}
++// h: the HC stream [1, rows, 10240] after layer first-1 at absolute positions [position, ...).
++// out: the stream after layer 47, in h's dtype.
++// rope_delta: the rows' rotary offset (Qwen M-RoPE decode delta after an image; 0 for text), sent in
++// aux bits 8..31 as a signed 24-bit value. The KV row index stays `position`.
++int stage_split_forward(mlx_array h, mlx_array* out, uint64_t position, int32_t rope_delta, mlx_stream s) {
++  if (g_dead) return -1;
++  if (!stage_split_valid_at(position)) return -2;  // caller re-seeds
++  const double t0 = now_us();
++  mlx_array c = mlx_array_new();
++  if (materialize(&c, h, 1, MLX_BFLOAT16, s)) return -1;
++  const int* sh = mlx_array_shape(c);
++  const int nd = int(mlx_array_ndim(c));
++  const uint32_t rows = uint32_t(mlx_array_size(c) / kF);
++  if (rows < 1 || rows > 16 || sh[nd - 1] != kF) { fprintf(stderr, "[stage] forward rows %u\n", rows); return -1; }
++  memcpy(g_shm, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
++  const double t1 = now_us();
++  // infer the commit of the previous forward
++  if (g_rows && position < g_base + g_rows) {
++    if (rpc(2, 0, 0, position - g_base)) return -1;
++    g_partials++;
++  }
++  if (rope_delta < -(1 << 23) || rope_delta >= (1 << 23)) { fprintf(stderr, "[stage] rope delta %d out of range\n", rope_delta); return -1; }
++  if (rpc(1, rows, position, 0, (uint32_t(rope_delta) & 0xFFFFFFu) << 8)) return -1;
++  const double t2 = now_us();
++  g_base = position;
++  g_rows = rows;
++  resident_add(g_owner);
++  int oshape[3] = {1, int(rows), kF};
++  mlx_array ob = mlx_array_new_data(g_shm, oshape, 3, MLX_BFLOAT16);
++  const mlx_dtype want = mlx_array_dtype(h);
++  if (want != MLX_BFLOAT16) {
++    if (mlx_astype(out, ob, want, s)) return -1;
++    mlx_array_free(ob);
++  } else {
++    *out = ob;
++  }
++  mlx_array_free(c);
++  g_forwards++;
++  g_copy_us += (t1 - t0) + (now_us() - t2);
++  g_rpc_us += t2 - t1;
++  if (g_forwards % 1000 == 0)
++    fprintf(stderr, "[stage] %llu forwards: rpc %.0f us, copies %.0f us avg; %llu partial commits, %llu seeds\n",
++            (unsigned long long)g_forwards, g_rpc_us / g_forwards, g_copy_us / g_forwards,
++            (unsigned long long)g_partials, (unsigned long long)g_seeds);
++  return 0;
++}
++// R60 S4 (prefill v2): the empty state at position 0 (a request with no cached prefix): zero
++// convolution windows and recurrent states, no KV or index rows. Layer types follow the canonical
++// stack (full attention at layer % 4 == 3), which the server checks tag by tag.
++int stage_split_seed_zero(void) {
++  if (stage_split_seed_begin(0)) return -1;
++  for (int l = g_first; l < 48; l++) {
++    if (l % 4 == 3) {
++      const uint32_t tag[2] = {2, 0};
++      put(tag, 8);
++      align16();
++      const uint64_t len = 0;
++      put(&len, 8);
++      align16();
++    } else {
++      const uint32_t tag[2] = {1, 0};
++      put(tag, 8);
++      align16();
++      if (g_at + size_t(3) * kF * 2 + size_t(48) * 128 * 128 * 4 + 32 > kShmBytes) return -1;
++      memset(g_shm + g_at, 0, size_t(3) * kF * 2);
++      g_at += size_t(3) * kF * 2;
++      align16();
++      memset(g_shm + g_at, 0, size_t(48) * 128 * 128 * 4);
++      g_at += size_t(48) * 128 * 128 * 4;
++      align16();
++    }
++  }
++  return stage_split_seed_end(0);
++}
++// R60 S4 (prefill v2). A new request's prefill starts here: the stage holds no state of it yet,
++// so its first chunk re-seeds (from Sushi's caches at the chunk's position).
++void stage_split_prefill_begin(uint64_t owner) {
++  stage_split_bind(owner);
++  park_drop(park_find(owner));  // a new prefill of this sequence: any parked state is stale
++  if (!g_inflight) g_valid = false;
++}
++// Whether a prefill chunk at `position` can go to the stage without a seed first.
++int stage_split_prefill_ready(uint64_t position) {
++  if (g_inflight) return position == g_pf_next;
++  return g_valid && g_rows == 0 && position == g_base;
++}
++int stage_split_prefill_inflight(void) { return g_inflight; }
++// h: the HC stream [1, rows, 10240] after layer first-1 at positions [position, position+rows).
++// Copied into the next free slot; op 6 is sent without waiting (stage_split_prefill_recv reads the
++// reply, oldest first). At most two chunks in flight.
++int stage_split_prefill_send(mlx_array h, uint64_t position, mlx_stream s) {
++  if (g_dead) return -1;
++  if (g_inflight >= 2) { fprintf(stderr, "[stage] prefill: two chunks already in flight\n"); return -1; }
++  if (!stage_split_prefill_ready(position)) { fprintf(stderr, "[stage] prefill at %llu not ready\n", (unsigned long long)position); return -1; }
++  const double t0 = now_us();
++  mlx_array c = mlx_array_new();
++  if (materialize(&c, h, 1, MLX_BFLOAT16, s)) return -1;
++  const uint64_t rows = mlx_array_size(c) / kF;
++  if (rows < 1 || rows * kF * 2 > kSlotBytes) { fprintf(stderr, "[stage] prefill rows %llu\n", (unsigned long long)rows); return -1; }
++  const int slot = (g_pf_head + g_inflight) % 2;
++  const uint64_t off = kSlotBase + uint64_t(slot) * kSlotStride;
++  if (g_pullback < 0) {
++    const char* v = getenv("SUSHI_STAGE_PULLBACK");
++    g_pullback = !(v && strcmp(v, "0") == 0);
++  }
++  const uint32_t aux = uint32_t(g_pullback);
++  memcpy(g_shm + off, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
++  mlx_array_free(c);
++  uint8_t m[32] = {};
++  const uint32_t op = 6, r = uint32_t(rows);
++  memcpy(m, &op, 4);
++  memcpy(m + 8, &r, 4);
++  memcpy(m + 12, &aux, 4);
++  memcpy(m + 16, &position, 8);
++  memcpy(m + 24, &off, 8);
++  if (!io(m, 32, true)) { mark_dead("socket failure or timeout on prefill send"); return -1; }
++  g_pf_rows[slot] = r;
++  g_pf_pos[slot] = position;
++  g_inflight++;
++  g_pf_next = position + rows;
++  g_pf_send_us += now_us() - t0;
++  return 0;
++}
++// The oldest in-flight chunk's stream after layer 47: [1, rows, 10240] in dtype `dt`.
++int stage_split_prefill_recv(mlx_array* out, mlx_dtype dt, mlx_stream s) {
++  if (g_dead || !g_inflight) return -1;
++  const double t0 = now_us();
++  uint8_t m[32];
++  if (!io(m, 32, false, 2 * timeout_ms())) { mark_dead("socket failure or timeout on prefill reply"); return -1; }
++  uint32_t status;
++  memcpy(&status, m + 4, 4);
++  const int slot = g_pf_head;
++  g_pf_head = (g_pf_head + 1) % 2;
++  g_inflight--;
++  if (status) {
++    char why[480];
++    snprintf(why, sizeof why, "prefill failed: %.400s", reinterpret_cast<const char*>(g_shm));
++    mark_dead(why);
++    return -1;
++  }
++  const uint32_t rows = g_pf_rows[slot];
++  memcpy(&g_pf_export_len, m + 24, 8);
++  g_pf_export_slot = slot;
++  int oshape[3] = {1, int(rows), kF};
++  mlx_array ob = mlx_array_new_data(g_shm + kSlotBase + uint64_t(slot) * kSlotStride, oshape, 3, MLX_BFLOAT16);
++  if (dt != MLX_BFLOAT16) {
++    if (mlx_astype(out, ob, dt, s)) return -1;
++    mlx_array_free(ob);
++  } else {
++    *out = ob;
++  }
++  g_valid = true;
++  g_base = g_pf_pos[slot] + rows;
++  g_rows = 0;
++  resident_add(g_owner);
++  g_pf_chunks++;
++  g_pf_wait_us += now_us() - t0;
++  if (g_pf_chunks % 8 == 0)
++    fprintf(stderr, "[stage] %llu prefill chunks: send %.1f ms, wait %.1f ms avg\n", (unsigned long long)g_pf_chunks,
++            g_pf_send_us / g_pf_chunks / 1e3, g_pf_wait_us / g_pf_chunks / 1e3);
++  return 0;
++}
++// The pull-back blob of the last received chunk (valid until the next chunk goes to its slot).
++int stage_split_prefill_export(const uint8_t** data, uint64_t* len) {
++  if (g_pf_export_slot < 0 || !g_pf_export_len) return -1;
++  *data = g_shm + kSlotBase + uint64_t(g_pf_export_slot) * kSlotStride + kSlotBytes;
++  *len = g_pf_export_len;
++  return 0;
++}
++int stage_split_pullback_enabled(void) {
++  if (g_pullback < 0) {
++    const char* v = getenv("SUSHI_STAGE_PULLBACK");
++    g_pullback = !(v && strcmp(v, "0") == 0);
++  }
++  return g_pullback;
++}
++}
+diff --git a/native/texas_checkpoint.cpp b/native/texas_checkpoint.cpp
+new file mode 100644
+index 00000000..1349545b
+--- /dev/null
++++ b/native/texas_checkpoint.cpp
+@@ -0,0 +1,206 @@
++// Texas lossless parking; MLX 0.32.3 C++ ABI, Sushi owner thread only.
++// The caller must drain all streams and exclude every shared/model buffer.
++#include <mlx/array.h>
++#include <mlx/allocator.h>
++#include <mlx/random.h>
++#include <unistd.h>
++#include <vector>
++#include <algorithm>
++#include <sys/statvfs.h>
++#include <dlfcn.h>
++#include <mach-o/loader.h>
++#include <mach-o/nlist.h>
++#include <sys/mman.h>
++#include <CommonCrypto/CommonDigest.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <cerrno>
++#include <cstring>
++#include <unordered_map>
++#include <unordered_set>
++#include <stdexcept>
++namespace mx=mlx::core;
++using Data=mx::array::Data;
++// Follow lazy dependencies without evaluating them. Compiled verifier capture
++// objects can retain symbolic/retired leaves which are not evaluable requests.
++// Their materialized ancestors still need ordinary alias/weight protection.
++static std::vector<mx::array> materialized_arrays(const std::vector<mx::array>& roots) {
++  std::vector<mx::array> todo=roots, result;
++  std::unordered_set<uintptr_t> seen;
++  while(!todo.empty()) {
++    auto a=std::move(todo.back());todo.pop_back();
++    if(!seen.insert(a.id()).second) continue;
++    if(seen.size()>1000000) throw std::runtime_error("checkpoint array graph exceeds bounded traversal");
++    auto d=a.data_shared_ptr();
++    if(a.is_available() && !a.has_primitive() && d && d->buffer.ptr()) {
++      result.push_back(std::move(a));
++    } else {
++      for(const auto& input:a.inputs()) todo.push_back(input);
++    }
++  }
++  return result;
++}
++static void io_all(int fd, void* ptr, size_t n, off_t off, bool write, unsigned char* digest) {
++  CC_SHA256_CTX hash;CC_SHA256_Init(&hash);
++  auto p=static_cast<char*>(ptr);
++  while(n) {
++    auto got=write ? pwrite(fd,p,std::min(n,size_t(16<<20)),off) : pread(fd,p,std::min(n,size_t(16<<20)),off);
++    if(got<0 && errno==EINTR) continue;
++    if(got<=0) throw std::runtime_error(std::string("checkpoint I/O: ")+strerror(errno));
++    CC_SHA256_Update(&hash,p,static_cast<CC_LONG>(got));
++    p+=got; off+=got; n-=got;
++  }
++  CC_SHA256_Final(digest,&hash);
++}
++struct Group {
++  std::vector<std::shared_ptr<Data>> refs;
++  size_t bytes=0; off_t offset=0;
++  unsigned char digest[CC_SHA256_DIGEST_LENGTH]{};
++};
++struct Parked {
++  std::vector<Group> groups;
++  int fd=-1;
++  size_t bytes=0;
++  bool parked=false;
++  std::string path;
++  Parked(const std::vector<mx::array>& arrays, const std::vector<mx::array>& protect, const std::string& p, size_t max_bytes):path(p) {
++    std::unordered_set<const void*> protected_buffers;
++    for(const auto& a:protect) if(a.data_shared_ptr()) protected_buffers.insert(a.buffer().ptr());
++    std::unordered_set<const void*> seen_data;
++    std::unordered_map<const void*,size_t> by_buffer;
++    for(const auto& a:arrays) {
++      if(!a.is_available() || a.has_primitive()) throw std::runtime_error("checkpoint requires materialized leaf tensors");
++      auto d=a.data_shared_ptr();
++      if(!d || !d->buffer.ptr() || protected_buffers.count(d->buffer.ptr()) || !seen_data.insert(d.get()).second) continue;
++      size_t n=mx::allocator::allocator().size(d->buffer);
++      if(n < (1<<20)) continue; // Small logical state stays resident.
++      auto it=by_buffer.find(d->buffer.ptr());
++      if(it==by_buffer.end()) {
++        if(n>max_bytes-bytes) throw std::runtime_error("checkpoint exceeds bounded disk budget");
++        by_buffer[d->buffer.ptr()]=groups.size();
++        groups.push_back(Group{{d},n,static_cast<off_t>(bytes)});bytes+=n;
++      } else groups[it->second].refs.push_back(d);
++    }
++    struct statvfs space;
++    auto parent=path.substr(0,path.find_last_of('/'));
++    if(statvfs(parent.c_str(),&space) || (uint64_t)space.f_bavail*space.f_frsize < bytes+(32ull<<30)) throw std::runtime_error("checkpoint SSD reserve unavailable");
++    fd=open(path.c_str(),O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
++    if(fd<0) throw std::runtime_error("cannot create private checkpoint");
++    try {
++      // F_NOCACHE keeps the checkpoint from becoming another large RAM cache.
++      if(fcntl(fd,F_NOCACHE,1)<0) throw std::runtime_error("cannot disable checkpoint file cache");
++      for(auto& g:groups) io_all(fd,g.refs[0]->buffer.raw_ptr(),g.bytes,g.offset,true,g.digest);
++      if(fsync(fd)<0) throw std::runtime_error("checkpoint sync failed");
++    } catch(...) { close(fd);fd=-1;unlink(path.c_str());throw; }
++    // No mutation occurs until every byte is safely on disk.
++    try {
++      for(auto& g:groups) for(auto& d:g.refs) {
++        auto b=d->buffer; auto deleter=std::move(d->d);
++        d->buffer=mx::allocator::Buffer(nullptr);
++        d->d=[](mx::allocator::Buffer){};
++        deleter(b);
++      }
++    } catch(...) { std::terminate(); } // Never expose a partially parked graph.
++    parked=true;
++  }
++  void restore() {
++    if(!parked) return;
++    // Restore one allocation at a time. A failure leaves the unread groups
++    // parked, with the checkpoint open, so the owner can retry safely.
++    for(auto& g:groups) {
++      if(g.refs[0]->buffer.ptr()) continue;
++      auto b=mx::allocator::malloc(g.bytes);
++      if(!b.ptr()) throw std::bad_alloc();
++      try {
++        unsigned char digest[CC_SHA256_DIGEST_LENGTH];
++        io_all(fd,b.raw_ptr(),g.bytes,g.offset,false,digest);
++        if(memcmp(digest,g.digest,sizeof(digest))) throw std::runtime_error("checkpoint checksum mismatch");
++      }
++      catch(...) { mx::allocator::free(b);throw; }
++      std::shared_ptr<Data> owner;
++      try { owner=std::make_shared<Data>(b); }
++      catch(...) { mx::allocator::free(b);throw; }
++      std::vector<mx::Deleter> deleters;
++      deleters.reserve(g.refs.size());
++      for(size_t i=0;i<g.refs.size();++i) deleters.emplace_back([owner](mx::allocator::Buffer){});
++      // Allocate all bookkeeping before publication. Moves are noexcept.
++      for(size_t i=0;i<g.refs.size();++i) {
++        g.refs[i]->buffer=b;
++        g.refs[i]->d=std::move(deleters[i]);
++      }
++    }
++    parked=false;
++    close(fd);fd=-1;unlink(path.c_str());
++  }
++  ~Parked() { if(fd>=0) close(fd); if(!path.empty()) unlink(path.c_str()); }
++};
++
++static thread_local std::string last_error;
++static std::vector<mx::array> roots_from(void** p,size_t n) {
++ std::vector<mx::array> out;out.reserve(n);
++ for(size_t i=0;i<n;i++) if(p[i]) out.push_back(*static_cast<mx::array*>(p[i]));
++ return materialized_arrays(out);
++}
++extern "C" void* texas_park(void** roots,size_t n,void** protect,size_t pn,const char* path,size_t cap) {
++ // Both sets traverse materialized ancestors without evaluating symbolic leaves.
++ // Protected roots include the retained weight map and private model buffers.
++ try { last_error.clear();return new Parked(roots_from(roots,n),roots_from(protect,pn),path,cap); }
++ catch(const std::exception& e){last_error=e.what();return nullptr;}
++}
++extern "C" size_t texas_park_bytes(void* p){return p?static_cast<Parked*>(p)->bytes:0;}
++extern "C" int texas_restore(void* p){
++ try {if(p) static_cast<Parked*>(p)->restore();return 0;}
++ catch(const std::exception& e){last_error=e.what();return -1;}
++}
++extern "C" void texas_park_free(void* p){delete static_cast<Parked*>(p);}
++extern "C" const char* texas_park_error(){return last_error.c_str();}
++// MLX 0.32.3's inline default_() has hidden TLS per dylib. Calling the inline
++// here would snapshot a different RNG. Resolve the pinned library's two TLV
++// descriptors from its Mach-O symbols; never infer an object layout or offset.
++struct Tlv { void* (*address)(Tlv*); uintptr_t key,offset; };
++struct RngSymbols { Tlv *key=nullptr,*guard=nullptr; };
++static RngSymbols rng_symbols() {
++ Dl_info info{};
++ if(!dladdr(reinterpret_cast<const void*>(&mx::random::seed),&info)) throw std::runtime_error("MLX RNG image missing");
++ int fd=open(info.dli_fname,O_RDONLY|O_NOFOLLOW);
++ if(fd<0) throw std::runtime_error("MLX RNG image unreadable");
++ struct stat st{};if(fstat(fd,&st)){close(fd);throw std::runtime_error("MLX RNG image stat failed");}
++ auto raw=mmap(nullptr,st.st_size,PROT_READ,MAP_PRIVATE,fd,0);close(fd);
++ if(raw==MAP_FAILED) throw std::runtime_error("MLX RNG symbol map failed");
++ auto base=static_cast<const char*>(raw);auto mh=reinterpret_cast<const mach_header_64*>(base);
++ RngSymbols result; const symtab_command* sym=nullptr;uint64_t text=0;
++ if(mh->magic==MH_MAGIC_64 && mh->sizeofcmds+sizeof(*mh)<=static_cast<size_t>(st.st_size)) {
++  auto cmd=reinterpret_cast<const load_command*>(mh+1);
++  for(uint32_t i=0;i<mh->ncmds;i++) {
++   if(cmd->cmd==LC_SYMTAB) sym=reinterpret_cast<const symtab_command*>(cmd);
++   if(cmd->cmd==LC_SEGMENT_64) {auto seg=reinterpret_cast<const segment_command_64*>(cmd);if(!strcmp(seg->segname,"__TEXT")) text=seg->vmaddr;}
++   cmd=reinterpret_cast<const load_command*>(reinterpret_cast<const char*>(cmd)+cmd->cmdsize);
++  }
++  if(sym && uint64_t(sym->symoff)+uint64_t(sym->nsyms)*sizeof(nlist_64)<=uint64_t(st.st_size) && uint64_t(sym->stroff)+sym->strsize<=uint64_t(st.st_size)) {
++   const auto entries=reinterpret_cast<const nlist_64*>(base+sym->symoff);
++   const auto strings=base+sym->stroff;auto slide=reinterpret_cast<uintptr_t>(info.dli_fbase)-text;
++   for(uint32_t i=0;i<sym->nsyms;i++) {
++    auto idx=entries[i].n_un.n_strx;if(idx>=sym->strsize) continue;
++    const auto name=strings+idx;
++    if(!strcmp(name,"__ZZN3mlx4core6random11KeySequence8default_EvE2ks")) result.key=reinterpret_cast<Tlv*>(slide+entries[i].n_value);
++    if(!strcmp(name,"__ZGVZN3mlx4core6random11KeySequence8default_EvE2ks")) result.guard=reinterpret_cast<Tlv*>(slide+entries[i].n_value);
++   }
++  }
++ }
++ munmap(raw,st.st_size);
++ if(!result.key || !result.guard) throw std::runtime_error("Pinned MLX RNG TLS ABI unavailable");
++ return result;
++}
++struct SavedRng { mx::random::KeySequence* target; mx::random::KeySequence saved; };
++extern "C" void* texas_rng_save(){
++ try {
++  static auto symbols=rng_symbols();
++  if(!(*static_cast<unsigned char*>(symbols.guard->address(symbols.guard))&1)) return nullptr;
++  auto target=static_cast<mx::random::KeySequence*>(symbols.key->address(symbols.key));
++  return new SavedRng{target,*target};
++ } catch(const std::exception& e) {fprintf(stderr,"Texas RNG guard: %s\n",e.what());_exit(78);}
++}
++extern "C" void texas_rng_restore(void* p){
++ if(!p) return;
++ auto saved=static_cast<SavedRng*>(p);*saved->target=saved->saved;delete saved;
++}
+diff --git a/native/texas_checkpoint_test.cpp b/native/texas_checkpoint_test.cpp
+new file mode 100644
+index 00000000..f5410343
+--- /dev/null
++++ b/native/texas_checkpoint_test.cpp
+@@ -0,0 +1,87 @@
++#include <mlx/array.h>
++#include <mlx/ops.h>
++#include <mlx/transforms.h>
++#include <mlx/random.h>
++#include <mlx/c/random.h>
++#include <cassert>
++#include <cstring>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/resource.h>
++#include <signal.h>
++#include <fcntl.h>
++#include <vector>
++extern "C" void* texas_park(void**,size_t,void**,size_t,const char*,size_t);
++extern "C" size_t texas_park_bytes(void*);
++extern "C" int texas_restore(void*);
++extern "C" void texas_park_free(void*);
++extern "C" const char* texas_park_error();
++extern "C" void* texas_rng_save();
++extern "C" void texas_rng_restore(void*);
++namespace mx=mlx::core;
++int main() {
++ mx::random::seed(789);
++ auto expected=mx::random::uniform({16});mx::eval(expected);
++ mx::random::seed(789);auto saved=texas_rng_save();
++ auto interference=mx::random::uniform({16});mx::eval(interference);
++ texas_rng_restore(saved);
++ auto actual=mx::random::uniform({16});mx::eval(actual);
++ assert(memcmp(expected.data<float>(),actual.data<float>(),64)==0);
++ auto stream=mlx_default_gpu_stream_new();
++ auto draw=[&](){
++   auto v=mlx_array_new();int shape[]={16};
++   assert(mlx_random_bits(&v,shape,1,4,mlx_array{nullptr},stream)==0 && mlx_array_eval(v)==0);
++   std::vector<uint32_t> out(mlx_array_data_uint32(v),mlx_array_data_uint32(v)+16);mlx_array_free(v);return out;
++ };
++ assert(mlx_random_seed(1234)==0);auto expected_c=draw();
++ assert(mlx_random_seed(1234)==0);saved=texas_rng_save();draw();texas_rng_restore(saved);
++ assert(draw()==expected_c);mlx_stream_free(stream);
++ // Async decode roots may still be lazy. Park their materialized request
++ // ancestors while protecting even a model-private lazy dependency.
++ {
++  auto owned=mx::ones({1048576});auto weight=mx::full({1048576},2.0f);mx::eval(owned,weight);
++  auto lazy=mx::add(owned,weight);auto private_root=mx::add(weight,mx::array(1.0f));
++  void* roots[]={&lazy};void* protected_roots[]={&private_root};
++  const char* path="/tmp/texas-sushi-lazy-fixture.bin";unlink(path);
++  auto parked=texas_park(roots,1,protected_roots,1,path,24ull<<30);
++  assert(parked && texas_park_bytes(parked)==4194304 && !owned.buffer().ptr() && weight.buffer().ptr());
++  assert(texas_restore(parked)==0);texas_park_free(parked);mx::eval(lazy);
++  for(size_t i=0;i<lazy.size();i++) assert(lazy.data<float>()[i]==3.0f);
++ }
++ const char* p="/tmp/texas-sushi-checkpoint-fixture.bin"; unlink(p);
++ auto a=mx::arange(0,1048576,1,mx::float32); mx::eval(a);
++ auto v=mx::slice(a,{7},{1048570},{3}); mx::eval(v);
++ auto w=mx::ones({1048576}); mx::eval(w);
++ auto wv=mx::reshape(w,{1024,1024}); mx::eval(wv);
++ auto before=std::vector<float>(a.data<float>(),a.data<float>()+a.size());
++ auto aid=a.id(); auto data=a.data_shared_ptr().get(); auto vstrides=v.strides();
++ void* roots[]={&a,&v,&wv};void* protect[]={&w};
++ auto ck=texas_park(roots,3,protect,1,p,24ull<<30);
++ assert(ck && texas_park_bytes(ck)==4194304);
++ assert(a.data_shared_ptr().get()==data && !a.buffer().ptr() && !v.buffer().ptr());
++ assert(w.buffer().ptr() && wv.buffer().ptr());
++ struct stat st;assert(stat(p,&st)==0 && (st.st_mode&0777)==0600);
++ assert(texas_restore(ck)==0 && a.id()==aid && a.data_shared_ptr().get()==data);
++ assert(v.strides()==vstrides && a.buffer().ptr()==v.buffer().ptr());
++ assert(memcmp(a.data<float>(),before.data(),4194304)==0);
++ for(size_t i=0;i<v.size();i++) assert(v.data<float>()[i*3]==before[7+i*3]);
++ texas_park_free(ck);assert(access(p,F_OK)!=0);
++ // A failed write leaves every original allocation readable.
++ ck=texas_park(roots,2,nullptr,0,"/nonexistent/texas/fixture",24ull<<30);
++ assert(!ck && a.buffer().ptr() && memcmp(a.data<float>(),before.data(),4194304)==0);
++ ck=texas_park(roots,2,nullptr,0,p,1);
++ assert(!ck && a.buffer().ptr());
++ struct rlimit limit,small;assert(getrlimit(RLIMIT_FSIZE,&limit)==0);small=limit;small.rlim_cur=3;
++ auto old_signal=signal(SIGXFSZ,SIG_IGN);assert(setrlimit(RLIMIT_FSIZE,&small)==0);
++ ck=texas_park(roots,2,nullptr,0,p,24ull<<30);
++ assert(!ck && a.buffer().ptr() && memcmp(a.data<float>(),before.data(),4194304)==0);
++ assert(setrlimit(RLIMIT_FSIZE,&limit)==0);signal(SIGXFSZ,old_signal);
++ ck=texas_park(roots,2,nullptr,0,p,24ull<<30);assert(ck);
++ assert(truncate(p,3)==0 && texas_restore(ck)!=0);
++ assert(!a.buffer().ptr());texas_park_free(ck);
++ auto damaged=mx::ones({1048576});mx::eval(damaged);void* dr[]={&damaged};
++ ck=texas_park(dr,1,nullptr,0,p,24ull<<30);assert(ck);
++ int fd=open(p,O_RDWR);assert(fd>=0);char bad=91;assert(pwrite(fd,&bad,1,100)==1);close(fd);
++ assert(texas_restore(ck)!=0 && !damaged.buffer().ptr());texas_park_free(ck);
++ return 0;
++}
+diff --git a/native/texas_ipc.c b/native/texas_ipc.c
+new file mode 100644
+index 00000000..4867ba77
+--- /dev/null
++++ b/native/texas_ipc.c
+@@ -0,0 +1,46 @@
++// Private cross-process control page. No MLX calls occur here.
++#include <stdint.h>
++#include <stddef.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++
++enum { SEQ, HOLD, STATE, ACK, BYTES, PAUSES, TOKENS, PROMPT, PHASE,
++       PARK_ERROR, RESTORE_WAIT, FREED, AVAILABLE, FIELDS };
++typedef struct { uint64_t magic; _Atomic uint64_t v[64]; } Page;
++#define MAGIC UINT64_C(0x5458505355534831)
++
++void* texas_ipc_open(const char* path, int create) {
++  int fd=open(path,O_RDWR|O_NOFOLLOW|(create?(O_CREAT|O_EXCL):0),0600);
++  if(fd<0) return NULL;
++  struct stat st;
++  if(fstat(fd,&st) || st.st_uid!=getuid() || (st.st_mode&0777)!=0600 ||
++     (create?ftruncate(fd,4096):(st.st_size!=4096))) {close(fd);return NULL;}
++  Page* p=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);close(fd);
++  if(p==MAP_FAILED) return NULL;
++  if(create) p->magic=MAGIC;
++  if(p->magic!=MAGIC) {munmap(p,4096);return NULL;}
++  return p;
++}
++void texas_ipc_close(void* p) {if(p) munmap(p,4096);}
++uint64_t texas_ipc_get(void* p,unsigned field) {
++  return p && field<FIELDS?atomic_load_explicit(&((Page*)p)->v[field],memory_order_acquire):0;
++}
++void texas_ipc_set(void* p,unsigned field,uint64_t value) {
++  if(p && field<FIELDS) atomic_store_explicit(&((Page*)p)->v[field],value,memory_order_release);
++}
++uint64_t texas_available(void) {
++  // Match Texas's reclaimable-supply probe; do not count speculative pages twice.
++  static mach_port_t host=0; if(!host) host=mach_host_self();
++  vm_statistics64_data_t s;mach_msg_type_number_t n=HOST_VM_INFO64_COUNT;
++  if(host_statistics64(host,HOST_VM_INFO64,(host_info64_t)&s,&n)!=KERN_SUCCESS) return 0;
++  uint64_t total=0;size_t z=sizeof(total);if(sysctlbyname("hw.memsize",&total,&z,NULL,0)) return 0;
++  uint64_t ext=s.external_page_count>s.speculative_count?s.external_page_count-s.speculative_count:0;
++  uint64_t avail=((uint64_t)s.free_count+s.purgeable_count+ext)*vm_kernel_page_size;
++  return avail<total?avail:total;
++}
+diff --git a/src/generate.zig b/src/generate.zig
+index b026590c..f188dd68 100644
+--- a/src/generate.zig
++++ b/src/generate.zig
+@@ -1333,6 +1333,82 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
+     return if (adaptive_width) tailMergeMax(default_chunk) else TAIL_MERGE_MAX;
+ }
+ 
++/// R60 S4 (prefill v2): a prefill chunk waiting for its stage output, with the checkpoint whose
++/// layers [0, first) were captured at its eval.
++const StageChunk = struct { pos: usize, end: usize, cp: ?SSMCheckpoint };
++
++/// R60 S4 (prefill v2 pull-back): complete a two-step checkpoint (layers [first, 48) re-captured now
++/// that the chunk's stage state is imported; the partial's layers [0, first) kept) and append it
++/// exactly as the chunk loop does: peak, MTP head leftover mark, interior thinning.
++fn finishStageCheckpoint(
++    allocator: std.mem.Allocator,
++    xfm: anytype,
++    ctx: anytype,
++    glm: anytype,
++    partial: SSMCheckpoint,
++    abs_pos: usize,
++    list: *std.ArrayList(SSMCheckpoint),
++    peak: *u32,
++    max: anytype,
++    thin: anytype,
++    mtp_active: bool,
++    mtp_cache: anytype,
++    mtp_position_base: usize,
++) !void {
++    var cp = partial;
++    errdefer cp.deinit(allocator);
++    const first = qwen4_forward.stageSplitFirst() orelse return error.StageSplitPullback;
++    var fresh = try capturePrefillCheckpoint(allocator, xfm, ctx, glm, abs_pos);
++    defer fresh.deinit(allocator);
++    if (fresh.layers.len != cp.layers.len) return error.StageSplitPullback;
++    for (first..cp.layers.len) |l| std.mem.swap(SSMCacheEntrySnapshot, &cp.layers[l], &fresh.layers[l]);
++    try list.append(allocator, cp);
++    peak.* = @max(peak.*, @as(u32, @intCast(list.items.len)));
++    if (mtp_active) {
++        mtp_cache.*.?.activate();
++        xfm.qwen4MtpMarkQsaLeftover(abs_pos -| mtp_position_base) catch |e| {
++            log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
++        };
++    }
++    if (max > 0 and list.items.len > max) {
++        var dropped = list.orderedRemove(checkpointDropIndex(list.items, thin));
++        dropped.deinit(allocator);
++    }
++}
++
++/// R60 S4 (prefill v2): finish a chunk whose layers [first, 48) ran on the stage: its stream after
++/// layer 47 feeds the MTP head's history exactly as the chunk loop's own capture would.
++fn completeStagePrefillChunk(
++    xfm: anytype,
++    ctx: anytype,
++    options: anytype,
++    mtp_cache: anytype,
++    mtp_active: bool,
++    history_started: *bool,
++    position_base: *usize,
++    prompt_ids: []const u32,
++    pos: usize,
++    end: usize,
++    ssm_cp_offset: usize,
++    allocator: std.mem.Allocator,
++) !void {
++    var hidden = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(hidden);
++    try qwen4_forward.stagePrefillRecv(xfm, &hidden);
++    if (qwen4_forward.stagePullbackEnabled()) try qwen4_forward.stagePrefillImport(xfm, ctx);
++    if (!mtp_active) return;
++    if (!history_started.*) {
++        std.debug.assert(mtp_cache.*.?.step() == 0);
++        position_base.* = ssm_cp_offset + pos;
++        history_started.* = true;
++    }
++    try options.mtp.?.appendHistory(xfm, &(mtp_cache.*.?), prompt_ids[pos + 1 .. end + 1], hidden, @intCast(mtp_cache.*.?.step()), null, allocator);
++    const ev = mlx.mlx_vector_array_new();
++    defer _ = mlx.mlx_vector_array_free(ev);
++    mtp_cache.*.?.appendEvalArrays(ev);
++    _ = mlx.mlx_eval(ev);
++}
++
+ pub fn nextChunkEnd(
+     pos: usize,
+     prefix_len: usize,
+@@ -2375,6 +2451,7 @@ pub const Generator = struct {
+         /// runs atomically (pre-interleave behavior, and the
+         /// SUSHI_PREFILL_INTERLEAVE=0 kill switch).
+         interleave_hook: ?InterleaveHook = null,
++        native_priority_hook: ?NativePriorityHook = null,
+         /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
+         write_through_hook: ?WriteThroughHook = null,
+         /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
+@@ -2386,6 +2463,14 @@ pub const Generator = struct {
+         adaptive_chunk_width: bool = false,
+     };
+ 
++    pub const NativePriorityHook = struct {
++        ctx: *anyopaque,
++        call: *const fn (*anyopaque, *ForwardCtx, ?*MtpCacheRef, []SSMCheckpoint) anyerror!void,
++        /// texas-split: whether `call` would park now (a split prefill first lands its in-flight
++        /// stage chunk: the nested foreground uses the stage).
++        wants: ?*const fn (*anyopaque) bool = null,
++    };
++
+     pub const InterleaveHook = struct {
+         ctx: *anyopaque,
+         call: *const fn (ctx: *anyopaque) void,
+@@ -2532,7 +2617,15 @@ pub const Generator = struct {
+         }
+         const has_vision = ctx.vision_embeddings != null;
+         const glm_request = ctx.glm5_request;
+-        const want_ssm_cp = shouldCheckpointSsmPrefill(
++        // R60 S4 (prefill v2): layers [first, 48) of every prefill chunk on the RTX 5090 stage,
++        // pipelined with the next chunk's layers [0, first). With the pull-back (default) the stage's
++        // state of each chunk is written into Sushi's caches when it lands and SSM checkpoints are
++        // assembled in two steps (layers [0, first) at the chunk's eval, the rest after its import);
++        // without it checkpoints are off.
++        // M-RoPE turns (an image anywhere in the prompt, cached or not) rope at absolute positions the
++        // stage does not know: they stay on the Mac.
++        const split_prefill_env = qwen4_forward.stagePrefillEnabled() and !has_vision and glm_request == null and ctx.mrope_pos == null;
++        const want_ssm_cp = !(split_prefill_env and !qwen4_forward.stagePullbackEnabled()) and shouldCheckpointSsmPrefill(
+             options.ssm_checkpoint_stride,
+             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
+             has_vision,
+@@ -2612,6 +2705,21 @@ pub const Generator = struct {
+         // freshly forwarded tail (`base_pos = ssm_cp_offset`) — sliding-
+         // window semantics, same rule as the MTP history.
+         const dflash_active = options.dflash_enabled and options.dflash != null;
++        const split_prefill = split_prefill_env and !dflash_active;
++        if (split_prefill) qwen4_forward.stagePrefillBegin(&ctx);
++        var split_pending: ?StageChunk = null;
++        var split_cp_new: ?SSMCheckpoint = null;
++        errdefer {
++            if (split_pending) |*pc| if (pc.cp) |*cp| cp.deinit(allocator);
++            if (split_cp_new) |*cp| cp.deinit(allocator);
++        }
++        errdefer if (split_prefill) {
++            while (qwen4_forward.stagePrefillInflight() > 0) {
++                var junk = mlx.mlx_array_new();
++                qwen4_forward.stagePrefillRecv(xfm, &junk) catch break;
++                _ = mlx.mlx_array_free(junk);
++            }
++        };
+         var dflash_ctx: ?dflash_mod.DflashCtx = if (!dflash_active)
+             null
+         else if (options.dflash_ctx_restored) |restored| blk: {
+@@ -2772,12 +2880,18 @@ pub const Generator = struct {
+                 errdefer if (dflash_active) {
+                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+                 };
++                if (split_prefill) ctx.stage_prefill = 1;
+                 const chunk_logits = if (mtp_active) blk: {
+                     var last_unused = mlx.mlx_array_new();
+                     defer _ = mlx.mlx_array_free(last_unused);
+                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
+                 } else try xfm.forwardWith(&ctx, chunk_input);
+                 _ = mlx.mlx_array_free(chunk_logits);
++                if (split_prefill) {
++                    ctx.stage_prefill = 0;
++                    if (!ctx.stage_prefill_sent) return error.StageSplitPrefill;
++                    ctx.stage_prefill_sent = false;
++                }
+                 if (dflash_active) {
+                     ctx.capture_layers = null;
+                     try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
+@@ -2799,7 +2913,7 @@ pub const Generator = struct {
+                 // tokens [pos+1, end+1) — prompt_ids[end] always exists since
+                 // the chunk loop spans [0, prefix_len) and prompt_ids has
+                 // prefix_len + 1 entries.
+-                if (mtp_active) {
++                if (mtp_active and !split_prefill) {
+                     if (!mtp_history_started) {
+                         std.debug.assert(mtp_cache.?.step() == 0);
+                         mtp_position_base = ssm_cp_offset + pos;
+@@ -2869,6 +2983,7 @@ pub const Generator = struct {
+                 }
+                 // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
+                 _ = mlx.mlx_clear_cache();
++
+                 if (trace_enabled) {
+                     const eval_dt = prefill_sw.read() - eval_start_ns;
+                     eval_ns += eval_dt;
+@@ -2887,7 +3002,12 @@ pub const Generator = struct {
+                 // are realized; the snapshot is just a refcount-share of the
+                 // already-resident state.
+                 const abs_end_for_cp2 = end + ssm_cp_offset;
+-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) {
++                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) split_cp: {
++                    if (split_prefill) {
++                        // layers [0, first) are final here; the rest arrive with this chunk's stage output
++                        split_cp_new = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
++                        break :split_cp;
++                    }
+                     const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
+                     ssm_checkpoints.append(allocator, cp) catch |e| {
+                         var doomed = cp;
+@@ -2915,6 +3035,17 @@ pub const Generator = struct {
+                     }
+                 }
+ 
++                if (split_prefill) {
++                    if (split_pending) |*pc| {
++                        try completeStagePrefillChunk(xfm, &ctx, options, &mtp_cache, mtp_active, &mtp_history_started, &mtp_position_base, prompt_ids, pc.pos, pc.end, ssm_cp_offset, allocator);
++                        if (pc.cp) |partial| {
++                            pc.cp = null;
++                            try finishStageCheckpoint(allocator, xfm, &ctx, glm_request, partial, pc.end + ssm_cp_offset, &ssm_checkpoints, &ssm_cp_peak, options.ssm_checkpoint_max, cp_thin, mtp_active, &mtp_cache, mtp_position_base);
++                        }
++                    }
++                    split_pending = .{ .pos = pos, .end = end, .cp = split_cp_new };
++                    split_cp_new = null;
++                }
+                 if (vision_chunked) {
+                     vision_rows_consumed += countSpliceRows(
+                         ids_i32[pos..end],
+@@ -2927,6 +3058,19 @@ pub const Generator = struct {
+                 // Publish progress once per chunk — same cadence discipline as
+                 // `inflight_generated_tokens` (once per decode tick), never per token.
+                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
++                if (options.native_priority_hook) |hk| {
++                    // texas-split: land the chunk still on the stage before parking (the parked
++                    // state then covers [0, pos) on both sides and the stage is free)
++                    if (split_prefill) if (split_pending) |*pc| if (hk.wants) |wants| if (wants(hk.ctx)) {
++                        try completeStagePrefillChunk(xfm, &ctx, options, &mtp_cache, mtp_active, &mtp_history_started, &mtp_position_base, prompt_ids, pc.pos, pc.end, ssm_cp_offset, allocator);
++                        if (pc.cp) |partial| {
++                            pc.cp = null;
++                            try finishStageCheckpoint(allocator, xfm, &ctx, glm_request, partial, pc.end + ssm_cp_offset, &ssm_checkpoints, &ssm_cp_peak, options.ssm_checkpoint_max, cp_thin, mtp_active, &mtp_cache, mtp_position_base);
++                        }
++                        split_pending = null;
++                    };
++                    try hk.call(hk.ctx, &ctx, if (mtp_cache) |*mc| mc else null, ssm_checkpoints.items);
++                }
+                 // Persist this chunk now: the KV bytes for [0, pos) are final.
+                 if (options.write_through_hook) |wt| {
+                     wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
+@@ -2989,6 +3133,14 @@ pub const Generator = struct {
+             // With it, the cache restores to position 749 (~99% of the
+             // prompt) and only the last token + new tail re-forwards.
+             // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
++            if (split_prefill) if (split_pending) |*pc| {
++                try completeStagePrefillChunk(xfm, &ctx, options, &mtp_cache, mtp_active, &mtp_history_started, &mtp_position_base, prompt_ids, pc.pos, pc.end, ssm_cp_offset, allocator);
++                if (pc.cp) |partial| {
++                    pc.cp = null;
++                    try finishStageCheckpoint(allocator, xfm, &ctx, glm_request, partial, pc.end + ssm_cp_offset, &ssm_checkpoints, &ssm_cp_peak, options.ssm_checkpoint_max, cp_thin, mtp_active, &mtp_cache, mtp_position_base);
++                }
++                split_pending = null;
++            };
+             if (want_ssm_cp and loop_end > 0) {
+                 // The snapshot sits at the chunk loop's end — snapshot_backoff
+                 // tokens BEFORE the prompt end, where the next turn's prefix
+@@ -3074,6 +3226,7 @@ pub const Generator = struct {
+         errdefer if (dflash_active) {
+             for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
+         };
++        if (split_prefill) ctx.stage_prefill = 2;
+         const raw_logits = if (tail_mtp_capture) blk: {
+             has_captured_hidden = true;
+             break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
+@@ -3081,6 +3234,7 @@ pub const Generator = struct {
+             has_captured_hidden = true;
+             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
+         } else try xfm.forwardWith(&ctx, last_input);
++        ctx.stage_prefill = 0;
+         // History entries for the held-back span: (hidden[j], token[j+1]) for
+         // j in [final_start, prefix_len) — same pairing as the chunk loop.
+         // The last row's pair (hidden[last], t1) is appended by the first
+@@ -3995,7 +4149,11 @@ pub const Generator = struct {
+     /// rollback without being counted.
+     fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
+         self.partial_rounds += 1;
+-        for (entries) |*entry| {
++        // R60 pipeline split: layers [first, 48) ran on the 5090 stage, which rolls back on its own
++        // (the next stage forward commits only the accepted rows); their Sushi state is untouched.
++        const split_first: ?usize = if (self.ctx.stage_split) qwen4_forward.stageSplitFirst() else null;
++        for (entries, 0..) |*entry, i| {
++            if (split_first) |f| if (i >= f) continue;
+             try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
+         }
+     }
+@@ -6267,6 +6425,10 @@ pub const Generator = struct {
+     pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState, open: MtpRoundOpen };
+ 
+     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
++        // R60 pipeline split: this round's trunk forwards run layers [first, 48) on the 5090 stage.
++        const prev_split = self.ctx.stage_split;
++        self.ctx.stage_split = qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
++        defer self.ctx.stage_split = prev_split;
+         var st = switch (try self.mtpRoundBegin(allocator)) {
+             .done => |r| return r,
+             .verify => |v| v,
+@@ -9390,6 +9552,10 @@ pub const Generator = struct {
+     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+         var tick_prof = TickProf.begin();
+         defer tick_prof.finish();
++        // R60 pipeline split: a serial decode step's trunk forward uses the 5090 stage too.
++        const prev_split = self.ctx.stage_split;
++        self.ctx.stage_split = qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
++        defer self.ctx.stage_split = prev_split;
+         if (self.done) return null;
+         if (self.sampling.constraint != null) return self.nextConstrained(allocator);
+ 
+diff --git a/src/kld.zig b/src/kld.zig
+index 1fd85276..765954cf 100644
+--- a/src/kld.zig
++++ b/src/kld.zig
+@@ -10,6 +10,7 @@ const scheduler_mod = @import("scheduler.zig");
+ const model_settings_mod = @import("model_settings.zig");
+ const server_mod = @import("server.zig");
+ const hidden_capture = @import("hidden_capture.zig");
++const qwen4_forward = @import("qwen4_forward.zig");
+ const fp8_block = @import("fp8_block.zig");
+ const testing = std.testing;
+ 
+@@ -1166,6 +1167,9 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
+         var ctx = l.xfm.defaultCtx();
+         var logits = try forwardPromptCapture(allocator, l, &ctx, ids, hidden);
+         defer _ = mlx.mlx_array_free(logits);
++        // R60 pipeline split: the prompt prefills on the Mac; with a stage configured, every
++        // one-token continuation forward runs layers [first, 48) on the RTX 5090 (seeded once).
++        ctx.stage_split = qwen4_forward.stageDecodeEnabled();
+         const vocab = try logitsVocab(logits);
+         const row = try allocator.alloc(f32, vocab);
+         defer allocator.free(row);
+@@ -1338,6 +1342,7 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
+         var ctx = l.xfm.defaultCtx();
+         var logits = try forwardPrompt(allocator, l, &ctx, prompt_ids);
+         defer _ = mlx.mlx_array_free(logits);
++        ctx.stage_split = qwen4_forward.stageDecodeEnabled();
+ 
+         var prompt_kld: f64 = 0;
+         var prompt_nll: f64 = 0;
+diff --git a/src/qwen4_forward.zig b/src/qwen4_forward.zig
+index 3ab27c9f..1fa8f71a 100644
+--- a/src/qwen4_forward.zig
++++ b/src/qwen4_forward.zig
+@@ -1,6 +1,218 @@
+ //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
+ 
+ const trf = @import("transformer.zig");
++// R60 pipeline split (isolated experiment): native/stage_split.cpp.
++extern "c" fn stage_split_first() c_int;
++extern "c" fn stage_split_invalidate() void;
++extern "c" fn stage_split_valid_at(position: u64) c_int;
++extern "c" fn stage_split_seed_begin(position: u64) c_int;
++extern "c" fn stage_split_seed_recurrent(conv: mlx.mlx_array, ssm: mlx.mlx_array, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_seed_attention(keys: mlx.mlx_array, ks: mlx.mlx_array, kb: mlx.mlx_array, values: mlx.mlx_array, vs: mlx.mlx_array, vb: mlx.mlx_array, pooled: mlx.mlx_array, raw: mlx.mlx_array, len: u64, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_seed_end(position: u64) c_int;
++extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_prefill_begin(owner: u64) void;
++extern "c" fn stage_split_bind(owner: u64) void;
++extern "c" fn stage_split_resident(owner: u64) c_int;
++extern "c" fn stage_split_park(owner: u64, position: u64, path: [*:0]const u8) c_int;
++extern "c" fn stage_split_unpark(owner: u64, position: u64) c_int;
++extern "c" fn stage_split_forget(owner: u64) void;
++extern "c" fn stage_split_seed_zero() c_int;
++extern "c" fn stage_split_prefill_export(data: *[*]const u8, len: *u64) c_int;
++extern "c" fn stage_split_pullback_enabled() c_int;
++extern "c" fn stage_split_prefill_ready(position: u64) c_int;
++extern "c" fn stage_split_prefill_inflight() c_int;
++extern "c" fn stage_split_prefill_send(h: mlx.mlx_array, position: u64, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_prefill_recv(out: *mlx.mlx_array, dt: mlx.mlx_dtype, s: mlx.mlx_stream) c_int;
++/// R60 S4 (prefill v2): split prefill is on when the stage is connected and SUSHI_STAGE_PREFILL != 0.
++pub fn stagePrefillEnabled() bool {
++    if (stageSplitFirst() == null) return false;
++    const v = std.c.getenv("SUSHI_STAGE_PREFILL") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++/// R60 S4: split decode is on unless SUSHI_STAGE_DECODE=0 (then decode runs every layer on the Mac,
++/// which after a split prefill needs the pull-back).
++pub fn stageDecodeEnabled() bool {
++    if (stageSplitFirst() == null) return false;
++    const v = std.c.getenv("SUSHI_STAGE_DECODE") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++/// R60 S4: image (M-RoPE) requests decode through the stage with their rope delta unless
++/// SUSHI_STAGE_MROPE=0; their prefill always stays on the Mac.
++pub fn stageMropeEnabled() bool {
++    const v = std.c.getenv("SUSHI_STAGE_MROPE") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++pub fn stagePullbackEnabled() bool {
++    return stage_split_pullback_enabled() != 0;
++}
++/// R60 S4 (prefill v2 pull-back): write the last received chunk's layer [first, 48) state into
++/// Sushi's caches (canon-stage-server's "QDX1" blob: recurrent conv/state; attention KV rows through
++/// KVCache.appendQuantized, pooled blocks and raw keys through the QSA ring/bank helpers).
++pub fn stagePrefillImport(self: *Transformer, ctx: *ForwardCtx) !void {
++    var ptr: [*]const u8 = undefined;
++    var len: u64 = 0;
++    if (stage_split_prefill_export(&ptr, &len) != 0) return error.StageSplitPullback;
++    const blob = ptr[0..@intCast(len)];
++    const r32 = struct {
++        fn f(b: []const u8, o: usize) u32 {
++            return std.mem.readInt(u32, b[o..][0..4], .little);
++        }
++    }.f;
++    const r64 = struct {
++        fn f(b: []const u8, o: usize) u64 {
++            return std.mem.readInt(u64, b[o..][0..8], .little);
++        }
++    }.f;
++    if (blob.len < 32 or r32(blob, 0) != 0x31584451) return error.StageSplitPullback;
++    const first: usize = r32(blob, 8);
++    const nlayers: usize = r32(blob, 12);
++    const from: usize = @intCast(r64(blob, 16));
++    const to: usize = @intCast(r64(blob, 24));
++    const rows: usize = to - from;
++    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
++    const s = self.s;
++    var at: usize = 32;
++    const Arr = struct {
++        fn make(p: [*]const u8, shape: []const c_int, dt: mlx.mlx_dtype) mlx.mlx_array {
++            return mlx.mlx_array_new_data(@ptrCast(p), shape.ptr, @intCast(shape.len), dt);
++        }
++        fn headMajor(p: [*]const u8, r: usize, w: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
++            // token-major [R, 2, w] -> [1, 2, R, w]
++            const a = make(p, &[_]c_int{ 1, @intCast(r), 2, w }, dt);
++            defer _ = mlx.mlx_array_free(a);
++            var t = mlx.mlx_array_new();
++            try mlx.check(mlx.mlx_transpose_axes(&t, a, &[_]c_int{ 0, 2, 1, 3 }, 4, st));
++            return t;
++        }
++    };
++    var l = first;
++    while (l < first + nlayers) : (l += 1) {
++        const tag = r32(blob, at);
++        at += 16;
++        if (tag == 1) {
++            const conv = Arr.make(blob[at..].ptr, &[_]c_int{ 1, 3, 10240 }, .bfloat16);
++            at += 3 * 10240 * 2;
++            const state = Arr.make(blob[at..].ptr, &[_]c_int{ 1, 48, 128, 128 }, .float32);
++            at += 48 * 128 * 128 * 4;
++            const e = &entries[l];
++            if (e.conv_state.ctx != null) _ = mlx.mlx_array_free(e.conv_state);
++            if (e.ssm_state.ctx != null) _ = mlx.mlx_array_free(e.ssm_state);
++            e.conv_state = conv;
++            e.ssm_state = state;
++            e.initialized = true;
++        } else if (tag == 2) {
++            var kq: [6]mlx.mlx_array = undefined;
++            const widths = [_]usize{ 512, 16, 16, 512, 16, 16 };
++            const lanes = [_]c_int{ 64, 4, 4, 64, 4, 4 };
++            const dts = [_]mlx.mlx_dtype{ .uint32, .bfloat16, .bfloat16, .uint32, .bfloat16, .bfloat16 };
++            for (0..6) |j| {
++                kq[j] = try Arr.headMajor(blob[at..].ptr, rows, lanes[j], dts[j], s);
++                at += rows * widths[j];
++            }
++            defer for (kq) |a| {
++                _ = mlx.mlx_array_free(a);
++            };
++            var view = try ctx.cache.appendQuantized(@intCast(l), .{ .q = kq[0], .scales = kq[1], .biases = kq[2] }, .{ .q = kq[3], .scales = kq[4], .biases = kq[5] }, s, 0);
++            view.deinit();
++            const nb = to / 4 - from / 4;
++            if (nb > 0) {
++                const pooled = Arr.make(blob[at..].ptr, &[_]c_int{ 1, @intCast(nb), 128 }, .bfloat16);
++                defer _ = mlx.mlx_array_free(pooled);
++                at += nb * 128 * 2;
++                try self.qsaAppendPooled(&entries[l], pooled, @intCast(from / 4));
++            }
++            at = (at + 15) / 16 * 16;
++            const n: usize = @intCast(r64(blob, at));
++            at += 16;
++            if (n > 0) {
++                const keys = Arr.make(blob[at..].ptr, &[_]c_int{ 1, @intCast(n), 128 }, .bfloat16);
++                defer _ = mlx.mlx_array_free(keys);
++                at += n * 128 * 2;
++                try self.qsaAppendKeys(&entries[l], keys, @intCast(to - n));
++            }
++            at = (at + 15) / 16 * 16;
++        } else return error.StageSplitPullback;
++        if (at > blob.len) return error.StageSplitPullback;
++    }
++}
++/// A new request's prefill: its first chunk re-seeds the stage.
++pub fn stagePrefillBegin(ctx: *const ForwardCtx) void {
++    stage_split_prefill_begin(stageOwner(ctx));
++}
++/// texas-split parking: the sequence a forward serves, as the stage client names it (the slot's
++/// KV cache: the same object in the prefill's and the decode's ForwardCtx).
++pub fn stageOwner(ctx: *const ForwardCtx) u64 {
++    return @intFromPtr(ctx.cache);
++}
++/// Park the sequence's stage state (layers [first, 48)) at its committed length into `path`:
++/// 1 parked, 0 the stage holds none of it, -1 the stage failed (given up; the sequence re-runs
++/// Mac-only when it resumes, see the resident check in the forward).
++pub fn stageSplitPark(ctx: *const ForwardCtx, position: usize, path: [*:0]const u8) c_int {
++    if (stageSplitFirst() == null) return 0;
++    return stage_split_park(stageOwner(ctx), @intCast(position), path);
++}
++/// The sequence's committed length as the Mac layers [0, first) hold it (the stage's committed
++/// length at a native boundary): the KV length of the first full-attention layer before the stage.
++pub fn stageCommittedPosition(self: *const Transformer, ctx: *const ForwardCtx) ?usize {
++    const first = stageSplitFirst() orelse return null;
++    var l: usize = 0;
++    while (l < first) : (l += 1) {
++        if (self.config.isLinearLayer(@intCast(l))) continue;
++        const kv = &ctx.cache.entries[l];
++        if (!kv.initialized or kv.base != 0) return null;
++        return @intCast(kv.offset);
++    }
++    return null;
++}
++/// The slot's sequence ended or re-runs from its tokens: drop its parked stage state and residency.
++pub fn stageSplitForget(cache: *const anyopaque) void {
++    stage_split_forget(@intFromPtr(cache));
++}
++/// Re-seed the stage for this sequence at `position`, from its parked state when it was parked
++/// exactly there, else from Sushi's caches.
++fn stageSeedOrRestore(self: *Transformer, ctx: *ForwardCtx, first: usize, position: usize) !void {
++    const r = stage_split_unpark(stageOwner(ctx), @intCast(position));
++    if (r < 0) return error.StageSplitSeed;
++    if (r == 0) try stageSeed(self, ctx, first, position);
++}
++pub fn stagePrefillInflight() usize {
++    return @intCast(stage_split_prefill_inflight());
++}
++/// The oldest in-flight chunk's stream after layer 47, as the MTP history's hidden input.
++pub fn stagePrefillRecv(self: *Transformer, target_all: *mlx.mlx_array) !void {
++    var out = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(out);
++    if (stage_split_prefill_recv(&out, .bfloat16, self.s) != 0) return error.StageSplitPrefill;
++    try capturePrefillHidden(self.s, target_all, out, true);
++}
++/// The stage's first layer, or null when the split is disabled.
++pub fn stageSplitFirst() ?usize {
++    const f = stage_split_first();
++    return if (f >= 0) @intCast(f) else null;
++}
++/// Copy Sushi's committed state of layers [first, 48) into the stage (after a prefill).
++fn stageSeed(self: *Transformer, ctx: *ForwardCtx, first: usize, position: usize) !void {
++    // R60 S4: nothing cached yet (a cold prefill): the empty state, without reading Sushi's caches.
++    if (position == 0) {
++        if (stage_split_seed_zero() != 0) return error.StageSplitSeed;
++        return;
++    }
++    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
++    if (stage_split_seed_begin(position) != 0) return error.StageSplitSeed;
++    var l: usize = first;
++    while (l < self.config.num_hidden_layers) : (l += 1) {
++        const e = &entries[l];
++        if (self.config.isLinearLayer(@intCast(l))) {
++            if (stage_split_seed_recurrent(e.conv_state, e.ssm_state, self.s) != 0) return error.StageSplitSeed;
++        } else {
++            const kv = &ctx.cache.entries[l];
++            if (!kv.initialized or kv.base != 0 or kv.offset != position) return error.StageSplitSeedKv;
++            if (stage_split_seed_attention(kv.keys, kv.keys_scales, kv.keys_biases, kv.values, kv.values_scales, kv.values_biases, e.qsa_pooled, e.aux_state, position, self.s) != 0)
++                return error.StageSplitSeed;
++        }
++    }
++    if (stage_split_seed_end(position) != 0) return error.StageSplitSeed;
++}
+ const Transformer = trf.Transformer;
+ const std = @import("std");
+ const sushi_exl3 = @import("sushi_exl3");
+@@ -1444,6 +1656,7 @@ pub fn forwardQwen4VerifyRows(
+     out_last: []mlx.mlx_array,
+     out_all: []mlx.mlx_array,
+ ) !void {
++    stage_split_invalidate(); // R60: these batched paths run every layer on the Mac
+     const previous_hc_prepared = mtp_verify_hc_prepared_active;
+     mtp_verify_hc_prepared_active = true;
+     defer mtp_verify_hc_prepared_active = previous_hc_prepared;
+@@ -1694,6 +1907,7 @@ pub fn forwardQwen4DecodeRows(
+     ctxs: []const *ForwardCtx,
+     hidden_rows: ?*?[]mlx.mlx_array,
+ ) ![]mlx.mlx_array {
++    stage_split_invalidate(); // R60: these batched paths run every layer on the Mac
+     const n = ctxs.len;
+     std.debug.assert(n == next_tokens.len and n >= 1 and n <= MAX_BATCH_ROWS);
+     if (!qwen4_rows_logged) {
+@@ -1969,9 +2183,54 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+         !diagEnvOnCached(&trf.expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
+     var deferred: ?DeferredQwenMoe = null;
+     defer if (deferred) |*d| d.deinit();
++    // R60: a normal full forward (prefill) leaves the stage behind Sushi's caches; a stage prefill
++    // forward (R60 S4) keeps it in step.
++    // An M-RoPE prefill (image tokens: 3-D positions) never goes to the stage; M-RoPE decode rows are
++    // text and go with their rope delta (stage_split_forward), unless SUSHI_STAGE_MROPE=0.
++    if (ctx.stage_prefill != 0 and ctx.mrope_pos != null) return error.StageSplitMrope;
++    const stage_first: ?usize = if ((ctx.stage_split and (ctx.mrope_pos == null or stageMropeEnabled())) or ctx.stage_prefill != 0) stageSplitFirst() else blk: {
++        stage_split_invalidate();
++        break :blk null;
++    };
++    // texas-split: a sequence whose layers [first, 48) live on the stage (it decoded there) has no
++    // usable state for them in Sushi's caches: without the stage it re-runs from its tokens (the
++    // scheduler's stage recovery), never Mac-only from stale caches.
++    if (stage_first == null and stage_split_resident(stageOwner(ctx)) != 0) return error.StageSplitForward;
++    if (stage_first != null) stage_split_bind(stageOwner(ctx));
+     var layer_idx: usize = 0;
+     while (layer_idx < layerCap(cfg.num_hidden_layers)) {
+         const li: u32 = @intCast(layer_idx);
++        if (stage_first) |first| if (layer_idx == first) {
++            // R60 pipeline split: layers [first, 48) on the RTX 5090; resume after layer 47.
++            try self.hcFlush(&h, batch, seq_len, &pending);
++            std.debug.assert(deferred == null);
++            if (ctx.stage_prefill != 0) {
++                // R60 S4 (prefill v2): the chunk's rows through the stage's prefill path.
++                if (stage_split_prefill_ready(@intCast(offset)) == 0) try stageSeedOrRestore(self, ctx, first, offset);
++                if (stage_split_prefill_send(h, @intCast(offset), self.s) != 0) return error.StageSplitPrefill;
++                if (ctx.stage_prefill == 1) {
++                    ctx.stage_prefill_sent = true;
++                    ctx.moe_seq_offset.* += @intCast(seq_len);
++                    _ = mlx.mlx_array_free(h);
++                    h = .{ .ctx = null };
++                    return mlx.mlx_array_new();
++                }
++                var pout = mlx.mlx_array_new();
++                if (stage_split_prefill_recv(&pout, mlx.mlx_array_dtype(h), self.s) != 0) return error.StageSplitPrefill;
++                if (stagePullbackEnabled()) try stagePrefillImport(self, ctx);
++                _ = mlx.mlx_array_free(h);
++                h = pout;
++                break;
++            }
++            if (stage_split_valid_at(@intCast(offset)) == 0) try stageSeedOrRestore(self, ctx, first, offset);
++            var out = mlx.mlx_array_new();
++            // An M-RoPE request's decode rows are text: rope at row + its decode delta on all axes.
++            const rope_delta: i32 = if (ctx.mrope_pos != null) ctx.mrope_delta else 0;
++            if (stage_split_forward(h, &out, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
++            _ = mlx.mlx_array_free(h);
++            h = out;
++            break;
++        };
+         if (dumping) trf.moe_dump_layer = li;
+         const lw = &ml[layer_idx];
+         const entry = &entries[layer_idx];
+diff --git a/src/scheduler.zig b/src/scheduler.zig
+index 8adeb60a..9c9a059f 100644
+--- a/src/scheduler.zig
++++ b/src/scheduler.zig
+@@ -32,6 +32,7 @@
+ //! plus a cv broadcast.
+ 
+ const std = @import("std");
++const texas_priority = @import("texas_priority.zig");
+ pub var slot_vision_free_test_hook: ?*const fn (mlx.mlx_array) void = null;
+ const mlx = @import("mlx.zig");
+ const transformer_mod = @import("transformer.zig");
+@@ -39,6 +40,7 @@ const mimo_forward = @import("mimo_forward.zig");
+ const qwen4_qsa = @import("qwen4_qsa.zig");
+ const tokenizer_mod = @import("tokenizer.zig");
+ const generate_mod = @import("generate.zig");
++const qwen4_forward = @import("qwen4_forward.zig");
+ const rp_mod = @import("reasoning_protocol.zig");
+ const mtp_mod = @import("mtp.zig");
+ const depth_bounds = @import("mtp_depth_bounds.zig");
+@@ -408,6 +410,7 @@ fn firstMediaPlaceholder(
+ 
+ /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
+ pub const Slot = struct {
++    background: bool = false,
+     allocator: std.mem.Allocator,
+     /// io reference for Stopwatch / async-eval (captured from Scheduler).
+     io: std.Io,
+@@ -1632,6 +1635,15 @@ pub const Scheduler = struct {
+     /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
+     /// the scheduler is shutting down this returns `error.Shutdown`.
+     pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
++        if (texas_priority.enabled() and texas_priority.request_background) {
++            const n = (params.full_prompt orelse params.prompt_ids).len +| @as(usize, params.max_tokens);
++            if (n > 262144) return error.NativeBackgroundContext;
++            const cfg = params.model.config orelse return error.ModelNotReady;
++            const numbers = prefill_admission_numbers orelse return error.NativeBackgroundMemory;
++            const b = numbers(cfg, (params.full_prompt orelse params.prompt_ids).len, params.max_tokens, params.kv_quant_config orelse self.kv_quant_config, false, params.enable_mtp);
++            const retained = b.commit *| 2 +| (512 * 1024 * 1024);
++            if (!texas_priority.admissionFits(retained, texas_priority.texas_available())) return error.NativeBackgroundMemory;
++        }
+         // Construct the slot up front so we don't hold the queue mutex
+         // through any allocation. Per-request `kv_quant_config` override (Wave
+         // 1.A) wins over the process-level default carried on the scheduler.
+@@ -1683,7 +1695,9 @@ pub const Scheduler = struct {
+         const eff_kv_quant = params.kv_quant_config orelse
+             transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
+         if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
+-        return Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
++        const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
++        slot.background = texas_priority.request_background;
++        return slot;
+     }
+ 
+     /// `submit` failed before any slot owned `ve`; only the inference thread may free it. Waits
+@@ -2482,6 +2496,7 @@ fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
+     var outstanding: u64 = 0;
+     for (sch.decoding.items) |s| {
+         if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
++        if (texas_priority.nested and s.background) continue;
+         live = true;
+         outstanding +|= slotOutstandingGrowth(s);
+     }
+@@ -5134,6 +5149,12 @@ pub fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[orphan_vision_cap]mlx.ml
+ 
+ /// Caller holds `queue_mu`. Shared with the wait condition below.
+ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
++    if (texas_priority.enabled()) {
++        for (sch.pending.items) |slot| if (!slot.background or (!texas_priority.nested and !texas_priority.held())) return true;
++        for (sch.decoding.items) |slot| if (!slot.background or !texas_priority.nested) return true;
++        return sch.vision_queue.items.len > 0 or sch.embed_queue.items.len > 0 or sch.cleanup_queue.items.len > 0 or sch.abandoned != null or sch.orphan_vision_n > 0 or sch.load_queue.items.len > 0 or sch.unload_queue.items.len > 0;
++    }
++
+     return sch.pending.items.len > 0 or
+         sch.decoding.items.len > 0 or
+         sch.vision_queue.items.len > 0 or
+@@ -5232,12 +5253,239 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+         }
+     }
+ 
+-    // The GPU warm window (`--gpu-warm-secs`): open since the last pass that ran a prefill or a
+-    // decode tick (`worked`).
+-    var warm_since: ?io_util.Stopwatch = null;
+-    var warm_ticks: u32 = 0;
+-    var worked = false;
++    texas_priority.open();
++    var state: InferenceTickState = .{};
+     while (!sch.shutdown.load(.acquire)) {
++        nativeDecodeBoundary(sch);
++        if (!inferenceTick(sch, &state)) break;
++    }
++    flushImatrixCaptures(sch);
++}
++
++const InferenceTickState = struct {
++    warm_since: ?io_util.Stopwatch = null,
++    warm_ticks: u32 = 0,
++    worked: bool = false,
++};
++
++fn admitNativePendingLocked(sch: *Scheduler, out: []*Slot) usize {
++    // Texas keeps the qualified solo foreground path while one background
++    // stack may be suspended. Priority never changes a request's batch kernel.
++    for ([_][]*Slot{ sch.prefilling.items, sch.decoding.items }) |slots| {
++        for (slots) |s| if (!s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) return 0;
++    }
++    var selected: ?usize = null;
++    for (sch.pending.items, 0..) |s, i| {
++        if (!s.background) { selected = i; break; }
++    }
++    if (selected == null and !texas_priority.nested and !texas_priority.held()) {
++        var live = false;
++        for (sch.decoding.items) |s| if (!s.finished and s.error_code == null and !s.cancelled.load(.acquire)) { live = true; };
++        if (!live and sch.pending.items.len > 0) selected = 0;
++    }
++    const idx = selected orelse return 0;
++    const indices = [_]usize{idx};
++    if (memoryAdmitCount(sch, &indices) == 0) return 0;
++    out[0] = admitForPrefillLocked(sch, idx);
++    _ = sch.pending.orderedRemove(idx);
++    return 1;
++}
++
++fn nativeHeld(sch: *Scheduler) bool {
++    if (texas_priority.held()) return true;
++    sch.queue_mu.lockUncancelable(sch.io);
++    defer sch.queue_mu.unlock(sch.io);
++    for ([_][]*Slot{ sch.pending.items, sch.prefilling.items, sch.decoding.items }) |slots| {
++        for (slots) |s| if (!s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) return true;
++    }
++    return sch.vision_queue.items.len > 0 or sch.embed_queue.items.len > 0;
++}
++
++test "Texas native admission prioritizes foreground and never admits background beside live work" {
++    const saved_numbers = prefill_admission_numbers;
++    defer prefill_admission_numbers = saved_numbers;
++    prefill_admission_numbers = null;
++    const saved_nested = texas_priority.nested;
++    defer texas_priority.nested = saved_nested;
++    var sch = submitTestScheduler(testing.allocator, 33);
++    sch.vision_queue = .empty;
++    sch.embed_queue = .empty;
++    defer sch.pending.deinit(testing.allocator);
++    defer sch.prefilling.deinit(testing.allocator);
++    defer sch.decoding.deinit(testing.allocator);
++    try sch.prefilling.ensureTotalCapacity(testing.allocator, 2);
++    var bg: Slot = undefined;
++    bg.background = true; bg.finished = false; bg.error_code = null;
++    bg.cancelled = .init(false); bg.in_pass = .init(0);
++    var fg: Slot = undefined;
++    fg.background = false; fg.finished = false; fg.error_code = null;
++    fg.cancelled = .init(false); fg.in_pass = .init(0);
++    try sch.pending.append(testing.allocator, &bg);
++    try testing.expect(!nativeHeld(&sch));
++    try sch.pending.append(testing.allocator, &fg);
++    try testing.expect(nativeHeld(&sch));
++    var out: [2]*Slot = undefined;
++    try testing.expect(admitNativePendingLocked(&sch, &out) == 1);
++    try testing.expect(out[0] == &fg and sch.pending.items[0] == &bg);
++    texas_priority.nested = true;
++    try testing.expect(admitNativePendingLocked(&sch, &out) == 0);
++    texas_priority.nested = false;
++    try sch.decoding.append(testing.allocator, &fg);
++    try testing.expect(admitNativePendingLocked(&sch, &out) == 0);
++    sch.prefilling.clearRetainingCapacity();
++    fg.finished = true;
++    try testing.expect(!nativeHeld(&sch));
++    try testing.expect(admitNativePendingLocked(&sch, &out) == 1 and out[0] == &bg);
++}
++
++fn releaseHead(mc: ?*generate_mod.MtpCacheRef) void {
++    if (mc) |m| switch (m.*) {
++        .qwen4 => |r| r.t.qwen4MtpRelease(r.st),
++        else => {},
++    };
++}
++fn collectHead(roots: *texas_priority.Roots, mc: ?*generate_mod.MtpCacheRef) !void {
++    if (mc) |m| switch (m.*) {
++        .qwen4 => |r| try roots.collect(r.st.*),
++        .qwen => |c| try roots.collect(c),
++        .mimo => |r| try roots.collect(r.st.*),
++    };
++}
++
++fn nativePrefillBoundary(ctx: *anyopaque, forward: *ForwardCtx, mc: ?*generate_mod.MtpCacheRef, cps: []transformer_mod.SSMCheckpoint) !void {
++    const ic: *InterleaveCtx = @ptrCast(@alignCast(ctx));
++    try nativeBoundary(ic.sch, ic.slot, forward, mc, cps);
++}
++/// texas-split: whether nativePrefillBoundary would park now (the split prefill lands its
++/// in-flight stage chunk first).
++fn nativePrefillWants(ctx: *anyopaque) bool {
++    const ic: *InterleaveCtx = @ptrCast(@alignCast(ctx));
++    return texas_priority.enabled() and ic.slot.background and !texas_priority.nested and nativeHeld(ic.sch);
++}
++/// texas-split: park the background sequence's stage half (layers [first, 48) on the RTX 5090) to
++/// SSD beside Sushi's own park; its next stage call restores it. A stage that fails here is given
++/// up, and the request re-runs Mac-only from its tokens when it resumes.
++fn nativeStagePark(slot: *Slot, forward: *ForwardCtx) void {
++    const dir = std.c.getenv("TEXAS_PRIORITY_CHECKPOINTS") orelse return;
++    const xfm = slot.model.transformer orelse return;
++    const position = qwen4_forward.stageCommittedPosition(xfm, forward) orelse return;
++    var buf: [1024]u8 = undefined;
++    const p = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/stage-request-{d}.bin", .{ std.mem.sliceTo(dir, 0), slot.request_id }) catch return;
++    buf[p.len] = 0;
++    if (qwen4_forward.stageSplitPark(forward, position, buf[0..p.len :0]) < 0)
++        log.warn("[stage] park failed at {d}; the request re-runs on the Mac when it resumes\n", .{position});
++}
++
++fn nativeDecodeBoundary(sch: *Scheduler) void {
++    if (!texas_priority.enabled() or texas_priority.nested) return;
++    var bg: ?*Slot = null;
++    sch.queue_mu.lockUncancelable(sch.io);
++    for (sch.decoding.items) |s| {
++        if (s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) {
++            bg = s;
++            _ = s.in_pass.fetchAdd(1, .acq_rel);
++            break;
++        }
++    }
++    sch.queue_mu.unlock(sch.io);
++    if (bg) |s| {
++        defer _ = s.in_pass.fetchSub(1, .acq_rel);
++        const mc = if (s.legacy_gen) |*g| if (g.mtp_cache) |*m| m else null else null;
++        nativeBoundary(sch, s, &s.ctx, mc, &.{}) catch |err| {
++            if (err != error.Cancelled) s.markError(@errorName(err));
++        };
++    } else {
++        texas_priority.set(.state, 0);
++        texas_priority.drained();
++    }
++}
++
++fn nativeBoundary(sch: *Scheduler, slot: *Slot, forward: *ForwardCtx, mc: ?*generate_mod.MtpCacheRef, cps: []const transformer_mod.SSMCheckpoint) !void {
++    if (!texas_priority.enabled() or !slot.background or texas_priority.nested) return;
++    texas_priority.set(.state, 1);
++    texas_priority.set(.tokens, slot.completion_tokens);
++    texas_priority.set(.prompt, slot.full_prompt.len);
++    texas_priority.set(.phase, if (slot.legacy_gen == null) 1 else 2);
++    if (slot.cancelled.load(.acquire)) return error.Cancelled;
++    if (!nativeHeld(sch)) return;
++    // texas-split: never park with a stage prefill chunk in flight (the prefill loop lands it first
++    // when the hook wants to park; a hold that arrived since then waits for the next boundary)
++    if (qwen4_forward.stagePrefillInflight() > 0) return;
++    const xfm = slot.model.transformer orelse return error.ModelNotReady;
++    const round_cost_saved = xfm.round_cost;
++    const group_cost_saved = xfm.mtp_group_cost;
++    const rng = texas_priority.texas_rng_save();
++    defer texas_priority.texas_rng_restore(rng);
++    defer {
++        xfm.round_cost = round_cost_saved;
++        xfm.mtp_group_cost = group_cost_saved;
++        if (mc) |m| m.activate();
++        if (slot.legacy_gen) |*g| {
++            g.invalidateSerialClock();
++            g.invalidateRoundClock();
++            g.stall = .{};
++        }
++    }
++    try xfm.ssmGroupRelease(forward);
++    releaseHead(mc);
++    try mlx.check(mlx.mlx_synchronize(xfm.s));
++    var roots: texas_priority.Roots = .{ .allocator = sch.allocator };
++    defer roots.deinit();
++    try roots.collect(slot.*);
++    try roots.collect(forward.cache.*);
++    try roots.collect(forward.ssm_entries);
++    try roots.collect(cps);
++    try collectHead(&roots, mc);
++    var protected: texas_priority.Roots = .{ .allocator = sch.allocator };
++    defer protected.deinit();
++    // Include private model buffers, not just public weights. The request's MTP
++    // state was swapped off the module before this protected-root traversal.
++    try protected.collect(xfm.*);
++    if (slot.model.weights) |w| {
++        var it = w.map.valueIterator();
++        while (it.next()) |a| try protected.collect(a.*);
++    }
++    if (slot.model.prefix_cache) |*hc| try protected.collect(hc.*);
++    if (slot.model.vision_encoder) |v| try protected.collect(v.*);
++    var nested_state: InferenceTickState = .{ .warm_since = io_util.Stopwatch.init(sch.io) };
++    texas_priority.nested = true;
++    defer texas_priority.nested = false;
++    while (true) {
++        texas_priority.set(.state, 2);
++        nativeStagePark(slot, forward);
++        var active_before: usize = 0;
++        _ = mlx.mlx_get_active_memory(&active_before);
++        var parked = texas_priority.Parked.create(&roots, &protected, slot.request_id);
++        _ = mlx.mlx_clear_cache();
++        var active_after: usize = 0;
++        _ = mlx.mlx_get_active_memory(&active_after);
++        texas_priority.set(.freed, active_before -| active_after);
++        texas_priority.set(.pauses, texas_priority.get(.pauses) + 1);
++        texas_priority.set(.state, 3);
++        texas_priority.drained();
++        while (true) {
++            texas_priority.set(.available, texas_priority.texas_available());
++            const held = nativeHeld(sch);
++            const ready = texas_priority.restoreFits(texas_priority.get(.available), texas_priority.get(.bytes));
++            texas_priority.set(.restore_wait, if (!ready) 1 else 0);
++            if ((!held or slot.cancelled.load(.acquire)) and ready) break;
++            texas_priority.drained();
++            if (sch.shutdown.load(.acquire)) std.process.exit(0);
++            _ = inferenceTick(sch, &nested_state);
++        }
++        texas_priority.set(.state, 4);
++        parked.restore();
++        texas_priority.set(.restore_wait, 0);
++        // Publish RUNNING before checking the gate: a new controller cannot
++        // acknowledge a drained background in the restore-to-dispatch race.
++        texas_priority.set(.state, 1);
++        if (!nativeHeld(sch) or slot.cancelled.load(.acquire)) break;
++    }
++    if (slot.cancelled.load(.acquire)) return error.Cancelled;
++    sleep_inhibit.setActive(true);
++}
++
++fn inferenceTick(sch: *Scheduler, state: *InferenceTickState) bool {
+         // 0a. Drain slots queued for cleanup. Conn threads hand finished
+         //     slots here in `complete()` — we own the mlx stream binding,
+         //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
+@@ -5321,13 +5569,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+         if (load_req) |req| runLoadRequest(sch, req);
+         if (unload_req) |req| runUnloadRequest(sch, req);
+         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+-        switch (gpuWarmBeforePark(worked, unload_req != null)) {
++        switch (gpuWarmBeforePark(state.worked, unload_req != null)) {
+             .keep => {},
+-            .restart => warm_since = io_util.Stopwatch.init(sch.io),
+-            .close => warm_since = null,
++            .restart => state.warm_since = io_util.Stopwatch.init(sch.io),
++            .close => state.warm_since = null,
+         }
+-        if (worked or unload_req != null) warm_ticks = 0;
+-        worked = false;
++        if (state.worked or unload_req != null) state.warm_ticks = 0;
++        state.worked = false;
+         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
+ 
+         // 1. Wait for work. Drain pending slots into a local list under lock,
+@@ -5339,33 +5587,46 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+             defer sch.queue_mu.unlock(sch.io);
+             const warm_ns: u64 = @as(u64, gpu_warm_secs) * std.time.ns_per_s;
+             while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+-                // No later tick runs while parked, so release here.
+                 sleep_inhibit.setActive(false);
+-                if (gpuWarmParkNs(if (warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
++                if (texas_priority.enabled()) {
++                    texas_priority.drained();
++                    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch {};
++                    const idle_ns = if (state.warm_since) |sw| sw.read() else 0;
++                    if (!hasWorkPendingLocked(sch) and gpuWarmTickDue(false, idle_ns, @as(u64, gpu_warm_secs) * std.time.ns_per_s) and idle_ns >= (@as(u64, state.warm_ticks) + 1) * GPU_WARM_TICK_NS) {
++                        state.warm_ticks += 1;
++                        sch.queue_mu.unlock(sch.io);
++                        gpuWarmTick();
++                        sch.queue_mu.lockUncancelable(sch.io);
++                    }
++                    return true;
++                }
++
++                // No later tick runs while parked.
++                if (gpuWarmParkNs(if (state.warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
+                     const timed_out = if (sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
+                         .raw = .fromNanoseconds(@intCast(park_ns)),
+                         .clock = .awake,
+                     } })) |_| false else |err| err == error.Timeout;
+-                    if (timed_out and gpuWarmTickDue(hasWorkPendingLocked(sch), if (warm_since) |sw| sw.read() else null, warm_ns)) {
+-                        if (warm_ticks == 0) log.debug("[gpu-warm] keeping the GPU awake for {d} s\n", .{gpu_warm_secs});
+-                        warm_ticks += 1;
++                    if (timed_out and gpuWarmTickDue(hasWorkPendingLocked(sch), if (state.warm_since) |sw| sw.read() else null, warm_ns)) {
++                        if (state.warm_ticks == 0) log.debug("[gpu-warm] keeping the GPU awake for {d} s\n", .{gpu_warm_secs});
++                        state.warm_ticks += 1;
+                         sch.queue_mu.unlock(sch.io);
+                         gpuWarmTick();
+                         sch.queue_mu.lockUncancelable(sch.io);
+                     }
+                 } else {
+-                    if (warm_ticks > 0) log.debug("[gpu-warm] idle window over after {d} ticks\n", .{warm_ticks});
+-                    warm_since = null;
+-                    warm_ticks = 0;
++                    if (state.warm_ticks > 0) log.debug("[gpu-warm] idle window over after {d} ticks\n", .{state.warm_ticks});
++                    state.warm_since = null;
++                    state.warm_ticks = 0;
+                     sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                 }
+             }
+-            if (sch.shutdown.load(.acquire)) break;
++            if (sch.shutdown.load(.acquire)) return false;
+             // Hold until the loop parks again.
+             sleep_inhibit.setActive(true);
+ 
+             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
+-            if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
++            if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) return true;
+ 
+             // Single-flight admission: a model with
+             // MODULE-OWNED decode state admits at most one live slot.
+@@ -5376,6 +5637,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+             // condition above never blocks while `pending` is non-empty,
+             // so a held slot admits on the first tick after the active one
+             // is culled (step 5, same mutex).
++            if (texas_priority.enabled()) {
++                n_prefill = admitNativePendingLocked(sch, &to_prefill);
++            } else {
+             var live_buf: [32]AdmitCand = undefined;
+             const n_live = heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slotExclusiveDecode);
+             var cand_buf: [32]AdmitCand = undefined;
+@@ -5396,6 +5660,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+                 r -= 1;
+                 _ = sch.pending.orderedRemove(admit_idx[r]);
+             }
++            }
+         }
+ 
+         if (sch.budget_revise_sw) |sw| {
+@@ -5422,10 +5687,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+                     finishSlot(sch, slot, "cancelled");
+                     continue;
+                 }
++                if (slot.background) nativeBoundary(sch, slot, &slot.ctx, null, &.{}) catch {
++                    finishSlot(sch, slot, "cancelled");
++                    continue;
++                };
+                 var prefill_sw = io_util.Stopwatch.init(sch.io);
+                 var qsa_gap_retried = false;
++                var stage_retried = false;
+                 prefill: while (true) {
+                     runPrefill(sch, slot) catch |err| {
++                        if (isStageSplitError(err) and !stage_retried) {
++                            stage_split_give_up("split prefill failed in the scheduler");
++                            log.warn("[stage] prefill failed ({s}); running the request again on the Mac\n", .{@errorName(err)});
++                            resetSlotForStageRetry(slot);
++                            stage_retried = true;
++                            continue :prefill;
++                        }
+                         if (err == error.Cancelled) {
+                             log.info("[scheduler] prefill aborted: client disconnected\n", .{});
+                             finishSlot(sch, slot, "cancelled");
+@@ -5486,6 +5763,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+             defer sch.queue_mu.unlock(sch.io);
+             for (sch.decoding.items) |s| {
+                 if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
++                if (texas_priority.nested and s.background) continue;
+                 active.append(sch.allocator, s) catch break;
+                 _ = s.in_pass.fetchAdd(1, .acq_rel);
+             }
+@@ -5501,18 +5779,33 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+         if (active.items.len > 0) {
+             var decode_sw = io_util.Stopwatch.init(sch.io);
+             runDecodeTick(sch, active.items) catch |err| {
+-                log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
+-                for (active.items) |s| s.markError(@errorName(err));
++                if (isStageSplitError(err)) {
++                    stage_split_give_up("split decode failed in the scheduler");
++                    log.warn("[stage] decode tick failed ({s}); continuing the stream on the Mac\n", .{@errorName(err)});
++                    for (active.items) |s| {
++                        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
++                        stageRecoverDecodingSlot(sch, s) catch |e| {
++                            if (e == error.Cancelled) {
++                                finishSlot(sch, s, "cancelled");
++                            } else {
++                                log.err("[stage] Mac-only recovery failed: {s}\n", .{@errorName(e)});
++                                s.markError(@errorName(e));
++                            }
++                        };
++                    }
++                } else {
++                    log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
++                    for (active.items) |s| s.markError(@errorName(err));
++                }
+             };
+             const tick_ns = decode_sw.read();
+             for (active.items) |s| s.decode_ns +|= tick_ns;
+         }
+-        worked = n_prefill > 0 or active.items.len > 0;
++        state.worked = n_prefill > 0 or active.items.len > 0;
+ 
+         // 5. Cull finished / errored / cancelled from `decoding`.
+         cullDecoding(sch);
+-    }
+-    flushImatrixCaptures(sch);
++    return true;
+ }
+ 
+ fn postPrefillTerminal(slot: *Slot) bool {
+@@ -6420,6 +6713,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+     // the record now describes bytes that die with `slot.cache`. Above every early return.
+     if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+     releaseNativeState(slot);
++    qwen4_forward.stageSplitForget(&slot.cache);
+     // SSD flush runs AFTER markFinished so the client never waits on the
+     // chunk-append — but everything it needs must be captured BEFORE the
+     // broadcast: the conn thread may complete()+free the slot immediately.
+@@ -6831,6 +7125,7 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
+     sch.queue_mu.lockUncancelable(sch.io);
+     for (sch.decoding.items) |s| {
+         if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
++        if (s.background) continue;
+         if (n >= buf.len) break;
+         buf[n] = s;
+         _ = s.in_pass.fetchAdd(1, .acq_rel);
+@@ -6895,6 +7190,55 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
+     slot.handover_token = t1;
+ }
+ 
++// R60 pipeline split, fatal-stage fallback (native/stage_split.cpp): any stage failure gives the
++// stage up for the rest of this process (every layer runs on the Mac from then on) and the request
++// it interrupted runs again Mac-only. A prefill simply restarts (nothing was streamed yet); a
++// decoding slot re-prefills its prompt plus every token the client already received, then keeps
++// decoding into the same stream, so the client sees a pause, not an error.
++extern "c" fn stage_split_give_up(why: [*:0]const u8) void;
++fn isStageSplitError(err: anyerror) bool {
++    return err == error.StageSplitForward or err == error.StageSplitSeed or err == error.StageSplitSeedKv or
++        err == error.StageSplitNoSsm or err == error.StageSplitPrefill or err == error.StageSplitPullback;
++}
++fn resetSlotForStageRetry(slot: *Slot) void {
++    qwen4_forward.stageSplitForget(&slot.cache);
++    if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
++    if (slot.model.transformer) |xf| {
++        slot.cache.truncate(0, xf.s) catch {};
++        xf.resetQsaPooledRope();
++        xf.qwen4MtpResetOwned(slot.enable_mtp);
++    }
++    if (slot.legacy_gen) |*g| {
++        g.deinit(slot.allocator);
++        slot.legacy_gen = null;
++    }
++    slot.moe_seq_offset = 0;
++    slot.cached_tokens = 0;
++    // Cold: the restore this slot made at its first prefill is still checked out to it.
++    slot.skip_prefix_cache = true;
++    slot.handover_token = null;
++}
++fn stageRecoverDecodingSlot(sch: *Scheduler, slot: *Slot) !void {
++    slot.out_mu.lockUncancelable(slot.io);
++    const emitted = slot.allocator.dupe(u32, slot.out_buf.items) catch |e| {
++        slot.out_mu.unlock(slot.io);
++        return e;
++    };
++    slot.out_mu.unlock(slot.io);
++    defer slot.allocator.free(emitted);
++    const extended = try std.mem.concat(slot.allocator, u32, &.{ slot.full_prompt, emitted });
++    log.warn("[stage] fallback: re-prefilling {d} prompt + {d} streamed tokens on the Mac, then continuing\n", .{ slot.full_prompt.len, emitted.len });
++    resetSlotForStageRetry(slot);
++    slot.allocator.free(slot.full_prompt);
++    slot.full_prompt = extended;
++    const prompt_tokens = slot.prompt_tokens;
++    try runPrefill(sch, slot);
++    const done: u32 = @intCast(emitted.len);
++    if (slot.legacy_gen) |*g| g.completion_tokens += done;
++    slot.completion_tokens = done;
++    slot.prompt_tokens = prompt_tokens;
++}
++
+ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+     // Mark the phase for the whole of prefill, and clear both signals on EVERY
+     // exit path (success, cancel, error). `requests_prefilling` flips at entry
+@@ -6924,6 +7268,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
+     // but cheap).
+     slot.ctx.cache = &slot.cache;
++    // texas-split: a new prefill of this slot's sequence; nothing of it is on the stage any more
++    qwen4_forward.stageSplitForget(&slot.cache);
+     slot.ctx.moe_seq_offset = &slot.moe_seq_offset;
+     slot.ctx.ssm_entries = slot.ssm_entries;
+     slot.ctx.vision_embeddings = slot.vision_embeddings;
+@@ -7220,7 +7566,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+     // out of prefill_ns below (the decoding slots got the time).
+     var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+     var write_through_ctx = WriteThroughCtx{ .slot = slot };
+-    const write_through_on = writeThroughArmed(slot, prefill_tokens.len);
++    const write_through_on = !slot.background and writeThroughArmed(slot, prefill_tokens.len);
+     cp_max = qwenCheckpointCap(slot, cp_max, write_through_on);
+     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
+     var width_ctx = ChunkWidthCtx{
+@@ -7314,6 +7660,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
+             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
++            .native_priority_hook = if (slot.background) .{ .ctx = &interleave_ctx, .call = nativePrefillBoundary, .wants = nativePrefillWants } else null,
+             .interleave_hook = if (prefillInterleaveEnabled())
+                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
+             else
+@@ -8084,17 +8431,20 @@ test "the inference loop parks without holding the sleep-inhibition assertion" {
+     const source = @embedFile("scheduler.zig");
+     const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+-    const body = source[start..end];
++    const startup = source[start..end];
++    const tick_start = std.mem.indexOf(u8, source, "fn inferenceTick(") orelse return error.MissingInferenceTick;
++    const tick_end = std.mem.indexOfPos(u8, source, tick_start + 1, "\nfn ") orelse return error.MissingInferenceTickEnd;
++    const body = source[tick_start..tick_end];
+     const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
+     const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+     const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+     try testing.expect(drop < park);
+     try testing.expect(park < hold);
+     try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
+-    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
+-    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
++    const boot_load = std.mem.indexOf(u8, startup, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
++    const boot_arm = std.mem.indexOf(u8, startup, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+     try testing.expect(boot_arm < boot_load);
+-    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
++    try testing.expect(std.mem.indexOf(u8, startup, "defer sleep_inhibit.release();") != null);
+ }
+ 
+ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
+diff --git a/src/server.zig b/src/server.zig
+index 979f298a..7d811111 100644
+--- a/src/server.zig
++++ b/src/server.zig
+@@ -1,4 +1,5 @@
+ const std = @import("std");
++const texas_priority = @import("texas_priority.zig");
+ const mlx = @import("mlx.zig");
+ const transformer_mod = @import("transformer.zig");
+ const tokenizer_mod = @import("tokenizer.zig");
+@@ -2298,6 +2299,8 @@ fn handleConnection(
+     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
+     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
+     logHttpRequest(method, raw_path, request_body);
++    texas_priority.request_background = if (findHeaderValueCI(request[0..header_end_pos], "x-localai-mode")) |v| std.ascii.eqlIgnoreCase(v, "background") else false;
++    defer texas_priority.request_background = false;
+ 
+     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
+     //    requires the key (the OpenAI/Anthropic APIs AND the metrics feed) —
+@@ -6505,6 +6508,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+             .message = if (context_refusal) |r| memoryContextRefusalMessage(buf, r) else PREFILL_NOFIT_MSG,
+         },
+         // Refused at submit, so every surface answers it the same way.
++        error.NativeBackgroundMemory => .{
++            .status_line = "507 Insufficient Storage", .code = 507, .openai_type = "insufficient_memory", .anthropic_type = "api_error",
++            .message = "Texas background admission needs projected retained bytes plus 12 GiB reclaimable memory (24 GiB retained limit)",
++        },
++        error.NativeBackgroundContext => .{
++            .status_line = "413 Payload Too Large", .code = 413, .openai_type = "invalid_request_error", .anthropic_type = "invalid_request_error",
++            .message = "Texas background prompt plus completion must fit 262144 tokens",
++        },
+         error.EmptyPrompt => .{
+             .status_line = "400 Bad Request",
+             .code = 400,
+@@ -9531,6 +9542,10 @@ fn handleChatCompletions(
+     defer allocator.free(prompt_ids);
+     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
+ 
++    if (texas_priority.request_background and !texas_priority.contextFits(prompt_ids.len, max_tokens)) {
++        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Texas background prompt plus requested completion must fit 262144 tokens", 413);
++        return;
++    }
+     // Enforce context size limit
+     const effective_ctx = getEffectiveContextLength(config);
+     if (prompt_ids.len > effective_ctx) {
+@@ -9789,6 +9804,10 @@ fn handleCompletions(
+     }
+     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
+ 
++    if (texas_priority.request_background and !texas_priority.contextFits(prompt_ids.len, max_tokens)) {
++        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Texas background prompt plus requested completion must fit 262144 tokens", 413);
++        return;
++    }
+     // Enforce context size limit
+     const effective_ctx = getEffectiveContextLength(config);
+     if (prompt_ids.len > effective_ctx) {
+diff --git a/src/tests.zig b/src/tests.zig
+index 49cad27e..bbd2ceb8 100644
+--- a/src/tests.zig
++++ b/src/tests.zig
+@@ -14,6 +14,7 @@ const expert_stream = @import("expert_stream.zig");
+ const expert_bf16_kernels = @import("expert_bf16_kernels.zig");
+ 
+ test {
++    _ = @import("texas_priority.zig");
+     _ = expert_stream;
+     _ = expert_bf16_kernels;
+     _ = @import("mimo_quant_test.zig");
+diff --git a/src/texas_priority.zig b/src/texas_priority.zig
+new file mode 100644
+index 00000000..a2a64000
+--- /dev/null
++++ b/src/texas_priority.zig
+@@ -0,0 +1,144 @@
++//! Texas's private native control page and identity-preserving SSD parking.
++const std = @import("std");
++const mlx = @import("mlx.zig");
++pub threadlocal var request_background: bool = false;
++var page: ?*anyopaque = null;
++pub var nested: bool = false; // Inference owner only.
++pub const Field = enum(c_uint) { seq, hold, state, ack, bytes, pauses, tokens, prompt, phase, park_error, restore_wait, freed, available };
++extern "c" fn texas_ipc_open([*:0]const u8, c_int) ?*anyopaque;
++extern "c" fn texas_ipc_get(?*anyopaque, c_uint) u64;
++extern "c" fn texas_ipc_set(?*anyopaque, c_uint, u64) void;
++pub extern "c" fn texas_available() u64;
++extern "c" fn texas_park([*]const ?*anyopaque, usize, [*]const ?*anyopaque, usize, [*:0]const u8, usize) ?*anyopaque;
++extern "c" fn texas_park_bytes(?*anyopaque) usize;
++extern "c" fn texas_restore(?*anyopaque) c_int;
++extern "c" fn texas_park_free(?*anyopaque) void;
++extern "c" fn texas_park_error() [*:0]const u8;
++pub extern "c" fn texas_rng_save() ?*anyopaque;
++pub extern "c" fn texas_rng_restore(?*anyopaque) void;
++
++pub fn open() void {
++    if (std.c.getenv("TEXAS_PRIORITY_IPC")) |path| {
++        page = texas_ipc_open(path, 0) orelse @panic("Texas private IPC unavailable");
++    }
++}
++pub fn enabled() bool { return page != null; }
++pub fn get(f: Field) u64 { return texas_ipc_get(page, @intFromEnum(f)); }
++pub fn set(f: Field, v: u64) void { texas_ipc_set(page, @intFromEnum(f), v); }
++pub fn held() bool { return get(.hold) != 0; }
++pub fn drained() void { set(.ack, get(.seq)); }
++pub fn contextFits(prompt: usize, requested: u32) bool {
++    return prompt +| @as(usize, requested) <= 262144;
++}
++pub fn admissionFits(retained: u64, available: u64) bool {
++    return retained <= 24 * 1024 * 1024 * 1024 and available >= retained +| (12 * 1024 * 1024 * 1024);
++}
++pub fn restoreFits(available: u64, parked: u64) bool {
++    return available >= parked +| (12 * 1024 * 1024 * 1024);
++}
++
++pub const Roots = struct {
++    values: std.ArrayList(?*anyopaque) = .empty,
++    allocator: std.mem.Allocator,
++    pub fn deinit(self: *Roots) void {
++        for (self.values.items) |ctx| _ = mlx.mlx_array_free(.{ .ctx = ctx });
++        self.values.deinit(self.allocator);
++    }
++    // Only value-owned arrays/slices are traversed. Pointer-owned request/model objects
++    // are collected explicitly; allocator, lock and opaque C handles are never followed.
++    pub fn collect(self: *Roots, value: anytype) !void { try self.walk(value, 12); }
++    fn walk(self: *Roots, value: anytype, comptime depth: usize) !void {
++        const T = @TypeOf(value);
++        if (T == mlx.mlx_array) {
++            if (value.ctx != null) {
++                var copy = mlx.mlx_array_new();
++                errdefer _ = mlx.mlx_array_free(copy);
++                try mlx.check(mlx.mlx_array_set(&copy, value));
++                try self.values.append(self.allocator, copy.ctx);
++            }
++            return;
++        }
++        if (depth == 0) return;
++        switch (@typeInfo(T)) {
++            .@"struct" => |s| inline for (s.field_names, s.field_attrs) |name, attrs| {
++                if (!attrs.@"comptime") try self.walk(@field(value, name), depth - 1);
++            },
++            .optional => if (value) |v| try self.walk(v, depth - 1),
++            .array => for (value) |v| try self.walk(v, depth - 1),
++            .pointer => |p| if (p.size == .slice and comptime containsArrays(p.child, depth - 1)) {
++                for (value) |v| try self.walk(v, depth - 1);
++            },
++            .@"union" => |u| if (u.tag_type != null) {
++                switch (value) { inline else => |v| try self.walk(v, depth - 1) }
++            },
++            else => {},
++        }
++    }
++};
++fn containsArrays(comptime T: type, comptime depth: usize) bool {
++    if (T == mlx.mlx_array) return true;
++    if (depth == 0) return false;
++    return switch (@typeInfo(T)) {
++        .@"struct" => |s| blk: {
++            inline for (s.field_types) |F| if (containsArrays(F, depth - 1)) break :blk true;
++            break :blk false;
++        },
++        .@"union" => |u| blk: {
++            inline for (u.field_types) |F| if (containsArrays(F, depth - 1)) break :blk true;
++            break :blk false;
++        },
++        .optional => |o| containsArrays(o.child, depth - 1),
++        .array => |a| containsArrays(a.child, depth - 1),
++        .pointer => |p| p.size == .slice and containsArrays(p.child, depth - 1),
++        else => false,
++    };
++}
++pub const Parked = struct {
++    handle: ?*anyopaque = null,
++    pub fn create(roots: *Roots, protected: *Roots, id: u64) Parked {
++        const dir = std.c.getenv("TEXAS_PRIORITY_CHECKPOINTS") orelse @panic("Texas checkpoint directory missing");
++        var path: [4096]u8 = undefined;
++        const p = std.fmt.bufPrint(path[0..path.len-1], "{s}/request-{d}.bin", .{ std.mem.sliceTo(dir, 0), id }) catch @panic("Texas checkpoint path too long");
++        path[p.len] = 0;
++        const h = texas_park(roots.values.items.ptr, roots.values.items.len,
++            protected.values.items.ptr, protected.values.items.len, @ptrCast(p.ptr), 24 * 1024 * 1024 * 1024);
++        set(.park_error, if (h == null) 1 else 0);
++        if (h == null) @import("log.zig").warn("[texas-priority] parking retained original RAM: {s}\n", .{std.mem.sliceTo(texas_park_error(), 0)});
++        set(.bytes, texas_park_bytes(h));
++        return .{ .handle = h };
++    }
++    pub fn restore(self: *Parked) void {
++        if (texas_restore(self.handle) != 0) {
++            @import("log.zig").err("[texas-priority] restore failed; stopping before tensor reuse: {s}\n", .{std.mem.sliceTo(texas_park_error(), 0)});
++            std.process.exit(70);
++        }
++        texas_park_free(self.handle);
++        self.handle = null;
++        set(.bytes, 0);
++    }
++};
++
++test "Texas roots retain private value-owned arrays without following opaque pointers" {
++    var r: Roots = .{ .allocator = std.testing.allocator };
++    defer r.deinit();
++    const a = mlx.mlx_array_new_int(1);
++    defer _ = mlx.mlx_array_free(a);
++    const dummy = .{ .a = a, .opt = @as(?mlx.mlx_array, a), .slice = @as([]const mlx.mlx_array, &.{a}), .handle = @as(*const mlx.mlx_array, &a) };
++    try r.collect(dummy);
++    try std.testing.expect(r.values.items.len == 3);
++}
++
++test "Texas context rejects overflow before an API can clamp the requested completion" {
++    try std.testing.expect(contextFits(262140,4));
++    try std.testing.expect(!contextFits(262140,5));
++    try std.testing.expect(!contextFits(std.math.maxInt(usize),1));
++}
++test "Texas admission and restore require their full reserve without a timeout escape" {
++    const gib: u64 = 1024 * 1024 * 1024;
++    try std.testing.expect(admissionFits(24*gib,36*gib));
++    try std.testing.expect(!admissionFits(24*gib+1,128*gib));
++    try std.testing.expect(!admissionFits(4*gib,16*gib-1));
++    try std.testing.expect(restoreFits(16*gib,4*gib));
++    try std.testing.expect(!restoreFits(16*gib-1,4*gib));
++    try std.testing.expect(!restoreFits(128*gib,std.math.maxInt(u64)));
++}
+diff --git a/src/transformer.zig b/src/transformer.zig
+index c90ff413..0e8652d5 100644
+--- a/src/transformer.zig
++++ b/src/transformer.zig
+@@ -12891,6 +12891,15 @@ pub const ForwardCtx = struct {
+     /// for the verify pass on a GDN model; the flag reaches the layers via
+     /// `Transformer.spec_capture_ssm`.
+     capture_ssm_seq: bool = false,
++    /// R60 pipeline split (isolated experiment): layers [first, 48) run on the RTX 5090 stage
++    /// for this decode/verify forward (native/stage_split.cpp). Set only by the generator's decode.
++    stage_split: bool = false,
++    /// R60 S4 (prefill v2): send this prefill forward's rows through the stage's prefill path:
++    /// 1 = async (the forward returns after layer first-1; the caller completes the chunk),
++    /// 2 = sync (wait for the stage and finish the forward normally).
++    stage_prefill: u8 = 0,
++    /// Set by an async stage-prefill forward that returned early.
++    stage_prefill_sent: bool = false,
+     /// MiMo spec verify: every row of this multi-row forward computes with its
+     /// own decode tick's arithmetic (`mimoVerifyRowsAttn`), so greedy MTP is serial.
+     verify_rows: bool = false,

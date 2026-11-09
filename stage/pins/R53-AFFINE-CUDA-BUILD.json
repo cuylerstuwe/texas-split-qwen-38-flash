@@ -1,0 +1,16 @@
+{
+  "cubin": "kernels/affine4_r53.sm120.cubin",
+  "cubin_bytes": 1515952,
+  "cubin_sha256": "5a4c5159304557da8cd292698a59b47282bcc6fd34eaea9345f1a64b2c7f06c3",
+  "source": "kernels/affine4_r53.cu",
+  "nvrtc_version": [
+    13,
+    0
+  ],
+  "options": [
+    "--gpu-architecture=sm_120",
+    "--std=c++17",
+    "--fmad=false"
+  ],
+  "image_id": "sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266"
+}

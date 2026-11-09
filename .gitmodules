@@ -1,0 +1,9 @@
+[submodule "sushi/lib/mlx-src"]
+	path = sushi/lib/mlx-src
+	url = https://github.com/ml-explore/mlx
+[submodule "sushi/lib/mlxc-src"]
+	path = sushi/lib/mlxc-src
+	url = https://github.com/ml-explore/mlx-c
+[submodule "third_party/macuda"]
+	path = third_party/macuda
+	url = https://github.com/Davinchy/macuda

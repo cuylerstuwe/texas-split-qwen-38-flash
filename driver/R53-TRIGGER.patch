@@ -1,0 +1,44 @@
+diff --git a/driver-r38/libtinynv/src/exec.c b/driver-r38/libtinynv/src/exec.c
+index 66eef0c..980b474 100644
+--- a/driver-r38/libtinynv/src/exec.c
++++ b/driver-r38/libtinynv/src/exec.c
+@@ -2321,8 +2321,15 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+       if (r->n==2) bad=tinynv_qmd_r44_edge(&r->prev_qmd,&q,2,1,1);
+       if (r->n==4) bad=tinynv_qmd_r44_edge(&r->prev_qmd,&q,4,2,0);
+       if (bad) {r->failed=1;return -1;}
+-    } else if (ex->pdl_mode && (!(ex->pdl_mode & 32) || !strncmp(k->name, "r39pdl_", 7)) && tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), ex->pdl_mode)) {
+-      r->failed = 1; return -1;
++    } else if (ex->pdl_mode && (!(ex->pdl_mode & 32) || !strncmp(k->name, "r39pdl_", 7))) {
++      // R53 trigger (bit 128): a predecessor whose kernel name ends in _trig executes
++      // griddepcontrol.launch_dependents itself, so its edge gets programmatic pre-exit (bit 2: the successor
++      // launches once every CTA has executed it or exited) instead of pre-exit at its last CTA launch (bit 1).
++      // The latch fields, and so the successor's griddepcontrol.wait on the predecessor's completion, are
++      // unchanged. Qualified on pdl-stress mode 6 (r53-trig-stress-m6). Every other edge is mode 37's.
++      int mode = ex->pdl_mode;
++      if ((mode & 128) && r->prev_trig) mode = (mode & ~1) | 2;
++      if (tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), mode)) { r->failed = 1; return -1; }
+     }
+     // the previous descriptor schedules this one; its bytes are written again with the link in them
+     if (tinynv_qmd_chain(&r->prev_qmd, qmd_va, ex->chain_prefetch)) { r->failed = 1; return -1; }
+@@ -2341,6 +2348,8 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
+   r->prev_qmd = q;
+   r->prev_host = host;
++  { const char *nm = k->name ? k->name : ""; size_t ln = strlen(nm);
++    r->prev_trig = ln >= 5 && !strcmp(nm + ln - 5, "_trig"); }
+   r->n++;
+   r->used = off + need;
+   return 0;
+diff --git a/driver-r38/libtinynv/src/exec.h b/driver-r38/libtinynv/src/exec.h
+index a4c403a..4c2feed 100644
+--- a/driver-r38/libtinynv/src/exec.h
++++ b/driver-r38/libtinynv/src/exec.h
+@@ -94,6 +94,8 @@ typedef struct tinynv_graph_rec {
+   uint64_t launches;
+   uint64_t r53_va;         // R53 project-local calibration stamps, fixed at begin (0 = none)
+   uint32_t r53_slots;
++  int prev_trig;           // R53: the previous descriptor's kernel name ends in _trig (it calls
++                           // griddepcontrol.launch_dependents itself; see TINYNV_R38_PDL bit 128)
+ } tinynv_graph_rec_t;
+ typedef struct {
+   const void *key;    // the kernel descriptor's address: one row per instantiation

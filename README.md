@@ -1,0 +1,94 @@
+# texas-split — Qwen3.8-Flash-Next across an M5 Max and an RTX 5090
+
+**texas-split runs [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on an Apple Silicon
+Mac with an NVIDIA RTX 5090 attached over Thunderbolt, splitting the model between them.** The Mac runs
+[Sushi](https://github.com/beamivalice/sushi) (included here as a fork) on the
+[Sushi 4bpw pack](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (EXL3 4-bit routed experts,
+8-bit affine dense weights). Transformer layers 28–47 run on the 5090; the rest of the model, the MTP draft head
+and sampling stay on the Mac. One OpenAI-compatible HTTP endpoint serves it, with tools, reasoning, images,
+video and the full 262,144-token context.
+
+No NVIDIA macOS driver is involved. The GPU side uses [macuda](https://github.com/Davinchy/macuda)'s userspace
+driver (`libtinynv`, a C port of tinygrad's NVIDIA driver) through tinygrad's signed TinyGPU DriverKit extension.
+
+| | Mac only (stock Sushi) | texas-split |
+|---|---|---|
+| Decode, agentic coding sessions | ~79–84 tok/s | **~98–111 tok/s** |
+| Total task time, same sessions | 1.00× | **1.28–1.34× faster** |
+| Prefill, cold 192K-token prompt (pipelined Mac → 5090) | — | 2.8K tok/s |
+| Quality vs. a teacher model (KL, short panel) | .00458 | .00446 (same level) |
+
+Measured on an M5 Max (128 GB) with an RTX 5090, macOS 27.2. Speedups come from the 5090 taking 20 of the
+48 layers' decode work; prefill is pipelined between the two machines. Details in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/VALIDATION.md](docs/VALIDATION.md).
+
+## What you need
+
+- An **Apple Silicon Mac with 128 GB** of unified memory, macOS 26.2 or later (tested: M5 Max, macOS 27.2).
+  The engine needs 82 GiB reclaimable memory when it starts.
+- An **RTX 5090** (GB202, 32 GB) in a Thunderbolt eGPU enclosure. At the full context the stage uses all
+  but ~0.8 GB of its memory.
+- **~175 GB free disk** for the model download (63.7 GiB of weights plus a 95.4 GiB n-gram table that
+  stays on the SSD), plus a few GB for builds.
+- Xcode command line tools, Homebrew (`webp`, `hf`, Python 3.12+), Rust 1.85+. The installer checks
+  everything and fetches the pinned Zig toolchain itself.
+- One manual step: approving TinyGPU's system extension in System Settings.
+
+## Install
+
+```sh
+git clone --recursive https://github.com/cuylerstuwe/texas-split-qwen-38-flash
+cd texas-split-qwen-38-flash
+./install.sh check        # reports what is missing; changes nothing
+./install.sh              # builds everything, downloads the model (asks first), writes the config
+bin/texas-split start     # launchd agent; ~40 s (stage server, then Sushi)
+host/tests/smoke.py       # end-to-end check of the endpoint
+```
+
+[INSTALL.md](INSTALL.md) walks through every step, what each one needs and how to fix failures.
+Coding agents: read [AGENTS.md](AGENTS.md) first.
+
+## Use
+
+The endpoint is `http://127.0.0.1:8003/v1` (OpenAI chat/completions API; model id `texas`,
+`texas-split` or `Qwen3.8-Flash-Next-Sushi-4bpw`).
+
+```sh
+curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"texas","messages":[{"role":"user","content":"Hello!"}],"max_tokens":200}'
+```
+
+- Thinking is on by default (Qwen's recommended sampling: T=1.0, top-p 0.95, top-k 20). Set
+  `"reasoning_effort": "none"` for non-thinking mode.
+- **Background requests**: send `X-LLM-Priority: background` (or `X-LocalAI-Mode: background`). While
+  any foreground request is queued or running, the background request is paused at a step boundary and
+  its state on both the Mac and the 5090 is parked to SSD; it resumes exactly where it stopped when the
+  last foreground request finishes. One background request at a time; background requests are text-only.
+- `bin/texas-split status | health | logs [--follow] | stop | restart`.
+- If the 5090 fails (unplugged, crashed, hung), the request in flight continues on the Mac alone after
+  a short pause, and the split comes back by itself when the service is idle.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `install.sh`, `bin/texas-split` | installer and CLI |
+| `host/` | the HTTP host and supervisor (`texas_split.py`), priority controller, tests |
+| `sushi/` | Sushi v1.3.0 with this project's changes: the pipeline split, 5090 stage client, background parking and the native-priority overlay ([sushi/FORK.md](sushi/FORK.md)) |
+| `stage/` | the 5090 stage server (Rust + CUDA kernels; prebuilt cubins included) |
+| `driver/` | macuda's `libtinynv` with this project's patches |
+| `third_party/macuda` | macuda (submodule, pinned): the GPU preflight and launch tooling |
+| `docs/` | architecture, validation results and evidence |
+
+## Status
+
+This is a single-machine research deployment that has been qualified on one hardware setup. Not covered:
+sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated
+by killing or freezing the stage server), recovery of parked requests after a crash or reboot.
+
+## Credits and licenses
+
+Built on [Sushi](https://github.com/beamivalice/sushi) (MIT), [macuda](https://github.com/Davinchy/macuda)
+(MIT), [tinygrad](https://github.com/tinygrad/tinygrad) (MIT), [MLX](https://github.com/ml-explore/mlx) (MIT)
+and the Qwen3.8-Flash-Next weights (Qwen community license; downloaded at install, not included). The
+vendored and adapted components keep their licenses: see [NOTICE](NOTICE).

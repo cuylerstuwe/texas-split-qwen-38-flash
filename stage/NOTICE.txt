@@ -1,0 +1,245 @@
+This experimental Rust host is new work. It is not a Sushi/Strata runtime wrapper.
+
+R25 kernels/lowbit_gdn.cu ports this project's Sushi/MLX-derived GDN K1S layout
+from kernels/gdn_block.metal; the GDN source and MIT notices below apply.
+Native CUDA warp reductions, final-checkpoint mode, accepted-prefix gather/
+restore, Rust packed-affine4 composition and bounded probes are new work.
+
+R24 kernels/lowbit_hc.cu ports the licensed normalization/injection/residual
+organization of this project's kernels/hc.metal (Sushi HC_FUSED_N_SOURCE,
+notice and source pin below) to CUDA warp reductions and native BF16 conversion.
+The lowbit weight reader, independent FP64 oracle and Rust CUDA composition are
+new work. The Sushi MIT notice below applies to the adapted portions.
+
+R21b kernels/target_attention_nax.metal adapts Sushi's packed QSA NAX kernel
+and retained Apple MLX cooperative fragments (Copyright (c) 2025 Apple Inc.)
+under the MIT permission/disclaimer below. tools/port_qsa_attention.py pins
+the upstream files and records the ABI/layout/dense-causal adaptations.
+kernels/target_attention.metal's affine8 encoder follows Apple's MLX
+affine_quantize kernel (Copyright Apple Inc., MIT). Native buffer ownership,
+CPU oracle, SIMD attention control, prefix validation and probes are new work.
+
+R21a kernels/qsa_select.metal adapts the MSD radix threshold/ascending-ID
+compaction from pinned Sushi src/qwen4_qsa.zig under the Sushi MIT notice below.
+tools/port_qsa_select.py records its source SHA256 and reproducibly extracts
+the licensed body, with a native ABI and fixed target K512/TGS256. The QSA
+pool/query semantic boundaries follow Sushi transformer.zig/qwen4_qsa.zig;
+native Rust state/projection ownership and independent CPU oracle are new work.
+
+src/dflash_selector.rs implements DFlash2's published adjacent-candidate score
+and conditional path contract, audited against Inco's model/config and Sushi
+src/dflash.zig:1553-1807 (MIT notice below). Native Rust bounded readers, packed
+lattice, integer-mass proposal handling and independent CPU checker are new.
+Research source: https://inco.ai/blog/dflash2/
+
+The EXL3 scalar format interpretation, codebook constants and tile permutation
+in src/exl3.rs follow the MIT-licensed Sushi implementation and the ExLlamaV3
+format. Sushi reference: beamivalice/sushi, src/exl3/expert_exl3.zig,
+8e4c0af1f5d239dcbed3d58728259432c86f1d96 plus the locally pinned overlay.
+Original format: https://github.com/turboderp-org/exllamav3 (MIT).
+
+The fractional MCG projection controls in kernels/mcg_project.{cu,metal} extend
+that same tile mapping to the K1.75 bit schedule, with explicit FP16 codebook
+rounding and FP32 accumulation. Reduction organization follows the retained
+Sushi-derived local texas_tp.cu / exl3_project.metal controls. Native bounded
+loaders, format pins, ownership, test inputs and FP64 references are new work.
+The Sushi MIT permission and disclaimer below apply to the adapted portions.
+
+Sushi MIT License
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Additional borrowed kernels must retain their own notices. Model licenses are
+separate from software licenses. No model weights are distributed here.
+
+kernels/gdn_block.metal adapts the K1S recurrence/prework organization and
+norm-gate expressions in Sushi src/gdn_decode.zig (SHA256
+653f41c407c3de05adf89c1e6e072349ab9f1f2666615af4f3ef1ed7fadd3d06) and
+transformer.zig (SHA256
+7cc0985d5ac9a167bc1ed852a9fc2bcaade4a67778c4880d1ef2880b10ae5f3b).
+Sushi credits the MIT-licensed mlx-serve K1 work by David Dalcu and verify-width
+work by Samuel Reed; the recurrence and math helpers derive from Apple's MLX
+and mlx-lm (Copyright (c) 2023 Apple Inc., MIT). The MIT notice above applies.
+Modifications: native Rust/buffer ABI without the MLX host, fixed Qwen geometry,
+explicit native-bfloat arithmetic boundaries, FP32 state/decay, staged/fused
+controls, width1/4/8/16 kernels, complete per-position checkpoints and guards.
+The Rust dependent-block scheduler and scalar CPU oracle are new work.
+
+kernels/gdn_replay.metal reuses that same K1S SIMD recurrence organization and
+MIT attribution for a prepared-operand capture/commit experiment. Modifications:
+head-major FP32 input ABI, optional final-state/pseudo-value capture, accepted-
+prefix replay and compact rank-one reconstruction. The independent Rust fixture
+reader, ownership/guard checks and whole-cycle experiment harness are new work.
+
+kernels/hc.metal adapts normalization/injection partials and optional residual
+write organization from Sushi src/qwen4_hc.zig HC_FUSED_N_SOURCE, SHA256
+df1cc341d3e08cdde4ab4e11c9c61b844bcd4ab38393cbd7147c4c5b6e78f450,
+under the Sushi MIT notice above. Native BF16 semantics, fixed geometry,
+standalone activation/mix/write kernels and Rust shared-queue ABI were added.
+src/hc.rs independently implements scalar FP64 math with explicit BF16 rounding;
+the /4 load-time fold follows transformer.zig loadHcWeights/scaleTriple.
+
+kernels/affine8_dense.metal adapts the row-reuse affine QMV organization from
+Sushi src/mtp_qmv.zig (SHA256
+530c879ca40aff91f09d115e33eb42ef8878ee04f1d1725bf8e5d2f8b86c1e77), itself derived
+from MLX (https://github.com/ml-explore/mlx), Copyright (c) 2023 Apple Inc., under
+the MIT permission and disclaimer reproduced above. Modifications: native Rust
+ABI, explicit shape/tail guards, FP32 diagnostic plus BF16 output stores.
+
+The tiled MPP dense kernel adapts VQMM_NAX_SOURCE from Sushi transformer.zig
+(SHA256 7cc0985d5ac9a167bc1ed852a9fc2bcaade4a67778c4880d1ef2880b10ae5f3b),
+which was ported from MTPLX mtplx/nax_verify.py and dflash-mlx. These portions
+remain under the Apache License, Version 2.0 (LICENSE-APACHE-2.0).
+MTPLX: https://github.com/youssofal/mtplx
+Copyright 2026 Youssof Altoukhi
+Preferred attribution: Powered by MTPLX by Youssof Altoukhi.
+MTPLX is a native MTP speculative decoding project for Apple Silicon.
+This product includes Metal kernel code adapted from dflash-mlx
+(https://github.com/bstnxbt/dflash-mlx), Copyright dflash-mlx contributors,
+licensed under the Apache License 2.0. See mtplx/nax_verify.py for details.
+Modifications here: affine8-only native ABI, runtime geometry, guarded row tiles,
+explicit BF16/FP16/FP16-high-plus-residual arms, input tile conversion, and native
+FP32/BF16 outputs. An additional centered-code matrix arm applies affine scales
+after each quantization-group product and includes a separate input-sum kernel.
+The Rust host and CPU oracle are new implementations.
+
+R10b kernels/dflash_ops.cu and native Rust DFlash2 MLP orchestration implement
+the sublayer semantics audited in Sushi src/dflash.zig and dflash_conv.zig
+(MIT notice above): two per-input learned tap sets, zero padding at block start,
+staged BF16 products/adds and residual placement. The CUDA implementation and
+scalar CPU oracle are new; a separately named FP32-fused arm changes arithmetic.
+The existing tinycublas raw Tensor Core symbols retain their attribution.
+
+R10c/R10d attention and complete-layer semantics follow the same audited Sushi
+DFlash2 source (MIT notice above): per-head QK normalization/NeoX RoPE, symmetric
+sliding-window masking with full noise-block visibility, and learned two-tap
+attention/MLP prepare/finish placement. The Rust orchestration/FP64 reference and
+CUDA split-context online softmax/merge/control-buffer implementation are new.
+
+R10e context encoder and K/V semantics follow the same MIT DFlash source and
+Qwen hcStreamMean. The native Rust committed-state protocol, guarded ping-pong
+cache, scalar replay and CUDA append kernel are new. Fractional-rate MCG decoding
+in src/exl3.rs follows Sushi's Rate.bitEnd/unpackTile/tensorCorePerm; the MIT
+notice above applies. It retains the existing target K4 decoder unchanged.
+
+kernels/exl3_project.metal ports the local CUDA projection's SIMD layout back to
+MSL for a portable control. That projection was derived from the Sushi source
+and is covered by the Sushi notices above. CUDA R04 reuses only the raw expert
+projection symbol from the pinned texas_ep.sm120.cubin, SHA256
+aa6dd11547009758b24d1081d5200ffa7b571287e2a2c19c34eaf0c176907b06.
+Its source texas_tp.cu SHA256
+d5c48c4d338ed2c32cf24a61dd1e308eb57d73110bfbe59eb7029f0ec24bb59c
+has a historical filename; R04 executes complete projections on one device,
+with no tensor-parallel model partition or old TP runtime enabled.
+
+kernels/exl3_mpp.metal adapts the fragment layout, cooperative matmul descriptor,
+and guarded row loads/stores from Sushi's expert_exl3_kernels.zig,
+GEMM_NAX_FRAGS / GEMM_NAX_REFERENCE_SOURCE, under the Sushi MIT notice above.
+It specializes K4/MCG/window15, accepts native Rust block descriptors, and writes
+FP32 output directly without calling the MLX host runtime.
+
+kernels/affine8_fragment.metal adapts the same Sushi GEMM_NAX_FRAGS cooperative
+fragment origins/load/store and descriptor layout (expert_exl3_kernels.zig,
+SHA256 3b4fc4ba2cf6a2a5fa8fbf6116ddd09e05c4a490d8dcd10321a6c646cb924bd7),
+under the Sushi MIT notice above. New work: affine8 byte dequantization,
+losslessly reordered packed codes/metadata, cached group scales/biases, 32-row
+weight reuse, independent split-K scheduling and reduction, tail guards, optional
+FP16 high/residual products, and native Rust ownership/benchmark orchestration.
+
+kernels/exl3_moe.metal adapts the H128 SIMD shuffles and prepare/SwiGLU/reduce
+stages from Sushi expert_exl3_kernels.zig (local source SHA256
+3b4fc4ba2cf6a2a5fa8fbf6116ddd09e05c4a490d8dcd10321a6c646cb924bd7),
+under the Sushi MIT notice above. Split sums and native route-buffer ABI are
+integrated here; the independent Rust FP64 oracle uses a butterfly transform
+checked against the explicit parity matrix.
+
+The optional CUDA component links the locally pinned libtinynv archive and
+loads its unchanged tinycudart_copy1d cubin. Raw ABI declarations follow
+cuda-shim/include/tinynv.h at e797e313654ad1c7dd86d60667751ab3872c3a12.
+Source: https://github.com/Davinchy/macuda (MIT).
+
+src/cuda_linear.rs additionally loads unchanged tinycublas BF16 Tensor Core
+symbols from the pinned macuda cuda-shim/libtinycublas/gemm.sm_120.cubin,
+SHA256 4ee3b384e349b89bfe3d28bb9b65d99f9fff3b8a00b2afa9550422b7bb99daaa.
+Existing gemm.cu SHA256bbb21c8d5c6717618c997c252f10ecf44563664cd47fd91a28d34bba3739f40d;
+source and license: macuda's cuda-shim/libtinycublas (third_party/macuda); this cubin
+and copy1d.sm_120.cubin ship unchanged in kernels/macuda/ with macuda's LICENSE. The MIT
+notice below applies. The cubin was not rebuilt/modified here. Native Rust
+buffer ownership, ABI records, graph lifetimes, scheduling and FP64 oracle are
+new; the tinycublas C host wrapper/global handles are not linked or called.
+
+MIT License
+Copyright (c) 2026 Antonio Torres
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+R16 kernels/mcg_moe.cu adapts the same licensed Sushi-derived transform
+formulas retained in kernels/exl3_moe.metal (prepare, H128, SwiGLU and reduction).
+Native K1.75 bank loading, CUDA composition and probes are new experimental code.
+R17 kernels/mcg_grouped.cu retains the same Sushi-derived MCG tile mapping
+and scalar reduction as mcg_project.cu. Device grouping, descriptor ownership,
+persistent dispatch and decoding reuse across rows are new experimental code.
+R18 kernels/affine4.cu adapts affine8_dense.metal's row-reuse QMV organization
+under the Sushi/MLX MIT notice above. CUDA warp reduction, packed nibble decode,
+direct/factored arithmetic controls and native Rust ownership/probe are new.
+R18b kernels/affine4_split.cu retains that licensed QMV organization, adding
+disjoint K-chunk owners and a separate FP32 reduction. The original R18 cubin
+remains unchanged. Scratch ownership, composed plans and validation are new.
+R19 kernels/lowbit_shared.cu follows Sushi transformer.zig's shared-expert
+activation/gating semantics under the same MIT notice. Its CUDA reductions,
+combined packed-row layout, resident Rust composition, named arithmetic arms
+and independent FP64 oracle are new experimental code. It does not copy the
+Metal-generated sigmoid table or claim bit identity with that table.
+R20a kernels/lowbit_router.cu follows Sushi transformer.zig's softmax routing
+and BF16 score boundaries under the same MIT notice. CUDA QMV, warp selection,
+original-ID tie handling, policy comparison and native Rust composition are new.
+
+R20b kernels/moe_join.cu reuses R16's licensed Sushi-derived H128 transforms
+with an explicit BF16 input ABI; its BF16 final addition and native Rust
+full-bank routing/composition/ownership are new work. The existing MIT notices
+above apply to the adapted transform expression. No weight conversion occurs.
+
+R22 kernels/mcg_tensor.cu retains that licensed Sushi/ExLlamaV3 MCG bitstream
+mapping. Its grouped512 routing, FP16x2 codebook addition and Tensor Core MMA
+organization are new experimental work, with fragment geometry documented by
+NVIDIA's PTX ISA. Existing MIT attributions above apply. Original weight bytes
+are unchanged; no new quantizer or full-matrix dequantization is used on GPU.
+
+R27 kernels/lowbit_attention.cu follows the qualified Rust/Metal attention and
+QSA ports of Sushi/MLX, retaining their norm/RoPE, pooling, affine8 KV and staged
+gating semantics under the MIT notices above. CUDA warp/block scheduling,
+bounded radix threshold plus stable ID compaction, partitioned online softmax,
+device prefix-tail restore and native Rust state ownership are new work.

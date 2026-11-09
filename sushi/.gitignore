@@ -1,0 +1,70 @@
+.zig-cache/
+zig-out/
+
+# Pinned Zig release, staged at build time by scripts/fetch-zig.sh (not vendored)
+/.zig-toolchain
+# .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
+.claude/*
+!.claude/skills/
+/models/
+*.safetensors
+# ...except small hermetic TEST fixtures. The rule above exists to keep model
+# WEIGHTS out; src/fixtures holds a 1.8 MB toy-geometry parity fixture, and a
+# test that silently skips because its fixture is untracked protects nothing.
+!src/fixtures/*.safetensors
+
+# mlx + mlx-c, built from the pinned submodules by scripts/build-mlx.sh
+# (lib/mlx-src + lib/mlxc-src are the vendored sources; these are outputs)
+/lib/mlx/
+/lib/mlx
+/lib/.mlx-build/
+
+# SwiftPM output (no leading slash: a swift command run anywhere drops one).
+.build/
+
+# macOS
+.DS_Store
+*.dmg
+
+# Python
+scripts/__pycache__/
+*.pyc
+
+# Images (tracked via releases, not git)
+mlx-logo.png
+transformer.o
+test_zig
+server_err.log
+.vscode
+
+# Cursor IDE / Cloud Agents. Local tooling only; not for upstream PRs.
+.cursor/
+agent-tools/
+
+# Speculative-decoding working notes (MTP + PLD planning)
+.mtp-progress.md
+.spec-progress.md
+docs/perf/
+docs/tmp
+
+# Private converter knowledge (sashimi): local-only, never committed (CLAUDE.md, Docs index).
+docs/private/
+tests/pi-results
+tests/validator-results
+tests/pi_integration_run.summary.tsv
+
+
+
+# Local working notes, not project context. The mission log's TOP entry is the
+# session handoff — one file, so two copies of "where things stand" cannot
+# drift apart. Checked-in context stays in CLAUDE.md and docs/.
+/missionlog.md
+/.mc.json
+tests/soak_log.csv
+
+# bf16 expert-io SSD microbench output
+ssd-fill-bench/
+
+# Local measurement dumps
+measurements/
+output/

@@ -1,0 +1,23 @@
+{
+  "omlx_commit": "6745c39cb66ba5ec130a761149fc1b8b832fcb07",
+  "source_hashes": {
+    "omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py": "cca4d5f7604e3890170210ff5dba4416b6264e68e037531c46b688fd4d642245",
+    "omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/gated_delta.py": "55111019f301e1b929e733a7043a5b20f29fa3b327691ba20ad50f7d0ec6f28d",
+    ".venv/lib/python3.14/site-packages/mlx_vlm/models/deepseek_v4/hyper_connection.py": "141fbe47d99f8eda9ab9a4c78665e5eb439cbf73b53a604c4da2a77845167bb3"
+  },
+  "seed": 53128,
+  "geometry": {
+    "batch": 2,
+    "tokens": 5,
+    "hidden": 128,
+    "heads": 1,
+    "head_dim": 128
+  },
+  "dtype": "BF16 weights and activations; FP32 decay and recurrent state",
+  "settings": {
+    "decode_fusion": false,
+    "fuse_in": false,
+    "tf32": false
+  },
+  "fixture_sha256": "d9572d9f8bbd39151012bf5d4741a6165bfb9c2e4fd78c7205d625d036d644b3"
+}

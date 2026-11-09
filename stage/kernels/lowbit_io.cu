@@ -1,0 +1,38 @@
+// Native lowbit vocabulary gather and final HC glue. See NOTICE.txt.
+// HC arithmetic follows lowbit_hc.cu/Sushi qwen4_hc.zig, omitting the absent
+// final injection projection. Original packed affine4 weights stay resident.
+typedef unsigned short bf;
+__device__ __forceinline__ float load(bf v) {return __uint_as_float((unsigned)v<<16);}
+__device__ __forceinline__ bf store(float v) {bf o;asm("cvt.rn.bf16.f32 %0, %1;":"=h"(o):"f"(v));return o;}
+__device__ __forceinline__ float rb(float v) {return load(store(v));}
+__device__ __forceinline__ float warp_sum(float v) {
+    for(int d=16;d;d>>=1)v+=__shfl_down_sync(0xffffffffu,v,d);return v;
+}
+enum {H=2560,HC=4,F=10240,R=320,V=248320,G=64};
+extern "C" __global__ void vocab_gather(const unsigned* ids,const unsigned* w,
+    const bf* s,const bf* b,bf* stream,unsigned* status,int rows) {
+    int r=blockIdx.y,j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(r>=rows||j>=H)return;
+    unsigned id=ids[r];
+    if(j==0)status[r]=(id<V)?0:1;
+    bf v;
+    if(id<V) {
+        unsigned code=(w[id*(H/8)+j/8]>>(4*(j%8)))&15u;
+        unsigned at=id*(H/G)+j/G;
+        v=store(fmaf(load(s[at]),float(code),load(b[at])));
+    } else v=0x7fc0u; // Invalid device token cannot index weights or appear valid.
+    for(int h=0;h<HC;h++)stream[r*F+h*H+j]=v;
+}
+extern "C" __global__ void final_norm(const bf* x,const bf* nw,bf* n) {
+    int h=blockIdx.x,r=blockIdx.y,t=threadIdx.x,sg=t/32,lane=t%32;
+    __shared__ float sums[8];float a[10],sum=0;
+    for(int i=0;i<10;i++){float v=load(x[r*F+h*H+t+256*i]);a[i]=v;sum=fmaf(v,v,sum);}
+    sum=warp_sum(sum);if(lane==0)sums[sg]=sum;
+    __syncthreads();float total=0;for(int i=0;i<8;i++)total+=sums[i];
+    float rs=rsqrtf(total/float(H)+1e-6f);
+    for(int i=0;i<10;i++){int j=h*H+t+256*i;n[r*F+j]=store(rb(a[i]*rs)*load(nw[j]));}
+}
+extern "C" __global__ void final_activate(const bf* down,bf* out,int rows) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*R)return;
+    float v=load(down[i]);out[i]=store(v*rb(1.f/(1.f+expf(-v))));
+}

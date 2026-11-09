@@ -1,0 +1,159 @@
+diff --git a/driver-r38/include/tinynv.h b/driver-r38/include/tinynv.h
+index 77b6ea4..507b0c6 100644
+--- a/driver-r38/include/tinynv.h
++++ b/driver-r38/include/tinynv.h
+@@ -145,6 +145,9 @@ typedef struct tinynv_graph *tinynv_graph_t;
+ tinynv_status_t tinynv_graph_begin(tinynv_stream_t);
+ // Isolated R45 build only: 0(serial) or64(five-node R44 protocol), outside capture.
+ tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t, int mode);
++// Isolated R53 calibration build only: stamp recorded descriptors' completion clocks and replayed chains' starts
++// into a caller-owned region (16 * (slots + 128) bytes), outside capture; va 0 turns it off.
++tinynv_status_t tinynv_r53_stamp(tinynv_stream_t, uint64_t va, uint32_t slots);
+ tinynv_status_t tinynv_graph_end(tinynv_stream_t, tinynv_graph_t *out);
+ tinynv_status_t tinynv_graph_launch(tinynv_stream_t, tinynv_graph_t);
+ void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);
+diff --git a/driver-r38/libtinynv/src/exec.c b/driver-r38/libtinynv/src/exec.c
+index b9562b0..66eef0c 100644
+--- a/driver-r38/libtinynv/src/exec.c
++++ b/driver-r38/libtinynv/src/exec.c
+@@ -1741,6 +1741,8 @@ int tinynv_exec_graph_begin(tinynv_exec_t *ex) {
+     if (tinynv_mm_alloc_buffer(&ex->g->mm, r->size, 0, 0, 1, 1, 0, &r->mem)) { free(r); return -1; }
+     if (tinynv_mm_alloc_buffer(&ex->g->mm, r->size, 1, 1, 1, 0, 0, &r->mirror)) { tinynv_vmap_free(&ex->g->mm, &r->mem); free(r); return -1; }
+   }
++  r->r53_va = ex->r53_va;
++  r->r53_slots = ex->r53_va ? ex->r53_slots : 0;
+   ex->rec = r;
+   return 0;
+ }
+@@ -1793,7 +1795,7 @@ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+         if (now() - t0 > 2.0) return tinynv_fail("the resident token's chain %d did not release in 2 s", k - 2);
+       }
+     }
+-    uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains : 0u) + (ex->profile ? 16u : 0u);
++    uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains : 0u) + (ex->profile ? 16u : 0u) + (r->r53_va ? 8u : 0u);
+     // All but the last chain's batch are staged: one fence read and one doorbell announce the whole token.
+     ex->defer_ring = k < r->nchains - 1;
+     if (batch_begin(ex, &ex->g->gsp.compute_q, want, &c, &va)) { ex->defer_ring = 0; return -1; }
+@@ -1805,6 +1807,10 @@ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+       ex->pending_acquire = ex->q_last[0];
+     }
+     if (tinynv_cmd_memory_barrier(&c)) { ex->defer_ring = 0; return -1; }
++    // R53 calibration: the front end's clock as it reaches chain k's head launch (after the acquire), payload = at.
++    if (r->r53_va && tinynv_cmd_timestamp(&c, r->r53_va + 16ull * ((uint64_t)r->r53_slots + (uint64_t)k), at)) {
++      ex->defer_ring = 0; return -1;
++    }
+     if (tinynv_cmd_launch(&c, r->chains[k].head_va)) { ex->defer_ring = 0; return -1; }
+     if (ex->profile && k == r->nchains - 1 && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_TAIL, at)) { ex->defer_ring = 0; return -1; }
+     if (ex->profile && k < 64 && tinynv_cmd_release_clocked(&c, ex->sem.va + SEM_TS_CHAIN(k), at)) { ex->defer_ring = 0; return -1; }
+@@ -2292,6 +2298,11 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+   uint64_t qmd_va = r->mem.va + off;
+   tinynv_qmd_t q;
+   if (build_qmd(ex, m, k, grid, block, dyn_smem, cbuf0_bytes, qmd_va, slot, &q)) { r->failed = 1; return -1; }
++  // R53 calibration: this descriptor's completion clock (payload index + 1) at r53_va + 16 * index.
++  if (r->r53_va && r->n < r->r53_slots && tinynv_qmd_r53_stamp(&q, r->r53_va + 16ull * r->n, (uint64_t)r->n + 1)) {
++    r->failed = 1;
++    return tinynv_fail("R53 stamp: the descriptor's last release slot is taken");
++  }
+   tinynv_graph_chain_t *ch = r->nchains ? &r->chains[r->nchains - 1] : NULL;
+   if (ch && ch->n >= (uint32_t)ex->chain_max) {
+     // this chain is full: it ends at the previous descriptor and the next one starts here
+diff --git a/driver-r38/libtinynv/src/exec.h b/driver-r38/libtinynv/src/exec.h
+index 5d1abf5..a4c403a 100644
+--- a/driver-r38/libtinynv/src/exec.h
++++ b/driver-r38/libtinynv/src/exec.h
+@@ -92,6 +92,8 @@ typedef struct tinynv_graph_rec {
+   uint32_t n;              // launches in total
+   int sealed, failed;
+   uint64_t launches;
++  uint64_t r53_va;         // R53 project-local calibration stamps, fixed at begin (0 = none)
++  uint32_t r53_slots;
+ } tinynv_graph_rec_t;
+ typedef struct {
+   const void *key;    // the kernel descriptor's address: one row per instantiation
+@@ -224,6 +226,8 @@ typedef struct {
+   int chain_max;   // how deep a chain may get before it is handed over; TINYNV_EXEC_CHAIN_MAX unless asked otherwise
+   int chain_prefetch;   // whether a chained descriptor is fetched early; on unless TINYNV_CHAIN_PREFETCH=0
+   int pdl_mode;         // R38 project-local experiment (TINYNV_R38_PDL bits); 0 = the pinned behaviour
++  uint64_t r53_va;      // R53 project-local calibration: stamp region for the next recording (0 = off)
++  uint32_t r53_slots;   // descriptors stamped per recording; chain-start stamps follow them
+   // Timeline values handed out, including to launches not yet submitted. `timeline` is what the engine has been asked
+   // for and may be waited on; `reserved` runs ahead of it while a chain is being built. Waiting on the difference is
+   // waiting for work nothing has been told about, so everything that waits flushes first.
+diff --git a/driver-r38/libtinynv/src/qmd.c b/driver-r38/libtinynv/src/qmd.c
+index 2e93053..a980563 100644
+--- a/driver-r38/libtinynv/src/qmd.c
++++ b/driver-r38/libtinynv/src/qmd.c
+@@ -120,8 +120,18 @@ int tinynv_qmd_program(tinynv_qmd_t *q, const tinynv_qmd_program_t *p) {
+   // still covers what the kernel asked for. A kernel wanting more than the largest cannot run at all.
+   static const uint32_t offered[] = {32 * 1024, 64 * 1024, TINYNV_SMEM_MAX_PER_BLOCK};
+   uint32_t smem_cfg = 0, max_cfg = 0x1a;   // 0x1a is what the card took, and stays the default
++  // R53 project-local experiment: TINYNV_R53_SMEM_FLOOR_KB (32, 64 or 100) raises the lowest rung every descriptor
++  // asks for. One block of 4.4 KB static plus the 1 KB per-block reserve, rounded to 128 bytes, leaves room for only
++  // five such blocks in the 32 KB rung though registers allow six. One floor for every kernel keeps all descriptors on
++  // the same rung, so an SM never has to drain to change its split between overlapping launches. Unset: unchanged.
++  static int r53_floor_kb = -1;
++  if (r53_floor_kb < 0) {
++    const char *e = getenv("TINYNV_R53_SMEM_FLOOR_KB");
++    r53_floor_kb = e && *e ? atoi(e) : 0;
++    if (r53_floor_kb != 0 && r53_floor_kb != 32 && r53_floor_kb != 64 && r53_floor_kb != 100) r53_floor_kb = 0;
++  }
+   for (size_t i = 0; i < sizeof(offered) / sizeof(*offered); i++)
+-    if (offered[i] >= p->shmem) { smem_cfg = offered[i] / 4096 + 1; break; }
++    if (offered[i] >= p->shmem && offered[i] >= (uint32_t)r53_floor_kb * 1024u) { smem_cfg = offered[i] / 4096 + 1; break; }
+ 
+   // Above the largest configuration a card has been seen to accept, a carveout has to be asked for explicitly, and this
+   // driver will not do it on a guess: ggml's flash attention wants 131,200 bytes and the shim's opt-in goes to 227 KB,
+@@ -276,6 +286,16 @@ int tinynv_qmd_release(tinynv_qmd_t *q, uint64_t addr, uint64_t payload, int tim
+   return slot;
+ }
+ 
++int tinynv_qmd_r53_stamp(tinynv_qmd_t *q, uint64_t addr, uint64_t payload) {
++  const int slot = TINYNV_QMD_RELEASES - 1;
++  if (q->v3 || GETP(q, rel_enable[slot])) return -1;
++  if (set_addr(q, rel_addr_lo[slot], rel_addr_hi[slot], addr)) return -1;
++  if (set_addr(q, rel_pay_lo[slot], rel_pay_hi[slot], payload)) return -1;
++  SETP(q, rel_enable[slot], 1);
++  SETP(q, rel_size[slot], TINYNV_QMDV_RELEASE_STRUCTURE_SIZE_SEMAPHORE_FOUR_WORDS);
++  return 0;
++}
++
+ int tinynv_qmd_release_clear(tinynv_qmd_t *q) {
+   for (int i = 0; i < TINYNV_QMD_RELEASES; i++) {
+     SETP(q, rel_enable[i], 0);
+diff --git a/driver-r38/libtinynv/src/qmd.h b/driver-r38/libtinynv/src/qmd.h
+index 1c81701..499da48 100644
+--- a/driver-r38/libtinynv/src/qmd.h
++++ b/driver-r38/libtinynv/src/qmd.h
+@@ -108,6 +108,9 @@ int tinynv_qmd_release(tinynv_qmd_t *q, uint64_t addr, uint64_t payload, int tim
+ // descriptor as it is built and only learns which one is the chain's tail at the flush, where that slot has to carry
+ // the timeline instead. Fields are replaced, not OR-ed, so the descriptor is exactly as if it had never released.
+ int tinynv_qmd_release_clear(tinynv_qmd_t *q);
++// R53 project-local calibration: completion clock in the LAST release slot, leaving slot 0 for a chain tail's
++// timeline release at replay. Blackwell (V05) only; refuses a slot already in use.
++int tinynv_qmd_r53_stamp(tinynv_qmd_t *q, uint64_t addr, uint64_t payload);
+ // Set the scope of the barrier at the end of the grid after the fact (TINYNV_QMD_MEMBAR_*): a descriptor that
+ // releases the timeline must publish its writes system-wide whatever the measurement mode asked of the others.
+ int tinynv_qmd_membar(tinynv_qmd_t *q, int membar);
+diff --git a/driver-r38/libtinynv/src/tinynv.c b/driver-r38/libtinynv/src/tinynv.c
+index 49978dd..541ae16 100644
+--- a/driver-r38/libtinynv/src/tinynv.c
++++ b/driver-r38/libtinynv/src/tinynv.c
+@@ -825,6 +825,18 @@ tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t s, int mode) {
+   return WITH_LOCK(ex->rec ? TINYNV_ERR_INVALID : (ex->pdl_mode = mode, TINYNV_OK));
+ }
+ 
++// R53 project-local calibration, outside capture only. While a token is recorded, every descriptor also releases its
++// completion clock into va + 16 * index (payload index + 1, index < slots), and every replay writes chain k's
++// front-end clock as it reaches that chain's head launch into va + 16 * (slots + k). The caller owns the region
++// (16 * (slots + 128) bytes). Sealed recordings keep what they were recorded with; va 0 turns it off.
++tinynv_status_t tinynv_r53_stamp(tinynv_stream_t s, uint64_t va, uint32_t slots) {
++  if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
++  NEED_GPU(s);
++  if (va && (!slots || slots > 4096 || (va & 15))) return TINYNV_ERR_INVALID;
++  tinynv_exec_t *ex = &s->dev->exec;
++  return WITH_LOCK(ex->rec ? TINYNV_ERR_INVALID : (ex->r53_va = va, ex->r53_slots = va ? slots : 0, TINYNV_OK));
++}
++
+ tinynv_status_t tinynv_graph_begin(tinynv_stream_t s) {
+   if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
+   NEED_GPU(s);

@@ -1,0 +1,72 @@
+--- macuda/cuda-shim/libtinynv/src/exec.h	2026-11-03 22:27:27
++++ src/exec.h	2026-11-05 16:46:54
+@@ -223,6 +223,7 @@
+   int nchain;
+   int chain_max;   // how deep a chain may get before it is handed over; TINYNV_EXEC_CHAIN_MAX unless asked otherwise
+   int chain_prefetch;   // whether a chained descriptor is fetched early; on unless TINYNV_CHAIN_PREFETCH=0
++  int pdl_mode;         // R38 project-local experiment (TINYNV_R38_PDL bits); 0 = the pinned behaviour
+   // Timeline values handed out, including to launches not yet submitted. `timeline` is what the engine has been asked
+   // for and may be waited on; `reserved` runs ahead of it while a chain is being built. Waiting on the difference is
+   // waiting for work nothing has been told about, so everything that waits flushes first.
+--- macuda/cuda-shim/libtinynv/src/exec.c	2026-11-03 22:27:27
++++ src/exec.c	2026-11-05 16:46:54
+@@ -2288,6 +2288,10 @@
+     ch = NULL;
+   }
+   if (ch) {
++    // R38 experiment: early dependent launch fields, written before the link and before either descriptor is copied
++    if (ex->pdl_mode && tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), ex->pdl_mode)) {
++      r->failed = 1; return -1;
++    }
+     // the previous descriptor schedules this one; its bytes are written again with the link in them
+     if (tinynv_qmd_chain(&r->prev_qmd, qmd_va, ex->chain_prefetch)) { r->failed = 1; return -1; }
+     memcpy(r->prev_host, r->prev_qmd.b, TINYNV_QMD_BYTES);
+@@ -2742,6 +2746,9 @@
+   // On unless asked otherwise, which is what the oracle does. Off is a one bit experiment against the theory that a
+   // prefetched descriptor's resources are reserved before its predecessor has released them.
+   { const char *e2 = getenv("TINYNV_CHAIN_PREFETCH"); ex->chain_prefetch = !(e2 && *e2 == '0'); }
++  { const char *e3 = getenv("TINYNV_R38_PDL"); ex->pdl_mode = e3 ? (int)strtol(e3, NULL, 0) : 0;
++    if (ex->pdl_mode) fprintf(stderr, "libtinynv: R38 PROJECT-LOCAL EXPERIMENT: early dependent launch mode %d between "
++                                      "chained descriptors of recorded graphs\n", ex->pdl_mode); }
+   ex->tail_release = tinynv_exec_tail_release(getenv("TINYNV_TAIL_RELEASE"));
+   { const char *m = getenv("TINYNV_QMD_MEMBAR"), *i = getenv("TINYNV_QMD_INVALIDATE");
+     ex->qmd_membar = tinynv_exec_qmd_membar(m);
+--- macuda/cuda-shim/libtinynv/src/qmd.h	2026-11-03 22:27:27
++++ src/qmd.h	2026-11-05 16:46:54
+@@ -122,6 +122,11 @@
+ // Chain `prev` to the descriptor at `next_qmd_addr`, so finishing schedules it. `prefetch` fetches that descriptor
+ // early: what the oracle does, and the first thing to turn off when a chain is not being scheduled at all.
+ int tinynv_qmd_chain(tinynv_qmd_t *prev, uint64_t next_qmd_addr, int prefetch);
++// R38 project-local experiment, Blackwell (QMD V05) only: early dependent launch between two chained descriptors.
++// mode bits: 1 prev PRE_EXIT_AT_LAST_CTA_LAUNCH, 2 prev ENABLE_PROGRAM_PRE_EXIT, 4 prev ARRIVE_AT_LATCH / next
++// WAIT_ON_LATCH (id = latch) with the latch-acquire L1/texture invalidates, 8 next HOLD_CTA_LAUNCH_UNTIL_PARENT_LATCH_
++// ACQUIRE_AND_CTA_COMPLETE, 16 next HOLD_MEMBAR_UNTIL_LATCH_ACQUIRE.
++int tinynv_qmd_r38_pdl(tinynv_qmd_t *prev, tinynv_qmd_t *next, uint32_t latch, int mode);
+ 
+ // Constant buffer 0's driver parameters, which are where a kernel finds the windows its shared and local memory live in.
+ // Returns how many dwords were written, or 0 if the buffer is too short for them.
+--- macuda/cuda-shim/libtinynv/src/qmd.c	2026-11-03 22:27:27
++++ src/qmd.c	2026-11-05 16:46:54
+@@ -380,3 +380,22 @@
+   if (block) for (int i = 0; i < 3; i++) out[ntid + i] = block[i];
+   return cap;
+ }
++
++int tinynv_qmd_r38_pdl(tinynv_qmd_t *prev, tinynv_qmd_t *next, uint32_t latch, int mode) {
++  if (prev->v3 || next->v3) return tinynv_fail("the R38 early-launch experiment uses Blackwell (QMD V05) fields only");
++#define R38_SET(q, f, v) do { if (tinynv_qmd_set((q), TINYNV_QMD_##f##_LO, TINYNV_QMD_##f##_HI, (v))) return -1; } while (0)
++  if (mode & 1) R38_SET(prev, PRE_EXIT_AT_LAST_CTA_LAUNCH, 1);
++  if (mode & 2) R38_SET(prev, ENABLE_PROGRAM_PRE_EXIT, 1);
++  if (mode & 4) {
++    R38_SET(prev, ARRIVE_AT_LATCH_ID, latch);
++    R38_SET(prev, ARRIVE_AT_LATCH_VALID, 1);
++    R38_SET(next, WAIT_ON_LATCH_ID, latch);
++    R38_SET(next, WAIT_ON_LATCH_VALID, 1);
++    R38_SET(next, LATCH_ACQUIRE_INVALIDATE_SHADER_DATA_CACHE, 1);
++    R38_SET(next, LATCH_ACQUIRE_INVALIDATE_TEXTURE_DATA_CACHE, 1);
++  }
++  if (mode & 8) R38_SET(next, HOLD_CTA_LAUNCH_UNTIL_PARENT_LATCH_ACQUIRE_AND_CTA_COMPLETE, 1);
++  if (mode & 16) R38_SET(next, HOLD_MEMBAR_UNTIL_LATCH_ACQUIRE, 1);
++#undef R38_SET
++  return 0;
++}

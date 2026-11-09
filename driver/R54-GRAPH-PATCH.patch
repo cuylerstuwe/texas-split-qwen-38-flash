@@ -1,0 +1,139 @@
+diff --git a/driver-r38/include/tinynv.h b/driver-r38/include/tinynv.h
+index 507b0c6..5b46a97 100644
+--- a/driver-r38/include/tinynv.h
++++ b/driver-r38/include/tinynv.h
+@@ -148,6 +148,8 @@ tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t, int mode);
+ // Isolated R53 calibration build only: stamp recorded descriptors' completion clocks and replayed chains' starts
+ // into a caller-owned region (16 * (slots + 128) bytes), outside capture; va 0 turns it off.
+ tinynv_status_t tinynv_r53_stamp(tinynv_stream_t, uint64_t va, uint32_t slots);
++tinynv_status_t tinynv_r54_graph_patch(tinynv_stream_t, tinynv_graph_t, uint32_t launch, uint32_t offset,
++                                       const void *data, uint32_t len);
+ tinynv_status_t tinynv_graph_end(tinynv_stream_t, tinynv_graph_t *out);
+ tinynv_status_t tinynv_graph_launch(tinynv_stream_t, tinynv_graph_t);
+ void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);
+diff --git a/driver-r38/libtinynv/src/exec.c b/driver-r38/libtinynv/src/exec.c
+index 47896fc..f992a82 100644
+--- a/driver-r38/libtinynv/src/exec.c
++++ b/driver-r38/libtinynv/src/exec.c
+@@ -1764,9 +1764,35 @@ void tinynv_exec_graph_free(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+       if (r->mirror.size) tinynv_vmap_free(&ex->g->mm, &r->mirror);
+     }
+   }
++  free(r->param_off);
++  free(r->param_len);
++  free(r->patch);
+   free(r);
+ }
+ 
++int tinynv_exec_graph_patch(tinynv_exec_t *ex, tinynv_graph_rec_t *r, uint32_t launch, uint32_t offset,
++                            const void *data, uint32_t len) {
++  (void)ex;
++  if (!r || !r->sealed) return tinynv_fail("R54 patch: that recording was never sealed");
++  if (launch >= r->n || !r->param_off) return tinynv_fail("R54 patch: launch %u of %u", launch, r->n);
++  if (!len || len > 16 || (len & 3u) || (offset & 3u) || offset + len > r->param_len[launch])
++    return tinynv_fail("R54 patch: %u bytes at %u of a %u-byte parameter block", len, offset, r->param_len[launch]);
++  if (r->npatch >= 1024) return tinynv_fail("R54 patch: more than 1024 queued before a replay");
++  if (r->npatch >= r->patch_cap) {
++    uint32_t cap = r->patch_cap ? 2u * r->patch_cap : 64u;
++    void *p = realloc(r->patch, cap * sizeof(*r->patch));
++    if (!p) return tinynv_fail("R54 patch: out of memory");
++    r->patch = p; r->patch_cap = cap;
++  }
++  uint64_t region = (uint64_t)r->param_off[launch] + offset;
++  r->patch[r->npatch].va = r->mem.va + region;
++  r->patch[r->npatch].len = len;
++  memcpy(r->patch[r->npatch].w, data, len);
++  memcpy((uint8_t *)r->mirror.dma.va + region, data, len);   // the host copy stays what the engine will read
++  r->npatch++;
++  return 0;
++}
++
+ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+   if (ex->rec) return tinynv_fail("a replay was asked for while a token is being recorded");
+   if (!r || !r->sealed) return tinynv_fail("that recording was never sealed");
+@@ -1799,13 +1825,19 @@ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r) {
+         if (now() - t0 > 2.0) return tinynv_fail("the resident token's chain %d did not release in 2 s", k - 2);
+       }
+     }
+-    uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains : 0u) + (ex->profile ? 16u : 0u) + (r->r53_va ? 8u : 0u);
++    uint32_t want = 48u + (k == 0 ? (8u + qdw) * (uint32_t)r->nchains + 12u * r->npatch : 0u) + (ex->profile ? 16u : 0u) + (r->r53_va ? 8u : 0u);
+     // All but the last chain's batch are staged: one fence read and one doorbell announce the whole token.
+     ex->defer_ring = k < r->nchains - 1;
+     if (batch_begin(ex, &ex->g->gsp.compute_q, want, &c, &va)) { ex->defer_ring = 0; return -1; }
+     if (k == 0)
+       for (int i = 0; i < r->nchains; i++)
+         if (tinynv_cmd_inline_upload(&c, r->chains[i].tail_va, tails[i].b, TINYNV_QMD_BYTES)) { ex->defer_ring = 0; return -1; }
++    // R54: queued parameter patches, written ahead of every launch of this replay (and kept for later ones).
++    if (k == 0) {
++      for (uint32_t i = 0; i < r->npatch; i++)
++        if (tinynv_cmd_inline_upload(&c, r->patch[i].va, r->patch[i].w, r->patch[i].len)) { ex->defer_ring = 0; return -1; }
++      r->npatch = 0;
++    }
+     if (!ex->sync && ex->q_last[0] && !(ex->r53_skip_done_acquire && sem_read_slot(ex, 0) >= ex->q_last[0])) {
+       if (tinynv_cmd_wait(&c, ex->sem.va + SEM_SLOT(0), ex->q_last[0])) { ex->defer_ring = 0; return -1; }
+       ex->pending_acquire = ex->q_last[0];
+@@ -2355,6 +2387,18 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
+   tinynv_qmd_cbuf0((uint32_t *)(host + slot), cbuf0_bytes / 4, q.v3, TINYNV_SHARED_WINDOW, TINYNV_LOCAL_WINDOW, grid, block);
+   if (params_len) memcpy(host + slot + k->param_base, params, params_len);
++  // R54: where this launch's parameters live, for tinynv_exec_graph_patch.
++  if (r->n >= r->param_cap) {
++    uint32_t cap = r->param_cap ? 2u * r->param_cap : 256u;
++    uint32_t *po = realloc(r->param_off, cap * sizeof(uint32_t));
++    if (!po) { r->failed = 1; return tinynv_fail("out of memory for parameter offsets"); }
++    r->param_off = po;
++    uint32_t *pl = realloc(r->param_len, cap * sizeof(uint32_t));
++    if (!pl) { r->failed = 1; return tinynv_fail("out of memory for parameter lengths"); }
++    r->param_len = pl; r->param_cap = cap;
++  }
++  r->param_off[r->n] = (uint32_t)(off + slot + k->param_base);
++  r->param_len[r->n] = (uint32_t)params_len;
+   r->prev_qmd = q;
+   r->prev_host = host;
+   { const char *nm = k->name ? k->name : ""; size_t ln = strlen(nm);
+diff --git a/driver-r38/libtinynv/src/exec.h b/driver-r38/libtinynv/src/exec.h
+index 884bfc3..48be48d 100644
+--- a/driver-r38/libtinynv/src/exec.h
++++ b/driver-r38/libtinynv/src/exec.h
+@@ -94,6 +94,12 @@ typedef struct tinynv_graph_rec {
+   uint64_t launches;
+   uint64_t r53_va;         // R53 project-local calibration stamps, fixed at begin (0 = none)
+   uint32_t r53_slots;
++  // R54: each launch's parameter block (offset in the region, bytes) and the parameter patches queued for the
++  // next replay. A patch rewrites up to 16 bytes of one launch's parameters in video memory with an inline upload in
++  // the replay's first batch, ahead of every launch, like the chain tails; it then stays in place for later replays.
++  uint32_t *param_off, *param_len, param_cap;
++  struct { uint64_t va; uint32_t len; uint32_t w[4]; } *patch;
++  uint32_t npatch, patch_cap;
+   int prev_trig;           // R53: the previous descriptor's kernel name ends in _trig (it calls
+                            // griddepcontrol.launch_dependents itself; see TINYNV_R38_PDL bit 128)
+ } tinynv_graph_rec_t;
+@@ -525,6 +531,8 @@ int tinynv_exec_graph_resident(const char *e);
+ int tinynv_exec_graph_begin(tinynv_exec_t *ex);
+ int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out);
+ int tinynv_exec_graph_launch(tinynv_exec_t *ex, tinynv_graph_rec_t *r);
++int tinynv_exec_graph_patch(tinynv_exec_t *ex, tinynv_graph_rec_t *r, uint32_t launch, uint32_t offset,
++                            const void *data, uint32_t len);
+ void tinynv_exec_graph_free(tinynv_exec_t *ex, tinynv_graph_rec_t *r);
+ int tinynv_exec_keepalive(const char *e);
+ unsigned tinynv_exec_keepalive_us(const char *e);
+diff --git a/driver-r38/libtinynv/src/tinynv.c b/driver-r38/libtinynv/src/tinynv.c
+index 541ae16..acb6c90 100644
+--- a/driver-r38/libtinynv/src/tinynv.c
++++ b/driver-r38/libtinynv/src/tinynv.c
+@@ -857,6 +857,15 @@ tinynv_status_t tinynv_graph_launch(tinynv_stream_t s, tinynv_graph_t g) {
+   s->submitted++;
+   return WITH_LOCK(tinynv_exec_graph_launch(&s->dev->exec, (tinynv_graph_rec_t *)g)) ? TINYNV_ERR_DRIVER : TINYNV_OK;
+ }
++// R54 project-local: rewrite len (4, 8, 12 or 16) bytes at byte `offset` of recorded launch `launch`'s parameters;
++// applied by the next replay before any of its launches, and kept for later replays.
++tinynv_status_t tinynv_r54_graph_patch(tinynv_stream_t s, tinynv_graph_t g, uint32_t launch, uint32_t offset,
++                                       const void *data, uint32_t len) {
++  if (!ON_GPU(s) || !g || !data) return TINYNV_ERR_INVALID;
++  NEED_GPU(s);
++  return WITH_LOCK(tinynv_exec_graph_patch(&s->dev->exec, (tinynv_graph_rec_t *)g, launch, offset, data, len))
++             ? TINYNV_ERR_INVALID : TINYNV_OK;
++}
+ void tinynv_graph_free(tinynv_stream_t s, tinynv_graph_t g) {
+   if (!g || !s) return;
+   s->dev->exec.torn_down = s->dev->torn_down;

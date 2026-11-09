@@ -1,0 +1,12 @@
+# built or fetched by install.sh
+/runtime/
+/models/
+/texas-split.env
+/stage/target/
+/sushi/lib/mlx/
+/sushi/native/*.o
+/host/texas_ipc.dylib
+/host/tests/evidence/
+__pycache__/
+*.pyc
+.DS_Store

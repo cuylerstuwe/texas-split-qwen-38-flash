@@ -1,0 +1,419 @@
+#!/bin/bash
+. "$(dirname "$0")/private_cache.sh"
+# DFlash block-drafter integration test — env-gated on a local target +
+# assistant pair (GLM-5.3-Flash Sushi pack + its DFlash2 drafter today):
+#
+#   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw \
+#   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw/dflash2 \
+#       ./tests/test_dflash.sh
+#
+# Pins the live contract: the sidecar probe classifies the assistant as
+# DFlash (boot log), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0` —
+# engagement COUNTS, never output shape), greedy dflash-on equals greedy
+# dflash-off over reasoning+content (byte-for-byte at 8-bit or wider),
+# per-request enable_drafter:false opts out, and tool calls still parse with
+# the drafter engaged.
+
+set -euo pipefail
+
+MODEL="${DFLASH_TEST_MODEL:-}"
+DRAFTER="${DFLASH_TEST_DRAFTER:-}"
+if [ -z "$MODEL" ] || [ -z "$DRAFTER" ]; then
+    echo "SKIP: DFLASH_TEST_MODEL / DFLASH_TEST_DRAFTER not set"
+    exit 0
+fi
+for d in "$MODEL" "$DRAFTER"; do
+    if [ ! -f "$d/config.json" ]; then
+        echo "FAIL: $d/config.json not found"; exit 1
+    fi
+done
+
+PORT="${DFLASH_TEST_PORT:-11353}"
+BASE="http://127.0.0.1:$PORT"
+BIN="$(dirname "$0")/../zig-out/bin/sushi"
+LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
+
+# --no-mtp: a loaded DFlash sidecar outranks an in-checkpoint MTP head
+# (Qwen3.8 packs) since 26.9.2, so this is belt and braces — it keeps the
+# MTP head out of the boot lines and pins the arm on older builds too.
+# --prefix-cache-mem: the RAM tier is opt-in (SSD-only by default), and [11] needs it.
+"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-mem 1GB --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
+SERVER_PID=$!
+cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+echo "waiting for server..."
+for _ in $(seq 1 120); do
+    curl -s -m 2 "$BASE/health" > /dev/null 2>&1 && break
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
+    fi
+    sleep 3
+done
+# /health answers as soon as the socket binds — the model is still loading
+# behind it (a 17 GB checkpoint takes minutes). Wait for the load itself via
+# the server's own ready line, timeout scaled to the checkpoint size.
+MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
+READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
+echo "waiting for model load (up to ${READY_SECS}s)..."
+for _ in $(seq 1 $((READY_SECS / 3))); do
+    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1
+    fi
+    sleep 3
+done
+if ! grep -q "Model ready (loaded on inference thread)" "$LOG"; then
+    echo "FAIL: model did not finish loading in ${READY_SECS}s"; tail -20 "$LOG"; exit 1
+fi
+
+pass=0; fail=0
+ok()   { echo "PASS $1"; pass=$((pass+1)); }
+bad()  { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; fail=$((fail+1)); }
+
+# [1] The probe classified the sidecar as DFlash at boot.
+if grep -q "DFlash drafter ready" "$LOG"; then ok "boot: DFlash sidecar detected"; else bad "boot: DFlash sidecar detected" "$(grep -i drafter "$LOG" | head -3)"; fi
+
+# [1b] DFlash2 sidecars (config declares `dflash_config`) must load their
+# selector + dyn convs — the drafter still runs v1-style without them, so
+# only the load line can prove the trained modules are in the forward.
+if grep -q '"dflash_config"' "$DRAFTER/config.json" 2>/dev/null; then
+    if grep -q "\[dflash\] dflash2: selector" "$LOG"; then
+        ok "dflash2: selector + dyn convs loaded ($(grep -o 'dflash2: selector[^\"]*' "$LOG" | head -1))"
+    else
+        bad "dflash2: selector + dyn convs loaded" "$(grep '\[dflash\]' "$LOG" | head -3)"
+    fi
+fi
+
+# Greedy request helper: returns reasoning_content + content concatenated.
+gen() { # prompt, max_tokens, extra_json_fragment
+    curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+        \"model\": \"sushi\",
+        \"messages\": [{\"role\": \"user\", \"content\": \"$1\"}],
+        \"temperature\": 0.0,
+        \"max_tokens\": $2
+        $3
+    }" | python3 -c 'import json,sys; m=json.load(sys.stdin)["choices"][0]["message"]; print((m.get("reasoning_content") or "") + (m.get("content") or ""))'
+}
+
+# [2] Echo-ish greedy round WITH dflash (the default when the sidecar loads) —
+# long enough to accumulate spec-stats rounds.
+DFLASH_ON_REQS=0
+LONG=$(gen "List the numbers from 1 to 15, one per line, then repeat the same list once more." 200 ", \"enable_drafter\": true")
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
+if [ -n "$LONG" ]; then ok "dflash-on generation non-empty"; else bad "dflash-on generation non-empty"; fi
+
+# Equivalence arms: SHORT window (the PLD-equivalence first-30-tokens rule —
+# spec verify runs GEMMs at a different width than serial decode, and 8-bit
+# near-tie argmax flips are a sanctioned divergence class at long range).
+# Fresh prompt (different leading text) so neither arm rides the other's
+# prefix-cache entry; the OFF arm turns off PLD too — fully serial.
+EQ_PROMPT="Explain in one short paragraph why the sky is blue."
+ON=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": true")
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
+OFF=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
+
+# [3b] The ngram spec-gate must not silently strand a DFlash drafter: an
+# IMPLICIT novel request (no enable_drafter in the body, prompt scores ~0)
+# still engages — dflash's runtime yield gate is its only economics gate.
+# Counted into [6]: if the ngram gate disabled it, no stats line appears and
+# the per-request count mismatches.
+gen "Describe how a refrigerator keeps food cold, in one short paragraph." 40 "" > /dev/null
+DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
+
+# [4] Engagement COUNTS: at least one dflash round ran, with accepts.
+STATS=$(grep "mode=dflash" "$LOG" | tail -1)
+ATTEMPTS=$(echo "$STATS" | sed -n 's/.*attempts=\([0-9]*\).*/\1/p')
+if [ -n "$ATTEMPTS" ] && [ "$ATTEMPTS" -gt 0 ]; then
+    ok "spec-stats mode=dflash attempts=$ATTEMPTS ($STATS)"
+else
+    bad "spec-stats mode=dflash attempts>0" "$(grep spec-stats "$LOG" | tail -3)"
+fi
+if GATE_STATE=$(python3 - "$STATS" <<'PY'
+import re, sys
+line = sys.argv[1]
+def field(name):
+    match = re.search(rf"\b{name}=([0-9.]+)", line)
+    if not match:
+        raise SystemExit(f"missing {name}: {line}")
+    return float(match.group(1))
+avg = field("avg_per_round")
+gate = field("gate_min")
+disabled = "runtime_disabled=true" in line
+print(("disabled" if disabled else "engaged") + f" avg={avg:.2f} gate={gate:.2f}")
+PY
+); then
+    case "$GATE_STATE" in
+        disabled*) ok "DFlash gate disabled a yield that lost to serial ($GATE_STATE)" ;;
+        engaged*)  ok "DFlash remained engaged for this prose sample ($GATE_STATE)" ;;
+        *)         bad "DFlash gate reported a known state" "$GATE_STATE" "$STATS" ;;
+    esac
+else
+    bad "DFlash gate stats obey the disable invariant" "$STATS"
+fi
+
+# [5] Greedy equivalence over the exact 30-token window (reasoning+content).
+#
+# The bar depends on the checkpoint's WIDTH. Spec verify runs the trunk as a
+# block-wide `qmm` where serial decode runs `qmv`, and at 4 bits a near-tie
+# argmax flips between them — the sanctioned INT4 divergence class. Measured on
+# Muse-Glimmer-30B: the 8-bit build is byte-identical 6/6, the 4-bit build
+# diverges reproducibly while each arm stays perfectly self-consistent, and the
+# divergence is unchanged without the sliding block trim.
+#
+# So: byte-equality at 8-bit or wider; at narrower widths assert what must still
+# hold — each arm REPRODUCIBLE (a broken verify or rollback shows as run-to-run
+# instability, not as a stable difference) and a long shared prefix — and print
+# where they parted. Skipping instead would read as a pass.
+QUANT_BITS=$(curl -s -m 10 "$BASE/v1/models" | python3 -c "
+import json, re, sys
+try:
+    d = json.load(sys.stdin)['data'][0]
+    m = re.search(r'(\d+)', str((d.get('meta') or {}).get('quantization') or ''))
+    print(m.group(1) if m else 8)
+except Exception:
+    print(8)
+" 2>/dev/null || echo 8)
+
+EQ_VERDICT=$(python3 - "$ON" "$OFF" "$QUANT_BITS" <<'PYEQ'
+import sys
+on, off, bits = sys.argv[1], sys.argv[2], int(sys.argv[3] or 8)
+if min(len(on), len(off)) < 80:
+    print("fail:window too short"); raise SystemExit
+if bits >= 8:
+    print("ok:byte-equal" if on == off else "fail:diverged at %d-bit" % bits); raise SystemExit
+shared = 0
+for a, b in zip(on, off):
+    if a != b: break
+    shared += 1
+print("narrow:%d:%d" % (bits, shared))
+PYEQ
+)
+case "$EQ_VERDICT" in
+    ok:*)
+        ok "greedy dflash-on == dflash-off (byte-equal exact window, ${QUANT_BITS}-bit)" ;;
+    narrow:*)
+        SHARED="${EQ_VERDICT##*:}"
+        ON2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": true")
+        DFLASH_ON_REQS=$((DFLASH_ON_REQS + 1))
+        OFF2=$(gen "$EQ_PROMPT" 30 ", \"enable_drafter\": false, \"enable_pld\": false")
+        if [ "$ON" != "$ON2" ]; then
+            bad "dflash-ON is reproducible at temp 0" "$(echo "$ON" | head -c 200)" "$(echo "$ON2" | head -c 200)"
+        elif [ "$OFF" != "$OFF2" ]; then
+            bad "serial decode is reproducible at temp 0" "$(echo "$OFF" | head -c 200)" "$(echo "$OFF2" | head -c 200)"
+        elif [ "$SHARED" -lt 40 ]; then
+            bad "dflash arms agree before the near-tie" "shared only $SHARED chars" "$(echo "$ON" | head -c 200)" "$(echo "$OFF" | head -c 200)"
+        else
+            ok "greedy dflash arms reproducible + agree for $SHARED chars before a sanctioned ${QUANT_BITS}-bit near-tie"
+        fi ;;
+    *)
+        bad "greedy dflash-on == dflash-off" "$EQ_VERDICT" "--- on ---" "$(echo "$ON" | head -c 300)" "--- off ---" "$(echo "$OFF" | head -c 300)" ;;
+esac
+
+# [6] The opt-out arms really ran serial: one `mode=dflash` line per request
+# that had dflash ENABLED, and none for the opt-outs. Counted rather than
+# hardcoded — the equivalence arm above issues a different number of requests
+# depending on the checkpoint's quantization width.
+N_STATS=$(grep -c "mode=dflash" "$LOG")
+if [ "$N_STATS" -eq "$DFLASH_ON_REQS" ]; then
+    ok "enable_drafter:false opted out ($N_STATS dflash stats lines for $DFLASH_ON_REQS dflash-enabled requests)"
+else
+    bad "enable_drafter:false opted out" "saw $N_STATS mode=dflash lines (expected $DFLASH_ON_REQS)"
+fi
+
+# [7] A final accepted block is clipped to the request budget. This checks the
+# externally visible accounting; the hermetic Zig test also pins returned ids,
+# generated_ids, trunk KV and assistant context to the same exact boundary.
+CAP=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+    "model": "sushi",
+    "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
+    "temperature": 0.0,
+    "max_tokens": 17,
+    "enable_drafter": true
+}')
+if echo "$CAP" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+assert r["usage"]["completion_tokens"] == 17, r.get("usage")
+assert r["choices"][0]["finish_reason"] == "length", r["choices"][0]
+' 2>/dev/null; then
+    ok "DFlash output clips exactly at max_tokens=17"
+else
+    bad "DFlash output clips exactly at max_tokens=17" "$(echo "$CAP" | head -c 500)"
+fi
+
+CAP_STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+    "model": "sushi",
+    "messages": [{"role": "user", "content": "Write a long numbered list with one short item per line."}],
+    "temperature": 0.0,
+    "max_tokens": 17,
+    "enable_drafter": true,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+}')
+if python3 - "$CAP" "$CAP_STREAM" <<'PY'
+import json, sys
+whole = json.loads(sys.argv[1])
+msg = whole["choices"][0]["message"]
+expected = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+pieces = []
+usage = None
+for line in sys.argv[2].splitlines():
+    if not line.startswith("data: "):
+        continue
+    data = line[6:]
+    if data == "[DONE]":
+        continue
+    event = json.loads(data)
+    if event.get("usage"):
+        usage = event["usage"]
+    choices = event.get("choices") or []
+    if choices:
+        delta = choices[0].get("delta") or {}
+        pieces.append((delta.get("reasoning_content") or "") + (delta.get("content") or ""))
+actual = "".join(pieces)
+assert actual == expected, (expected, actual)
+assert usage and usage["completion_tokens"] == 17, usage
+PY
+then
+    ok "stream publishes the complete clipped DFlash block"
+else
+    bad "stream publishes the complete clipped DFlash block" "$(echo "$CAP_STREAM" | tail -c 800)"
+fi
+
+# [8] Tools still parse with the drafter engaged.
+TOOLS=$(curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+    "model": "sushi",
+    "messages": [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}],
+    "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+    "temperature": 0.0,
+    "max_tokens": 400,
+    "enable_drafter": true
+}')
+if echo "$TOOLS" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+calls = r["choices"][0]["message"].get("tool_calls") or []
+assert calls, "no tool_calls"
+args = json.loads(calls[0]["function"]["arguments"])
+assert calls[0]["function"]["name"] == "get_weather", calls[0]["function"]["name"]
+assert "city" in args, args
+' 2>/dev/null; then
+    ok "tool call parses with dflash engaged"
+else
+    bad "tool call parses with dflash engaged" "$(echo "$TOOLS" | head -c 400)"
+fi
+
+# [9] Weight precision ENGAGED, read off the boot log — it is a
+# load-time decision, so there is no same-boot A/B for it; the numeric
+# guard is the hermetic greedy-equivalence test, which runs default-on.
+WLINE=$(grep -o "weights=[^ ]*-bit/gs[0-9]*" "$LOG" | head -1)
+if [ -n "$WLINE" ]; then
+    ok "assistant quantized at load ($WLINE)"
+else
+    bad "assistant quantized at load" "$(grep '\[dflash\] loaded' "$LOG" | head -1)"
+fi
+
+# [10] The block is capped to what this machine's verify lanes serve. The
+# uncapped expectation is the DRAFTER'S OWN declared block (root or nested
+# dflash_config, the loader's probe order) — a literal here was a checkpoint
+# expectation: muse declares 16, the qwen assistants declare 8.
+DECLARED_BLOCK=$(python3 -c '
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+dc = cfg.get("dflash_config") or cfg
+print(dc.get("block_size", ""))
+' "$DRAFTER/config.json")
+BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
+if echo "$BLINE" | grep -q ", capped ("; then
+    ok "block capped for this machine's verify lanes ($BLINE)"
+elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
+    ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
+else
+    bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
+fi
+
+# [11] The assistant context rides the prefix cache. A restore forwards no
+# trunk layers, so without it a reused prefix drafts blind — acceptance
+# collapsed 92.6% -> 66.5% live. Same prompt twice: the second is a hit, and
+# BOTH turns must report the same per-draft rate.
+CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea state and the ships that had passed by the point before dawn."
+gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
+RESTORES_COLD=$(grep -c "dflash context restored" "$LOG" || true)
+gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
+RESTORES_HIT=$(grep -c "dflash context restored" "$LOG" || true)
+if [ "$RESTORES_HIT" -gt "$RESTORES_COLD" ] && [ "$RATE_COLD" = "$RATE_HIT" ]; then
+    ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
+else
+    bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$RESTORES_COLD->$RESTORES_HIT"
+fi
+
+# [12] The assistant context also survives the SSD tier (v4 spec sidecar):
+# same prompt across a SERVER RESTART with --prefix-cache-disk must restore
+# the trunk from disk AND the dflash context beside it — a disk hit used to
+# draft blind (the same 92.6% -> 66.5% class [11] pins for the RAM tier).
+# Isolated HOME so the real kv-cache is never touched. Opt out with
+# DFLASH_SKIP_DISK=1 (two extra boots of the target).
+if [ "${DFLASH_SKIP_DISK:-0}" != "1" ]; then
+    cleanup
+    trap - EXIT
+    DISK_HOME=$(mktemp -d /tmp/dflash_disk_home.XXXXXX)
+    DISK_PROMPT="Repeat this sentence exactly, word for word: the harbor master counted the lanterns twice and noted the tide tables in the margin before the ferry cast off for the northern islands at first light. $(python3 -c 'print(" ".join(f"filler{i}" for i in range(400)))')"
+    disk_boot() { # $1 = logfile
+        HOME="$DISK_HOME" "$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-disk 2GB \
+            --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$1" 2>&1 &
+        SERVER_PID=$!
+        trap cleanup EXIT
+        for _ in $(seq 1 $((READY_SECS / 3)) ); do
+            grep -q "Model ready (loaded on inference thread)" "$1" && return 0
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 3
+        done
+        return 1
+    }
+    LOG_D1=$(mktemp /tmp/dflash_disk1.XXXXXX)
+    LOG_D2=$(mktemp /tmp/dflash_disk2.XXXXXX)
+    if disk_boot "$LOG_D1"; then
+        gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+        DISK_RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D1" | tail -1)
+        sleep 2 # let the post-response disk flush land
+        cleanup
+        trap - EXIT
+        if disk_boot "$LOG_D2"; then
+            gen "$DISK_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
+            DISK_RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG_D2" | tail -1)
+            # Rate equality is tolerant (5pp): a HYBRID trunk's prefix restore
+            # is legitimately not bit-identical (re-run recurrence block size),
+            # so near-tie flips can nudge the generation. The blind-draft
+            # collapse this pins is ~26pp.
+            RATES_CLOSE=$(python3 -c "
+import sys
+try:
+    c = float('${DISK_RATE_COLD#per_draft_pct=}' or 'nan')
+    h = float('${DISK_RATE_HIT#per_draft_pct=}' or 'nan')
+    print('yes' if abs(c - h) <= 5.0 else 'no')
+except ValueError:
+    print('no')
+")
+            if grep -q "\[disk-cache\] restored" "$LOG_D2" && grep -q "dflash context restored" "$LOG_D2" \
+                && [ -n "$DISK_RATE_HIT" ] && [ "$RATES_CLOSE" = "yes" ]; then
+                ok "assistant context restored from the SSD tier across a restart (cold==hit $DISK_RATE_HIT)"
+            else
+                bad "assistant context restored from the SSD tier across a restart" \
+                    "cold=$DISK_RATE_COLD hit=$DISK_RATE_HIT" \
+                    "disk-restores=$(grep -c '\[disk-cache\] restored' "$LOG_D2") dflash-restores=$(grep -c 'dflash context restored' "$LOG_D2")"
+            fi
+        else
+            bad "disk-tier arm: second boot did not become ready" "$(tail -5 "$LOG_D2")"
+        fi
+    else
+        bad "disk-tier arm: first boot did not become ready" "$(tail -5 "$LOG_D1")"
+    fi
+    rm -rf "$DISK_HOME"
+fi
+
+echo
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]

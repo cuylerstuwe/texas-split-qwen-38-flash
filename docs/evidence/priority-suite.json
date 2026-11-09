@@ -1,0 +1,608 @@
+[
+ {
+  "case": "decode-greedy-lease",
+  "exact": true,
+  "switch_s": 0.17386149999219924,
+  "in_prefill": false,
+  "lease": true,
+  "paused_tokens": 65,
+  "paused_phase": 2,
+  "checkpoint_bytes": 311427072,
+  "pauses": 1,
+  "frozen": true,
+  "usage": {
+   "prompt_tokens": 40,
+   "completion_tokens": 512,
+   "total_tokens": 552,
+   "prompt_tokens_details": {
+    "cached_tokens": 9
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference_usage": {
+   "prompt_tokens": 40,
+   "completion_tokens": 512,
+   "total_tokens": 552,
+   "prompt_tokens_details": {
+    "cached_tokens": 9
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference": {
+   "role": "assistant",
+   "content": "Here is a detailed, numbered explanation of the lifecycle of a program as it moves from source code to executable binary, covering parsing, analysis, optimization, and code generation.\n\n1.  **Source Code Ingestion**: The process begins when the compiler reads the raw text file containing the source code (e.g., C++, Java, Rust). This is treated as a stream of characters without any inherent meaning yet.\n2.  **Preprocessing (Language-Specific)**: For languages like C and C++, a preprocessor runs first. It handles directives starting with `#`, such as `#include` (which inserts header files), `#define` (macro expansion), and conditional compilation (`#ifdef`). This step flattens the code into a single translation unit.\n3.  **Lexical Analysis (Scanning)**: The lexer breaks the character stream into meaningful tokens. It identifies keywords (like `if`, `while`), identifiers (variable names), literals (numbers, strings), and operators (+, -, =). Whitespace and comments are typically discarded at this stage.\n4.  **Token Stream Generation**: The output of the lexical analysis is a linear sequence of tokens. For example, the line `int x = 5;` becomes tokens: `[KEYWORD_INT] [IDENTIFIER_x] [OPERATOR_ASSIGN] [LITERAL_5] [SEMICOLON]`.\n5.  **Syntax Analysis (Parsing)**: The parser takes the token stream and checks it against the formal grammar of the programming language. It verifies that the structure of the code is valid according to the language's rules.\n6.  **Abstract Syntax Tree (AST) Construction**: If the syntax is valid, the parser builds an Abstract Syntax Tree. This is a hierarchical tree representation where nodes represent constructs (like function calls, loops, or assignments) and edges represent their relationships. Unlike the concrete syntax tree, the AST omits syntactic details like parentheses or semicolons that don't affect semantics.\n7.  **Semantic Analysis**: The compiler traverses the AST to check for semantic errors\u2014errors that are syntactically correct but logically invalid. This includes type checking (ensuring you don\u2019t add a string to an integer), scope resolution, and verifying that variables are declared before use.\n8.  **Symbol Table Population**: During semantic analysis, the compiler builds a symbol table. This data structure maps identifiers (variable and function names) to their attributes, such as data type, memory location,"
+  },
+  "resumed": {
+   "role": "assistant",
+   "content": "Here is a detailed, numbered explanation of the lifecycle of a program as it moves from source code to executable binary, covering parsing, analysis, optimization, and code generation.\n\n1.  **Source Code Ingestion**: The process begins when the compiler reads the raw text file containing the source code (e.g., C++, Java, Rust). This is treated as a stream of characters without any inherent meaning yet.\n2.  **Preprocessing (Language-Specific)**: For languages like C and C++, a preprocessor runs first. It handles directives starting with `#`, such as `#include` (which inserts header files), `#define` (macro expansion), and conditional compilation (`#ifdef`). This step flattens the code into a single translation unit.\n3.  **Lexical Analysis (Scanning)**: The lexer breaks the character stream into meaningful tokens. It identifies keywords (like `if`, `while`), identifiers (variable names), literals (numbers, strings), and operators (+, -, =). Whitespace and comments are typically discarded at this stage.\n4.  **Token Stream Generation**: The output of the lexical analysis is a linear sequence of tokens. For example, the line `int x = 5;` becomes tokens: `[KEYWORD_INT] [IDENTIFIER_x] [OPERATOR_ASSIGN] [LITERAL_5] [SEMICOLON]`.\n5.  **Syntax Analysis (Parsing)**: The parser takes the token stream and checks it against the formal grammar of the programming language. It verifies that the structure of the code is valid according to the language's rules.\n6.  **Abstract Syntax Tree (AST) Construction**: If the syntax is valid, the parser builds an Abstract Syntax Tree. This is a hierarchical tree representation where nodes represent constructs (like function calls, loops, or assignments) and edges represent their relationships. Unlike the concrete syntax tree, the AST omits syntactic details like parentheses or semicolons that don't affect semantics.\n7.  **Semantic Analysis**: The compiler traverses the AST to check for semantic errors\u2014errors that are syntactically correct but logically invalid. This includes type checking (ensuring you don\u2019t add a string to an integer), scope resolution, and verifying that variables are declared before use.\n8.  **Symbol Table Population**: During semantic analysis, the compiler builds a symbol table. This data structure maps identifiers (variable and function names) to their attributes, such as data type, memory location,"
+  },
+  "foreground": [
+   "A compiler is a program that translates source code written in a high-level programming language into machine code that a computer can execute."
+  ],
+  "before": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "b0a50639f3cd433eb4dfe6244e191501",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 65,
+     "prompt_tokens": 40,
+     "paused": true,
+     "pauses": 1,
+     "checkpoint_bytes": 311427072,
+     "checkpoint_freed_bytes": 311427072,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 15,
+    "hold": 1,
+    "state": 3,
+    "ack": 15,
+    "bytes": 311427072,
+    "pauses": 1,
+    "tokens": 65,
+    "prompt": 40,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 311427072,
+    "available": 31934431232
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  },
+  "after": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "b0a50639f3cd433eb4dfe6244e191501",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 65,
+     "prompt_tokens": 40,
+     "paused": true,
+     "pauses": 1,
+     "checkpoint_bytes": 311427072,
+     "checkpoint_freed_bytes": 311427072,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 16,
+    "hold": 1,
+    "state": 3,
+    "ack": 16,
+    "bytes": 311427072,
+    "pauses": 1,
+    "tokens": 65,
+    "prompt": 40,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 311427072,
+    "available": 32724303872
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  }
+ },
+ {
+  "case": "decode-sampled-foreground-hold",
+  "exact": true,
+  "switch_s": null,
+  "in_prefill": false,
+  "lease": false,
+  "paused_tokens": 83,
+  "paused_phase": 2,
+  "checkpoint_bytes": 245366784,
+  "pauses": 2,
+  "frozen": true,
+  "usage": {
+   "prompt_tokens": 44,
+   "completion_tokens": 512,
+   "total_tokens": 556,
+   "prompt_tokens_details": {
+    "cached_tokens": 13
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference_usage": {
+   "prompt_tokens": 44,
+   "completion_tokens": 512,
+   "total_tokens": 556,
+   "prompt_tokens_details": {
+    "cached_tokens": 13
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference": {
+   "role": "assistant",
+   "content": "Here is a detailed, step-by-step explanation of how a compiler transforms human-readable code into machine-executable instructions, broken down into forty distinct stages and concepts.\n\n1.  **Source Code Input**: The process begins when the compiler reads your source code file (like `.c`, `.java`, or `.py`). This is text data stored on your computer\u2019s hard drive, containing keywords, variables, and functions written in a high-level language designed for humans to read easily.\n\n2.  **Preprocessing (Optional)** In languages like C or C++, the first step often involves a preprocessor. It handles directives starting with symbols like `#include` or `#define`. It replaces macro definitions with their actual values and inserts the contents of other header files directly into your main file, creating a single, expanded block of text before real parsing begins.\n\n3.  **Lexical Analysis (Tokenization)** The compiler breaks the continuous stream of characters into meaningful pieces called tokens. For example, it sees the string `int x = 10;` and splits it into separate tokens: the keyword `int`, the identifier `x`, the symbol `=`, the number `10`, and the terminator `;`. It ignores whitespace and comments during this phase.\n\n4.  **Syntax Analysis (Parsing)** The parser takes those tokens and checks if they follow the strict grammatical rules of the programming language. It builds a structure called a Parse Tree or Abstract Syntax Tree (AST). If you miss a semicolon or have mismatched parentheses, the parser detects this error here and reports it as a \"syntax error.\"\n\n5.  **Semantic Analysis**: Once the syntax is correct, the compiler checks the meaning. It verifies that operations make logical sense, such as ensuring you don\u2019t add a string to an integer without conversion, or that a variable was declared before it was used. This step catches logic errors that look syntactically correct but are invalid.\n\n6.  **Symbol Table Creation**: Throughout the earlier phases, the compiler builds a massive lookup table called the Symbol Table. This database stores information about every variable, function, and class, including their names, types, memory locations, and scope. Later steps rely heavily on this table to resolve references.\n\n7.  **Intermediate Representation (IR) Generation**: High-level source code is too abstract for direct optimization against specific hardware. So, the compiler converts the AST into an Intermediate Representation (IR). This is a simplified, generic form of assembly-like instructions"
+  },
+  "resumed": {
+   "role": "assistant",
+   "content": "Here is a detailed, step-by-step explanation of how a compiler transforms human-readable code into machine-executable instructions, broken down into forty distinct stages and concepts.\n\n1.  **Source Code Input**: The process begins when the compiler reads your source code file (like `.c`, `.java`, or `.py`). This is text data stored on your computer\u2019s hard drive, containing keywords, variables, and functions written in a high-level language designed for humans to read easily.\n\n2.  **Preprocessing (Optional)** In languages like C or C++, the first step often involves a preprocessor. It handles directives starting with symbols like `#include` or `#define`. It replaces macro definitions with their actual values and inserts the contents of other header files directly into your main file, creating a single, expanded block of text before real parsing begins.\n\n3.  **Lexical Analysis (Tokenization)** The compiler breaks the continuous stream of characters into meaningful pieces called tokens. For example, it sees the string `int x = 10;` and splits it into separate tokens: the keyword `int`, the identifier `x`, the symbol `=`, the number `10`, and the terminator `;`. It ignores whitespace and comments during this phase.\n\n4.  **Syntax Analysis (Parsing)** The parser takes those tokens and checks if they follow the strict grammatical rules of the programming language. It builds a structure called a Parse Tree or Abstract Syntax Tree (AST). If you miss a semicolon or have mismatched parentheses, the parser detects this error here and reports it as a \"syntax error.\"\n\n5.  **Semantic Analysis**: Once the syntax is correct, the compiler checks the meaning. It verifies that operations make logical sense, such as ensuring you don\u2019t add a string to an integer without conversion, or that a variable was declared before it was used. This step catches logic errors that look syntactically correct but are invalid.\n\n6.  **Symbol Table Creation**: Throughout the earlier phases, the compiler builds a massive lookup table called the Symbol Table. This database stores information about every variable, function, and class, including their names, types, memory locations, and scope. Later steps rely heavily on this table to resolve references.\n\n7.  **Intermediate Representation (IR) Generation**: High-level source code is too abstract for direct optimization against specific hardware. So, the compiler converts the AST into an Intermediate Representation (IR). This is a simplified, generic form of assembly-like instructions"
+  },
+  "foreground": [
+   "A compiler is a program that translates source code written in a high-level programming language into machine code that a computer can execute."
+  ],
+  "before": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 1,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "d9ceba8ca3b9428abdff06717c7a1891",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 83,
+     "prompt_tokens": 44,
+     "paused": true,
+     "pauses": 2,
+     "checkpoint_bytes": 245366784,
+     "checkpoint_freed_bytes": 245366784,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    },
+    {
+     "id": "a01d9f81dfc246058fb85e9246fb0e65",
+     "mode": "foreground",
+     "phase": "foreground"
+    }
+   ],
+   "native": {
+    "seq": 22,
+    "hold": 1,
+    "state": 3,
+    "ack": 22,
+    "bytes": 245366784,
+    "pauses": 2,
+    "tokens": 83,
+    "prompt": 44,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 245366784,
+    "available": 31967543296
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  },
+  "after": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": false,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "d9ceba8ca3b9428abdff06717c7a1891",
+     "mode": "background",
+     "phase": "running",
+     "output_tokens": 83,
+     "prompt_tokens": 44,
+     "paused": false,
+     "pauses": 2,
+     "checkpoint_bytes": 0,
+     "checkpoint_freed_bytes": 245366784,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 23,
+    "hold": 0,
+    "state": 1,
+    "ack": 23,
+    "bytes": 0,
+    "pauses": 2,
+    "tokens": 83,
+    "prompt": 44,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 245366784,
+    "available": 32389201920
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  }
+ },
+ {
+  "case": "prefill-cold-equals-warm",
+  "exact": true,
+  "usage_cold": {
+   "prompt_tokens": 63596,
+   "completion_tokens": 77,
+   "total_tokens": 63673,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "usage_warm": {
+   "prompt_tokens": 63596,
+   "completion_tokens": 77,
+   "total_tokens": 63673,
+   "prompt_tokens_details": {
+    "cached_tokens": 63565
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  }
+ },
+ {
+  "case": "prefill-greedy-lease",
+  "exact": true,
+  "switch_s": 1.393974459002493,
+  "in_prefill": true,
+  "lease": true,
+  "paused_tokens": 0,
+  "paused_phase": 1,
+  "checkpoint_bytes": 890421248,
+  "pauses": 3,
+  "frozen": true,
+  "usage": {
+   "prompt_tokens": 63596,
+   "completion_tokens": 96,
+   "total_tokens": 63692,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference_usage": {
+   "prompt_tokens": 63596,
+   "completion_tokens": 96,
+   "total_tokens": 63692,
+   "prompt_tokens_details": {
+    "cached_tokens": 63565
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference": {
+   "role": "assistant",
+   "content": "Sensor 5 records data at a consistent rate of 37 units per minute, cycling through values from 0 to 999 before resetting. The sensor's readings follow a predictable linear progression within each cycle, such as starting at 185 units in the first cycle and reaching 996 units near the end of that same cycle. This pattern repeats indefinitely, with the sensor consistently reporting its current value modulo 1000 at every recorded interval."
+  },
+  "resumed": {
+   "role": "assistant",
+   "content": "Sensor 5 records data at a consistent rate of 37 units per minute, cycling through values from 0 to 999 before resetting. The sensor's readings follow a predictable linear progression within each cycle, such as starting at 185 units in the first cycle and reaching 996 units near the end of that same cycle. This pattern repeats indefinitely, with the sensor consistently reporting its current value modulo 1000 at every recorded interval."
+  },
+  "foreground": [
+   "A compiler is a program that translates source code written in a high-level programming language into machine code that a computer can execute."
+  ],
+  "before": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "74f8f63183c2480e9be701bd7d183bc2",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 0,
+     "prompt_tokens": 63596,
+     "paused": true,
+     "pauses": 3,
+     "checkpoint_bytes": 890421248,
+     "checkpoint_freed_bytes": 890421248,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 28,
+    "hold": 1,
+    "state": 3,
+    "ack": 28,
+    "bytes": 890421248,
+    "pauses": 3,
+    "tokens": 0,
+    "prompt": 63596,
+    "phase": 1,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 890421248,
+    "available": 29013868544
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  },
+  "after": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "74f8f63183c2480e9be701bd7d183bc2",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 0,
+     "prompt_tokens": 63596,
+     "paused": true,
+     "pauses": 3,
+     "checkpoint_bytes": 890421248,
+     "checkpoint_freed_bytes": 890421248,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 29,
+    "hold": 1,
+    "state": 3,
+    "ack": 29,
+    "bytes": 890421248,
+    "pauses": 3,
+    "tokens": 0,
+    "prompt": 63596,
+    "phase": 1,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 890421248,
+    "available": 29747953664
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  }
+ },
+ {
+  "case": "decode-greedy-two-foregrounds",
+  "exact": true,
+  "switch_s": null,
+  "in_prefill": false,
+  "lease": false,
+  "paused_tokens": 52,
+  "paused_phase": 2,
+  "checkpoint_bytes": 311427072,
+  "pauses": 4,
+  "frozen": true,
+  "usage": {
+   "prompt_tokens": 44,
+   "completion_tokens": 512,
+   "total_tokens": 556,
+   "prompt_tokens_details": {
+    "cached_tokens": 13
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference_usage": {
+   "prompt_tokens": 44,
+   "completion_tokens": 512,
+   "total_tokens": 556,
+   "prompt_tokens_details": {
+    "cached_tokens": 13
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "reference": {
+   "role": "assistant",
+   "content": "1. **Source Code Ingestion**: The process begins when the compiler reads the raw source code files from the disk into memory, treating them initially as a stream of characters without any semantic understanding.\n\n2. **Character Encoding Handling**: The compiler identifies and handles character encoding schemes (such as UTF-8 or ASCII) to ensure that special characters, comments, and string literals are interpreted correctly across different platforms.\n\n3. **Preprocessing**: For languages like C and C++, the preprocessor runs first, expanding macros, including header files, removing comments, and handling conditional compilation directives before the main parsing phase begins.\n\n4. **Lexical Analysis (Tokenization)**: The lexer scans the character stream and groups sequences of characters into meaningful units called tokens, such as keywords, identifiers, operators, and literals.\n\n5. **Token Stream Generation**: The output of the lexical analysis is a linear sequence of tokens, which abstracts away whitespace and formatting details, providing a cleaner input for the parser.\n\n6. **Syntax Analysis (Parsing)**: The parser takes the token stream and attempts to structure it according to the formal grammar rules of the programming language, checking for syntactic correctness.\n\n7. **Abstract Syntax Tree (AST) Construction**: As the parser validates the syntax, it builds an Abstract Syntax Tree, a hierarchical data structure that represents the logical structure of the program while ignoring irrelevant syntactic details like parentheses.\n\n8. **Semantic Analysis**: The compiler traverses the AST to verify semantic correctness, ensuring that operations are valid for the types involved, such as preventing the addition of a string to an integer.\n\n9. **Symbol Table Creation**: During semantic analysis, the compiler constructs symbol tables that map variable names, function names, and class definitions to their respective types, scopes, and memory locations.\n\n10. **Scope Resolution**: The compiler resolves variable references by determining which declaration corresponds to each usage based on lexical scoping rules, distinguishing between local variables, global variables, and parameters.\n\n11. **Type Checking and Inference**: The compiler verifies type compatibility throughout the program; in statically typed languages, this ensures strict adherence to declared types, while in dynamically typed or hybrid languages, it may infer types where possible.\n\n12. **Control Flow Graph (CFG) Generation**: The compiler transforms the AST into a Control Flow Graph, a directed graph where nodes represent basic blocks of code and edges represent possible execution paths, facilitating flow-based optimizations.\n\n13. **Intermediate Representation (IR) Conversion**: The"
+  },
+  "resumed": {
+   "role": "assistant",
+   "content": "1. **Source Code Ingestion**: The process begins when the compiler reads the raw source code files from the disk into memory, treating them initially as a stream of characters without any semantic understanding.\n\n2. **Character Encoding Handling**: The compiler identifies and handles character encoding schemes (such as UTF-8 or ASCII) to ensure that special characters, comments, and string literals are interpreted correctly across different platforms.\n\n3. **Preprocessing**: For languages like C and C++, the preprocessor runs first, expanding macros, including header files, removing comments, and handling conditional compilation directives before the main parsing phase begins.\n\n4. **Lexical Analysis (Tokenization)**: The lexer scans the character stream and groups sequences of characters into meaningful units called tokens, such as keywords, identifiers, operators, and literals.\n\n5. **Token Stream Generation**: The output of the lexical analysis is a linear sequence of tokens, which abstracts away whitespace and formatting details, providing a cleaner input for the parser.\n\n6. **Syntax Analysis (Parsing)**: The parser takes the token stream and attempts to structure it according to the formal grammar rules of the programming language, checking for syntactic correctness.\n\n7. **Abstract Syntax Tree (AST) Construction**: As the parser validates the syntax, it builds an Abstract Syntax Tree, a hierarchical data structure that represents the logical structure of the program while ignoring irrelevant syntactic details like parentheses.\n\n8. **Semantic Analysis**: The compiler traverses the AST to verify semantic correctness, ensuring that operations are valid for the types involved, such as preventing the addition of a string to an integer.\n\n9. **Symbol Table Creation**: During semantic analysis, the compiler constructs symbol tables that map variable names, function names, and class definitions to their respective types, scopes, and memory locations.\n\n10. **Scope Resolution**: The compiler resolves variable references by determining which declaration corresponds to each usage based on lexical scoping rules, distinguishing between local variables, global variables, and parameters.\n\n11. **Type Checking and Inference**: The compiler verifies type compatibility throughout the program; in statically typed languages, this ensures strict adherence to declared types, while in dynamically typed or hybrid languages, it may infer types where possible.\n\n12. **Control Flow Graph (CFG) Generation**: The compiler transforms the AST into a Control Flow Graph, a directed graph where nodes represent basic blocks of code and edges represent possible execution paths, facilitating flow-based optimizations.\n\n13. **Intermediate Representation (IR) Conversion**: The"
+  },
+  "foreground": [
+   "A compiler is a program that translates source code written in a high-level programming language into machine code that a computer can execute.",
+   "A compiler is a program that translates source code written in a high-level programming language into machine code that a computer can execute."
+  ],
+  "before": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": true,
+   "local_foreground": 2,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "347a076422b744959cd6fd58bb0711f2",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 52,
+     "prompt_tokens": 44,
+     "paused": true,
+     "pauses": 4,
+     "checkpoint_bytes": 311427072,
+     "checkpoint_freed_bytes": 311427072,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    },
+    {
+     "id": "7c3ea739d9bf4eefaec3aba111bd14e8",
+     "mode": "foreground",
+     "phase": "foreground"
+    },
+    {
+     "id": "8dc761fb11054f078ee18ce8827ce272",
+     "mode": "foreground",
+     "phase": "foreground"
+    }
+   ],
+   "native": {
+    "seq": 38,
+    "hold": 1,
+    "state": 3,
+    "ack": 38,
+    "bytes": 311427072,
+    "pauses": 4,
+    "tokens": 52,
+    "prompt": 44,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 311427072,
+    "available": 32183566336
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  },
+  "after": {
+   "native_pause": true,
+   "backend": "texas-split-20261108-native-priority",
+   "foreground_active": false,
+   "local_foreground": 0,
+   "max_background_context_tokens": 262144,
+   "max_background_retained_bytes": 25769803776,
+   "background_system_reserve_bytes": 12884901888,
+   "requests": [
+    {
+     "id": "347a076422b744959cd6fd58bb0711f2",
+     "mode": "background",
+     "phase": "paused",
+     "output_tokens": 52,
+     "prompt_tokens": 44,
+     "paused": true,
+     "pauses": 4,
+     "checkpoint_bytes": 311427072,
+     "checkpoint_freed_bytes": 311427072,
+     "checkpoint_error": false,
+     "restore_waiting_for_memory": false
+    }
+   ],
+   "native": {
+    "seq": 39,
+    "hold": 0,
+    "state": 3,
+    "ack": 38,
+    "bytes": 311427072,
+    "pauses": 4,
+    "tokens": 52,
+    "prompt": 44,
+    "phase": 2,
+    "park_error": 0,
+    "restore_wait": 0,
+    "freed": 311427072,
+    "available": 32159875072
+   },
+   "split": {
+    "mode": "split",
+    "mode_reason": null,
+    "status": "ready"
+   }
+  }
+ },
+ {
+  "case": "foreground-disconnect-releases",
+  "exact": true,
+  "resume_after_disconnect_s": 0.27,
+  "paused_tokens": 33,
+  "frozen_tokens": 33
+ },
+ {
+  "case": "stream-tools-thinking",
+  "exact": true,
+  "tool_calls": [
+   [
+    "get_weather",
+    "{\"city\":\"Oslo\"}"
+   ]
+  ],
+  "reasoning_chars": 376,
+  "content_chars": 0
+ },
+ {
+  "case": "admission-rules",
+  "exact": true,
+  "checks": {
+   "second_background_429": true,
+   "background_media_400": true,
+   "invalid_priority_400": true,
+   "unknown_model_404": true,
+   "scheduler_unauthorized_401": true,
+   "models_id": true,
+   "backend_header": true
+  }
+ }
+]

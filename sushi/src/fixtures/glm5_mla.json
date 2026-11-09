@@ -1,0 +1,36 @@
+{
+  "source_hashes": {
+    "omlx/patches/mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py": "cca4d5f7604e3890170210ff5dba4416b6264e68e037531c46b688fd4d642245",
+    ".venv/lib/python3.14/site-packages/mlx_lm/models/mla.py": "22877b336255e58d949d982b6ac4730bd0ca1a1a6f40479f736570b3c9f35057",
+    ".venv/lib/python3.14/site-packages/mlx_lm/models/cache.py": "819ed95dcbf755652363cfdb15a639890447abb534a06dcefd52c7fff5055750"
+  },
+  "omlx_commit": "6745c39cb66ba5ec130a761149fc1b8b832fcb07",
+  "seed": 53256,
+  "geometry": {
+    "hidden_size": 128,
+    "num_attention_heads": 2,
+    "q_lora_rank": 128,
+    "qk_rope_head_dim": 0,
+    "kv_lora_rank": 512,
+    "v_head_dim": 256,
+    "qk_nope_head_dim": 256,
+    "mla_use_nope": true,
+    "attention_bias": false,
+    "rms_norm_eps": 1e-05,
+    "index_n_heads": 2,
+    "index_head_dim": 32,
+    "index_topk": 2048,
+    "index_kpool": 4,
+    "index_kpool_always_select_tail": true
+  },
+  "dtype": "BF16",
+  "settings": {
+    "decode_fusion": false,
+    "tf32": false
+  },
+  "absorbed_vs_expanded": {
+    "max_abs": 0.00390625,
+    "relative_l2": 0.0038833909202367067
+  },
+  "fixture_sha256": "4fc09c68b971437a506132f4d7a259058d2148cae63104087ac755faca38a0c4"
+}

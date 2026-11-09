@@ -1,0 +1,16 @@
+{
+  "cubin": "kernels/mcg4_tensor.sm120.cubin",
+  "cubin_bytes": 944776,
+  "cubin_sha256": "b0bec63ef3e4918a600134c54d641c7ee1f2b71b5d7df43e915f8a0313d9e431",
+  "source": "kernels/mcg4_tensor.cu",
+  "nvrtc_version": [
+    13,
+    0
+  ],
+  "options": [
+    "--gpu-architecture=sm_120",
+    "--std=c++17",
+    "--fmad=false"
+  ],
+  "image_id": "sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266"
+}

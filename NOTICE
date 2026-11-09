@@ -1,0 +1,40 @@
+texas-split — third-party components and licenses
+
+This repository combines original work with vendored, adapted and fetched third-party components.
+Each component below keeps its own license. No model weights are included.
+
+sushi/ — Sushi v1.3.0 (https://github.com/beamivalice/sushi), a fork of ddalcu's mlx-serve
+  MIT License, Copyright (c) 2026 Theinruj Toranavikrai, Copyright (c) 2026 David Dalcu
+  (sushi/LICENSE). Sushi incorporates third-party portions under their own licenses, including
+  Apache-2.0 portions (sushi/NOTICE, sushi/LICENSE-APACHE-2.0). Modified in this repository; the
+  changes are listed in sushi/FORK.md.
+
+sushi/lib/mlx-src, sushi/lib/mlxc-src — MLX and mlx-c (git submodules)
+  https://github.com/ml-explore/mlx, https://github.com/ml-explore/mlx-c — MIT License,
+  Copyright (c) 2023 Apple Inc.
+  The MLX runtime libraries used at run time are downloaded by install.sh from the Sushi v1.3.0
+  release bundle (MIT; see that bundle's LICENSE and NOTICE).
+
+stage/ — the RTX 5090 stage server
+  Original work, with kernels and formats adapted from Sushi (MIT), MLX (MIT), MTPLX and dflash-mlx
+  (Apache-2.0, stage/LICENSE-APACHE-2.0) and macuda (MIT), attributed file by file in
+  stage/NOTICE.txt. stage/kernels/macuda/ holds two unchanged macuda cubins (MIT, Copyright (c) 2026
+  Antonio Torres; stage/kernels/macuda/LICENSE).
+
+driver/ — libtinynv from macuda (https://github.com/Davinchy/macuda) at e797e31, with patches
+  MIT License, Copyright (c) 2026 Antonio Torres (driver/LICENSE). libtinynv is a C port of the
+  userspace NVIDIA driver in tinygrad (https://github.com/tinygrad/tinygrad), MIT License,
+  Copyright (c) 2024 the tiny corp. Modified in this repository (driver/*.patch, driver/README.md).
+
+third_party/macuda — macuda (git submodule, unmodified), MIT License.
+
+host/ — the HTTP host, supervisor, priority controller and tests: original work.
+
+Fetched by install.sh, not distributed here, each under its own license:
+  - TinyGPU.app (tinygrad's signed DriverKit extension), from tinygrad's tinygpu_releases.
+  - NVIDIA open-gpu-kernel-modules headers (MIT/GPL dual-licensed; used under MIT).
+  - NVIDIA GSP firmware 570.144 from linux-firmware (NVIDIA's firmware license; redistributable
+    unmodified).
+  - The Zig 0.17.0 toolchain (MIT), by sushi/scripts/fetch-zig.sh.
+  - Qwen3.8-Flash-Next packed by beamster (https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw),
+    under the Qwen community license (qwen-community-1.0) stated on its model card.

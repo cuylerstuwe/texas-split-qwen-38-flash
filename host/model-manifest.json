@@ -1,0 +1,864 @@
+{
+ "repo": "beamster/Qwen3.8-Flash-Next-Sushi-4bpw",
+ "revision": "f25c0c4acdc44289a9cc6dab7f0eb788d1125ded",
+ "name": "Qwen3.8-Flash-Next-Sushi-4bpw",
+ "bytes": 170804365060,
+ "files": [
+  {
+   "path": "LICENSE",
+   "size": 3235
+  },
+  {
+   "path": "README.md",
+   "size": 5071
+  },
+  {
+   "path": "chat_template.jinja",
+   "size": 8952
+  },
+  {
+   "path": "config.json",
+   "size": 92519
+  },
+  {
+   "path": "generation_config.json",
+   "size": 202
+  },
+  {
+   "path": "merges.txt",
+   "size": 3353259
+  },
+  {
+   "path": "model-00001.safetensors",
+   "size": 206184
+  },
+  {
+   "path": "model-00003.safetensors",
+   "size": 293520
+  },
+  {
+   "path": "model-00005.safetensors",
+   "size": 169928
+  },
+  {
+   "path": "model-00006.safetensors",
+   "size": 288768
+  },
+  {
+   "path": "model-00008.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00010.safetensors",
+   "size": 295600
+  },
+  {
+   "path": "model-00012.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00014.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00016.safetensors",
+   "size": 292728
+  },
+  {
+   "path": "model-00018.safetensors",
+   "size": 316216
+  },
+  {
+   "path": "model-00020.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00022.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00024.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00026.safetensors",
+   "size": 295592
+  },
+  {
+   "path": "model-00028.safetensors",
+   "size": 210864
+  },
+  {
+   "path": "model-00029.safetensors",
+   "size": 82656
+  },
+  {
+   "path": "model-00031.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00033.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00035.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00037.safetensors",
+   "size": 295600
+  },
+  {
+   "path": "model-00039.safetensors",
+   "size": 298784
+  },
+  {
+   "path": "model-00041.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00043.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00045.safetensors",
+   "size": 295600
+  },
+  {
+   "path": "model-00047.safetensors",
+   "size": 375600
+  },
+  {
+   "path": "model-00049.safetensors",
+   "size": 210648
+  },
+  {
+   "path": "model-00051.safetensors",
+   "size": 316208
+  },
+  {
+   "path": "model-00053.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00055.safetensors",
+   "size": 295600
+  },
+  {
+   "path": "model-00057.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00059.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00061.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00063.safetensors",
+   "size": 295992
+  },
+  {
+   "path": "model-00065.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00067.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00069.safetensors",
+   "size": 211048
+  },
+  {
+   "path": "model-00071.safetensors",
+   "size": 296224
+  },
+  {
+   "path": "model-00073.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00075.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00077.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00079.safetensors",
+   "size": 210656
+  },
+  {
+   "path": "model-00081.safetensors",
+   "size": 296232
+  },
+  {
+   "path": "model-00083.safetensors",
+   "size": 298768
+  },
+  {
+   "path": "model-00085.safetensors",
+   "size": 293528
+  },
+  {
+   "path": "model-00087.safetensors",
+   "size": 231256
+  },
+  {
+   "path": "model-00089.safetensors",
+   "size": 295592
+  },
+  {
+   "path": "model-00091.safetensors",
+   "size": 293520
+  },
+  {
+   "path": "model-00093.safetensors",
+   "size": 210648
+  },
+  {
+   "path": "model-00095.safetensors",
+   "size": 295584
+  },
+  {
+   "path": "model-00097.safetensors",
+   "size": 293520
+  },
+  {
+   "path": "model-00099.safetensors",
+   "size": 107952
+  },
+  {
+   "path": "model-embed.safetensors",
+   "size": 675430752
+  },
+  {
+   "path": "model-exl3-L00-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L00-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L00-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L01-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L01-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L01-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L02-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L02-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L02-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L03-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L03-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L03-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L04-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L04-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L04-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L05-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L05-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L05-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L06-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L06-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L06-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L07-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L07-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L07-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L08-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L08-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L08-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L09-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L09-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L09-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-L10-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L10-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L10-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L11-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L11-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L11-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L12-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L12-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L12-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L13-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L13-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L13-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L14-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L14-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L14-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L15-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L15-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L15-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L16-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L16-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L16-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L17-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L17-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L17-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L18-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L18-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L18-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L19-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L19-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L19-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L20-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L20-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L20-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L21-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L21-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L21-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L22-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L22-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L22-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L23-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L23-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L23-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L24-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L24-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L24-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L25-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L25-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L25-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L26-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L26-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L26-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L27-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L27-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L27-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L28-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L28-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L28-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L29-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L29-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L29-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L30-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L30-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L30-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L31-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L31-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L31-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L32-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L32-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L32-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L33-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L33-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L33-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L34-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L34-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L34-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L35-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L35-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L35-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L36-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L36-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L36-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L37-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L37-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L37-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L38-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L38-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L38-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L39-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L39-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L39-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L40-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L40-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L40-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L41-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L41-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L41-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L42-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L42-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L42-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L43-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L43-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L43-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L44-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L44-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L44-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L45-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L45-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L45-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L46-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L46-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L46-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L47-down.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L47-gate.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-L47-up.safetensors",
+   "size": 422708072
+  },
+  {
+   "path": "model-exl3-mtp-L00-down.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-mtp-L00-gate.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-exl3-mtp-L00-up.safetensors",
+   "size": 422708064
+  },
+  {
+   "path": "model-lm-head.safetensors",
+   "size": 655565120
+  },
+  {
+   "path": "model-mtp.safetensors",
+   "size": 96058152
+  },
+  {
+   "path": "model-trunk-00001-of-00002.safetensors",
+   "size": 2393244130
+  },
+  {
+   "path": "model-trunk-00002-of-00002.safetensors",
+   "size": 2408600368
+  },
+  {
+   "path": "model.safetensors.index.json",
+   "size": 331165
+  },
+  {
+   "path": "ngram_table.bin",
+   "size": 102400491704
+  },
+  {
+   "path": "tokenizer.json",
+   "size": 12809320
+  },
+  {
+   "path": "tokenizer_config.json",
+   "size": 17928
+  },
+  {
+   "path": "vocab.json",
+   "size": 6722759
+  }
+ ]
+}

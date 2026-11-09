@@ -1,0 +1,16 @@
+{
+  "cubin": "kernels/moe_join_r53.sm120.cubin",
+  "cubin_bytes": 9606368,
+  "cubin_sha256": "9395c665216ae7c95b6da4612382f3957a6597cbc093f4538efc3b3c9945ecb0",
+  "source": "kernels/moe_join_r53.cu",
+  "nvrtc_version": [
+    13,
+    0
+  ],
+  "options": [
+    "--gpu-architecture=sm_120",
+    "--std=c++17",
+    "--fmad=false"
+  ],
+  "image_id": "sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266"
+}

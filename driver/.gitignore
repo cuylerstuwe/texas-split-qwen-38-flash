@@ -1,0 +1,3 @@
+build/*
+!build/sdk.sh
+libtinynv/third_party/

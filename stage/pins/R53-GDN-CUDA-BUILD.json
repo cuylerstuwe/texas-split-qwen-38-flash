@@ -1,0 +1,16 @@
+{
+  "cubin": "kernels/lowbit_gdn_r53.sm120.cubin",
+  "cubin_bytes": 436792,
+  "cubin_sha256": "6e4ce0b0312c8856ac26dfceed8241fb287930e16af611cb761049ff2b1844a5",
+  "source": "kernels/lowbit_gdn_r53.cu",
+  "nvrtc_version": [
+    13,
+    0
+  ],
+  "options": [
+    "--gpu-architecture=sm_120",
+    "--std=c++17",
+    "--fmad=false"
+  ],
+  "image_id": "sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266"
+}

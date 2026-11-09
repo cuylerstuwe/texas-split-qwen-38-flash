@@ -1,0 +1,11 @@
+--- evidence/r39-opus-intake-v1/driver-r38/libtinynv/src/exec.c	2026-11-05 16:46:54
++++ driver-r38/libtinynv/src/exec.c	2026-11-05 17:36:31
+@@ -2289,7 +2289,7 @@
+   }
+   if (ch) {
+     // R38 experiment: early dependent launch fields, written before the link and before either descriptor is copied
+-    if (ex->pdl_mode && tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), ex->pdl_mode)) {
++    if (ex->pdl_mode && (!(ex->pdl_mode & 32) || !strncmp(k->name, "r39pdl_", 7)) && tinynv_qmd_r38_pdl(&r->prev_qmd, &q, (uint32_t)(r->n & 0xffffffffu), ex->pdl_mode)) {
+       r->failed = 1; return -1;
+     }
+     // the previous descriptor schedules this one; its bytes are written again with the link in them
