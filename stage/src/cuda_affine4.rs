@@ -381,6 +381,17 @@ impl<'m, 'd> Packed<'m, 'd> {
         a.validate()?;
         Self::build(d, m8, a.k, a.n, a.group, &a.codes, &a.scales, &a.biases, true)
     }
+    /// R64: the canonical 8-bit vocabulary head (hidden x 248,320), past `Affine8::validate`'s dense-size
+    /// cap: assembled from validated row tiles, so only the joined geometry is checked here.
+    pub fn new_affine8_head(d: &'d Device, m8: &'m Module<'d>, a: &crate::dense::Affine8) -> Result<Self> {
+        let groups = a.k / a.group;
+        ensure!(
+            a.k == crate::hc::H && a.n == crate::embedding::VOCAB && [64, 128].contains(&a.group) && a.k % a.group == 0
+                && a.codes.len() == a.k * a.n && a.scales.len() == a.n * groups && a.biases.len() == a.n * groups,
+            "affine8 head geometry"
+        );
+        Self::build(d, m8, a.k, a.n, a.group, &a.codes, &a.scales, &a.biases, true)
+    }
     pub fn vocabulary(
         d: &'d Device,
         m: &'m Module<'d>,

@@ -56,6 +56,9 @@ def body(prompt, temp=0, tokens=512, think=False, **extra):
     if temp == 0:
         b['top_k'] = 1
     b.update(extra)
+    # qualification of sampler-dependent paths: extra request fields as a JSON object, e.g.
+    # TEXAS_SPLIT_PRIORITY_EXTRA='{"presence_penalty": 0}' routes the non-thinking cases through the stage head
+    b.update(json.loads(os.environ.get('TEXAS_SPLIT_PRIORITY_EXTRA', '{}')))
     return b
 
 

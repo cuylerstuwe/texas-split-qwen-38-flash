@@ -1,5 +1,55 @@
 # Changelog
 
+## 2026-11-10
+
+Existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart` (the stage server
+changed too this time).
+
+### Faster decode: the verify's head on the 5090
+
+For an MTP verify round, the RTX 5090 now also runs the final mixer, the 8-bit LM head (248,320 × 2560) and
+a top-20 per row right after layer 47, and returns those 20 candidates with the stream. The Mac takes them as
+the verify's logits and computes the acceptance law on them, instead of running its own head over the whole
+vocabulary. Details in [sushi/FORK.md](sushi/FORK.md) §6.
+
+- Exact where it engages: a sampler that reads at most the top 20 candidates (top-k ≤ 20 or greedy) with no
+  presence/repeat penalty, logit bias or think penalty. That is the thinking-mode default (T=1.0,
+  top-p 0.95, top-k 20); other requests keep the Mac's head, as does a round whose top 20 contains a
+  reserved special token.
+- The acceptance law is the same, so outputs follow the same distribution. Its random draws are taken over
+  the 20 candidates, so a seeded sampled run's text differs from older builds (greedy text does not).
+- One decode round is ~0.8 ms shorter (the Mac's post-verify work 2.2 → 0.6 ms).
+- The head needs 0.71 GB on the card. At the full 262K context it fits with the stage's prefill pieces at
+  1,536 rows (the host sets `QD_STAGE_PREFILL_ROWS=1536`; time to first token is unchanged); ~0.6 GB stays
+  free.
+
+### Faster prefill
+
+- **Dequant cache** (bit-identical): the Mac keeps each 8-bit dense weight's bf16 copy instead of
+  rebuilding it for every 4,096-row chunk. ~4.1 GB more resident memory once the first long prompt has
+  run. Time to first token −5% per pair of agentic sessions, −10% on a cold 54K-token prompt.
+- **Whole-tail chunk planning**: the last two chunk widths of a split prefill are planned together, so each
+  of the Mac's chunks covers the 5090's work on the previous one and the final chunk is short. Interior
+  checkpoint boundaries there are skipped (the end-of-prompt snapshot always lands). This removes waits of
+  up to 0.7 s per follow-up turn (e.g. a checkpoint boundary that split a 4,720-row prompt into 4,557 + 163
+  rows, the small chunk then waiting 703 ms for the 5090). Six-turn agentic pair: summed time to first token
+  33.6–34.7 → 31.4 s. Chunk placement only: end-of-prefill logprobs move by about as much as switching the
+  chunk width does.
+
+### Host
+
+- `QD_STAGE_HEAD=1` and `QD_STAGE_PREFILL_ROWS=1536` for the stage; `SUSHI_R64_STAGE_HEAD`,
+  `SUSHI_R64_SPARSE_ACCEPT`, `SUSHI_STAGE_INFER_COMMIT`, `SUSHI_R64_DQ_CACHE_MB=6144` and
+  `SUSHI_R64_SPLIT_PLAN` for Sushi. Each can be set to `0`.
+- `host/tests/priority.py`: `TEXAS_SPLIT_PRIORITY_EXTRA` adds request fields (JSON) to every case, e.g.
+  `{"presence_penalty": 0}` to run the non-thinking cases through the stage head.
+
+### Validation
+
+Priority suite 8/8 exact with SSD parking after each change, including a run with presence 0 on every case
+so all 2,894 verify forwards used the stage head; smoke 10/10; `fault.py term`; a cold `fault.py prefill`.
+See [docs/VALIDATION.md](docs/VALIDATION.md).
+
 ## 2026-11-09
 
 Existing installs: `git pull`, `./install.sh sushi pins`, `bin/texas-split restart`.

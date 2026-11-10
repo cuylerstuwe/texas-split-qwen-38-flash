@@ -83,10 +83,10 @@ index 00000000..0db980ca
 +this live-process contract.
 diff --git a/native/stage_split.cpp b/native/stage_split.cpp
 new file mode 100644
-index 00000000..6bee66e5
+index 00000000..22dee872
 --- /dev/null
 +++ b/native/stage_split.cpp
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,624 @@
 +// R60 pipeline split (isolated experiment): Sushi's side of the RTX 5090 stage, which runs the
 +// canonical target's layers [first, 48) in qwen-hybrid-rs canon-stage-server. One Unix socket
 +// (SUSHI_STAGE_SOCKET) carries 32-byte messages; one shared file (SUSHI_STAGE_SHM) carries the
@@ -132,6 +132,16 @@ index 00000000..6bee66e5
 +size_t g_at = 0;        // seed blob cursor
 +uint64_t g_forwards = 0, g_seeds = 0, g_partials = 0;
 +double g_rpc_us = 0, g_copy_us = 0;
++// R64 stage head: request the final mixer + lm_head + top-20 with the next forward (op 1 aux bit 2); the reply's
++// per-row (20 BF16-valued f32 bit patterns, 20 token ids) are copied out of the shared file at receive time.
++int g_want_head = 0, g_head_rows = 0;
++uint32_t g_head_buf[16 * 40];
++// R64 (SUSHI_STAGE_INFER_COMMIT=1, a stage server that infers commits from positions): no op 2 round trip.
++static int infer_commit() {
++  static int v = -1;
++  if (v < 0) { const char* e = getenv("SUSHI_STAGE_INFER_COMMIT"); v = (e && e[0] == '1') ? 1 : 0; }
++  return v;
++}
 +// R60 S4 (prefill v2): pipelined chunk prefill through the stage (op 6). Two shm slots after the
 +// forward/seed area; replies arrive in send order. While chunks are in flight no other op may run.
 +constexpr size_t kSlotBase = size_t(256) << 20;
@@ -528,15 +538,21 @@ index 00000000..6bee66e5
 +  const double t1 = now_us();
 +  // infer the commit of the previous forward
 +  if (g_rows && position < g_base + g_rows) {
-+    if (rpc(2, 0, 0, position - g_base)) return -1;
++    if (!infer_commit() && rpc(2, 0, 0, position - g_base)) return -1;
 +    g_partials++;
 +  }
 +  if (rope_delta < -(1 << 23) || rope_delta >= (1 << 23)) { fprintf(stderr, "[stage] rope delta %d out of range\n", rope_delta); return -1; }
-+  if (rpc(1, rows, position, 0, (uint32_t(rope_delta) & 0xFFFFFFu) << 8)) return -1;
++  const int want_head = g_want_head;
++  g_head_rows = 0;
++  if (rpc(1, rows, position, 0, ((uint32_t(rope_delta) & 0xFFFFFFu) << 8) | (want_head ? 4u : 0u))) return -1;
 +  const double t2 = now_us();
 +  g_base = position;
 +  g_rows = rows;
 +  resident_add(g_owner);
++  if (want_head) {
++    memcpy(g_head_buf, g_shm + size_t(rows) * kF * 2, size_t(rows) * 40 * 4);
++    g_head_rows = int(rows);
++  }
 +  int oshape[3] = {1, int(rows), kF};
 +  mlx_array ob = mlx_array_new_data(g_shm, oshape, 3, MLX_BFLOAT16);
 +  const mlx_dtype want = mlx_array_dtype(h);
@@ -554,6 +570,14 @@ index 00000000..6bee66e5
 +    fprintf(stderr, "[stage] %llu forwards: rpc %.0f us, copies %.0f us avg; %llu partial commits, %llu seeds\n",
 +            (unsigned long long)g_forwards, g_rpc_us / g_forwards, g_copy_us / g_forwards,
 +            (unsigned long long)g_partials, (unsigned long long)g_seeds);
++  return 0;
++}
++void stage_split_set_head(int on) { g_want_head = on; }
++// The last forward's head rows (per row 20 BF16-valued f32 bit patterns then 20 token ids); -1 unless it
++// carried them for exactly `rows` rows.
++int stage_split_head_topk(uint32_t* dst, int rows) {
++  if (rows < 1 || rows > 16 || g_head_rows != rows) return -1;
++  memcpy(dst, g_head_buf, size_t(rows) * 40 * 4);
 +  return 0;
 +}
 +// R60 S4 (prefill v2): the empty state at position 0 (a request with no cached prefix): zero
@@ -1045,14 +1069,86 @@ index 00000000..4867ba77
 +  return avail<total?avail:total;
 +}
 diff --git a/src/generate.zig b/src/generate.zig
-index b026590c..dcca3d6e 100644
+index b026590c..ac1ca51b 100644
 --- a/src/generate.zig
 +++ b/src/generate.zig
-@@ -1,4 +1,14 @@
+@@ -1,4 +1,86 @@
  const std = @import("std");
 +var r64_nosettle_env: ?bool = null;
 +var r64_chain_ladder_env: ?bool = null;
 +var r64_shortconf_env: ?bool = null;
++var r64_defcap_mode: ?u8 = null;
++var r64_defcap_rounds: u64 = 0;
++pub var r64_defcap_window_mode: u8 = 0;
++fn r64DeferCaptures() bool {
++    if (r64_defcap_mode == null) r64_defcap_mode = if (std.c.getenv("SUSHI_R64_DEFER_CAPTURES")) |v| v[0] -% '0' else 0;
++    r64_defcap_rounds += 1;
++    const on = switch (r64_defcap_mode.?) {
++        1 => true,
++        2 => ((r64_defcap_rounds - 1) / 32) % 2 == 1,
++        else => false,
++    };
++    r64_defcap_window_mode = @intFromBool(on);
++    return on;
++}
++var r64_cpuacc_mode: ?u8 = null;
++var r64_cpuacc_rounds: u64 = 0;
++pub var r64_cpuacc_window: u8 = 0;
++pub var r64_cpuacc_n: u64 = 0;
++/// R64i (SUSHI_R64_CPU_ACCEPT=1; 2 = alternate per 32-round window): a stage-head round's acceptance runs on
++/// the host over the 1+m top-20 rows (the stage head's values and ids, already in unified memory) and the
++/// draft densities, instead of a GPU graph the host then waits on. Same filter and accept/residual/bonus law
++/// as sparseAcceptGraph; the draws come from the generator's PRNG (deterministic generator state).
++fn r64CpuAcceptPlanned() bool {
++    if (r64_cpuacc_mode == null) r64_cpuacc_mode = if (std.c.getenv("SUSHI_R64_CPU_ACCEPT")) |v| v[0] -% '0' else 0;
++    return r64_cpuacc_mode.? != 0;
++}
++fn r64CpuAccept() bool {
++    if (r64_cpuacc_mode == null) r64_cpuacc_mode = if (std.c.getenv("SUSHI_R64_CPU_ACCEPT")) |v| v[0] -% '0' else 0;
++    r64_cpuacc_rounds += 1;
++    const on = switch (r64_cpuacc_mode.?) {
++        1 => true,
++        2 => ((r64_cpuacc_rounds - 1) / 32) % 2 == 1,
++        else => false,
++    };
++    r64_cpuacc_window = @intFromBool(on);
++    return on;
++}
++/// R64i: the proposal density of depth `k` at `token`: from the shortlist's small form when the chain kept
++/// it (no GPU work: computed with the draft), one-hot for an argmax depth, else the dense q row (evaluated).
++fn r64HostQ(chain: anytype, qs: []mlx.mlx_array, k: usize, token: u32) !f32 {
++    if (chain.q_small) |small| if (k < chain.n_qs) switch (chain.q_kind.?[k]) {
++        1 => {
++            const qv = mlx.mlx_array_data_float32(small[k]) orelse return error.MlxArrayDataNull;
++            const cv = mlx.mlx_array_data_uint32(chain.q_cands.?[k]) orelse return error.MlxArrayDataNull;
++            const n: usize = @intCast(mlx.mlx_array_size(chain.q_cands.?[k]));
++            for (0..n) |j| if (cv[j] == token) return qv[j];
++            return 0;
++        },
++        2 => return if (chain.drafts[k] == token) 1 else 0,
++        else => {},
++    };
++    try mlx.check(mlx.mlx_array_eval(qs[k]));
++    const qd = mlx.mlx_array_data_float32(qs[k]) orelse return error.MlxArrayDataNull;
++    return qd[token];
++}
++inline fn r64Bf16(v: u16) f32 {
++    return @bitCast(@as(u32, v) << 16);
++}
++/// In place: softmax over xs (the f32 'precise' form: max shift, exp, sum, divide); -inf entries become 0.
++fn r64Softmax(xs: []f32) void {
++    var mx: f32 = -std.math.inf(f32);
++    for (xs) |x| mx = @max(mx, x);
++    var sum: f32 = 0;
++    for (xs) |*x| {
++        x.* = if (x.* == -std.math.inf(f32)) 0 else @exp(x.* - mx);
++        sum += x.*;
++    }
++    for (xs) |*x| x.* /= sum;
++}
++var r64_stage_head_env: ?bool = null;
++var r64_sparse_env: ?bool = null;
++pub var r64_sparse_rounds: u64 = 0;
 +fn r64EnvOn(cache: *?bool, comptime name: [:0]const u8) bool {
 +    if (cache.* == null) {
 +        const raw = std.c.getenv(name);
@@ -1063,7 +1159,7 @@ index b026590c..dcca3d6e 100644
  const mlx = @import("mlx.zig");
  const transformer_mod = @import("transformer.zig");
  const qwen4_forward = @import("qwen4_forward.zig");
-@@ -1333,6 +1343,82 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
+@@ -1333,6 +1415,82 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
      return if (adaptive_width) tailMergeMax(default_chunk) else TAIL_MERGE_MAX;
  }
  
@@ -1146,7 +1242,7 @@ index b026590c..dcca3d6e 100644
  pub fn nextChunkEnd(
      pos: usize,
      prefix_len: usize,
-@@ -1366,6 +1452,102 @@ pub fn nextChunkEnd(
+@@ -1366,6 +1524,163 @@ pub fn nextChunkEnd(
      return end;
  }
  
@@ -1206,7 +1302,68 @@ index b026590c..dcca3d6e 100644
 +        }
 +    }
 +    if (end > end_in and end - pos > SPLIT_SHAPE_MAX_ROWS) end = end_in;
++    // R64j (SUSHI_R64_SPLIT_PLAN=1): within the last two chunk widths, plan the whole covered tail at once
++    // instead of chunk by chunk: the current chunk is sized so that it, then cover(it), then cover(that), ...
++    // down to a final chunk of about `last` rows, sums to the rows left; a chunk in flight (`prev`) is
++    // still covered. Interior checkpoint boundaries in that stretch are skipped (the end-of-prompt
++    // snapshot always lands). Chunk placement only, as above.
++    if (last > 0 and default_chunk > 0 and splitPlanEnabled()) {
++        const rest = loop_end - pos;
++        if (rest <= 2 * default_chunk) {
++            const c = splitPlanTail(rest, prev, last);
++            if (std.c.getenv("SUSHI_R64_SPLIT_PLAN_LOG") != null) log.info("  [r64-plan] pos {d} (abs {d}) rest {d} prev {d} plain {d} default {d} -> chunk {d}\n", .{ pos, pos + offset, rest, prev, end_in - pos, default_chunk, @min(c, SPLIT_SHAPE_MAX_ROWS) });
++            return pos + @min(c, SPLIT_SHAPE_MAX_ROWS);
++        }
++    }
 +    return end;
++}
++
++var split_plan_env: ?bool = null;
++fn splitPlanEnabled() bool {
++    if (split_plan_env == null) split_plan_env = if (std.c.getenv("SUSHI_R64_SPLIT_PLAN")) |v| v[0] == '1' else false;
++    return split_plan_env.?;
++}
++
++/// Rows the covered tail starting with a `c`-row chunk spans: c, then splitCoverRows(c), ... until the next
++/// chunk would be under `2 * last` (that remainder becomes the final chunk, so it is at least `last`).
++fn splitTailSpan(c: usize, last: usize) usize {
++    var total: usize = c;
++    var cur = c;
++    var guard: usize = 0;
++    while (guard < 16) : (guard += 1) {
++        const nxt = splitCoverRows(cur);
++        if (nxt >= cur or nxt < 2 * last) return total + @max(nxt, last);
++        total += nxt;
++        cur = nxt;
++    }
++    return total;
++}
++
++/// The current chunk's rows for a covered tail of exactly `rest` rows (`prev` = the chunk in flight):
++/// the largest c whose tail span fits `rest`, at least cover(prev) (else the Mac would stall now).
++pub fn splitPlanTail(rest: usize, prev: usize, last: usize) usize {
++    if (rest <= 2 * last) return rest;
++    const floor_c: usize = if (prev > 0) @min(splitCoverRows(prev), rest) else 1;
++    var lo: usize = 1;
++    var hi: usize = rest;
++    while (lo < hi) {
++        const mid = lo + (hi - lo + 1) / 2;
++        if (splitTailSpan(mid, last) <= rest) lo = mid else hi = mid - 1;
++    }
++    var c = @max(lo, floor_c);
++    // a remainder too small to be its own chunk rides with this one
++    if (rest - @min(c, rest) < last) c = rest;
++    return @min(c, rest);
++}
++
++test "R64j covered tail plan" {
++    // A2-like: 4720 rows, nothing in flight -> a chunk of ~half, the rest covered down to a small final
++    const c1 = splitPlanTail(4720, 0, 384);
++    try std.testing.expect(c1 > 2000 and c1 < 3000);
++    const c2 = splitPlanTail(4720 - c1, c1, 384);
++    try std.testing.expect(c2 >= splitCoverRows(c1));
++    // a tiny remainder is one chunk
++    try std.testing.expectEqual(@as(usize, 500), splitPlanTail(500, 4096, 384));
 +}
 +
 +fn splitEnvRows(name: [*:0]const u8, comptime default: usize) usize {
@@ -1249,7 +1406,7 @@ index b026590c..dcca3d6e 100644
  /// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
  /// absorbs a grid point.
  pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
-@@ -2375,6 +2557,7 @@ pub const Generator = struct {
+@@ -2375,6 +2690,7 @@ pub const Generator = struct {
          /// runs atomically (pre-interleave behavior, and the
          /// SUSHI_PREFILL_INTERLEAVE=0 kill switch).
          interleave_hook: ?InterleaveHook = null,
@@ -1257,7 +1414,7 @@ index b026590c..dcca3d6e 100644
          /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
          write_through_hook: ?WriteThroughHook = null,
          /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
-@@ -2386,6 +2569,14 @@ pub const Generator = struct {
+@@ -2386,6 +2702,14 @@ pub const Generator = struct {
          adaptive_chunk_width: bool = false,
      };
  
@@ -1272,7 +1429,7 @@ index b026590c..dcca3d6e 100644
      pub const InterleaveHook = struct {
          ctx: *anyopaque,
          call: *const fn (ctx: *anyopaque) void,
-@@ -2511,6 +2702,9 @@ pub const Generator = struct {
+@@ -2511,6 +2835,9 @@ pub const Generator = struct {
          ), options.decode_share_width_cap);
          // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
          const trace_enabled = log.isDebug();
@@ -1282,7 +1439,7 @@ index b026590c..dcca3d6e 100644
          var prefill_sw = io_util.Stopwatch.init(io);
          var chunked_ns: u64 = 0;
          var eval_ns: u64 = 0;
-@@ -2532,7 +2726,15 @@ pub const Generator = struct {
+@@ -2532,7 +2859,15 @@ pub const Generator = struct {
          }
          const has_vision = ctx.vision_embeddings != null;
          const glm_request = ctx.glm5_request;
@@ -1299,7 +1456,7 @@ index b026590c..dcca3d6e 100644
              options.ssm_checkpoint_stride,
              (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
              has_vision,
-@@ -2612,6 +2814,21 @@ pub const Generator = struct {
+@@ -2612,6 +2947,21 @@ pub const Generator = struct {
          // freshly forwarded tail (`base_pos = ssm_cp_offset`) — sliding-
          // window semantics, same rule as the MTP history.
          const dflash_active = options.dflash_enabled and options.dflash != null;
@@ -1321,7 +1478,7 @@ index b026590c..dcca3d6e 100644
          var dflash_ctx: ?dflash_mod.DflashCtx = if (!dflash_active)
              null
          else if (options.dflash_ctx_restored) |restored| blk: {
-@@ -2752,10 +2969,15 @@ pub const Generator = struct {
+@@ -2752,10 +3102,15 @@ pub const Generator = struct {
                  // chunk-locally. Boundary alignment is in ABSOLUTE position
                  // (pos + offset), so the saved snapshot list is correct for
                  // the full prompt, not the truncated tail.
@@ -1338,7 +1495,7 @@ index b026590c..dcca3d6e 100644
                  if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                  const chunk_len: c_int = @intCast(end - pos);
                  const chunk_shape = [_]c_int{ 1, chunk_len };
-@@ -2772,12 +2994,18 @@ pub const Generator = struct {
+@@ -2772,12 +3127,18 @@ pub const Generator = struct {
                  errdefer if (dflash_active) {
                      for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                  };
@@ -1357,7 +1514,7 @@ index b026590c..dcca3d6e 100644
                  if (dflash_active) {
                      ctx.capture_layers = null;
                      try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
-@@ -2799,7 +3027,7 @@ pub const Generator = struct {
+@@ -2799,7 +3160,7 @@ pub const Generator = struct {
                  // tokens [pos+1, end+1) — prompt_ids[end] always exists since
                  // the chunk loop spans [0, prefix_len) and prompt_ids has
                  // prefix_len + 1 entries.
@@ -1366,7 +1523,7 @@ index b026590c..dcca3d6e 100644
                      if (!mtp_history_started) {
                          std.debug.assert(mtp_cache.?.step() == 0);
                          mtp_position_base = ssm_cp_offset + pos;
-@@ -2869,6 +3097,7 @@ pub const Generator = struct {
+@@ -2869,6 +3230,7 @@ pub const Generator = struct {
                  }
                  // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
                  _ = mlx.mlx_clear_cache();
@@ -1374,7 +1531,7 @@ index b026590c..dcca3d6e 100644
                  if (trace_enabled) {
                      const eval_dt = prefill_sw.read() - eval_start_ns;
                      eval_ns += eval_dt;
-@@ -2887,7 +3116,12 @@ pub const Generator = struct {
+@@ -2887,7 +3249,12 @@ pub const Generator = struct {
                  // are realized; the snapshot is just a refcount-share of the
                  // already-resident state.
                  const abs_end_for_cp2 = end + ssm_cp_offset;
@@ -1388,7 +1545,7 @@ index b026590c..dcca3d6e 100644
                      const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
                      ssm_checkpoints.append(allocator, cp) catch |e| {
                          var doomed = cp;
-@@ -2915,6 +3149,18 @@ pub const Generator = struct {
+@@ -2915,6 +3282,18 @@ pub const Generator = struct {
                      }
                  }
  
@@ -1407,7 +1564,7 @@ index b026590c..dcca3d6e 100644
                  if (vision_chunked) {
                      vision_rows_consumed += countSpliceRows(
                          ids_i32[pos..end],
-@@ -2927,6 +3173,19 @@ pub const Generator = struct {
+@@ -2927,6 +3306,19 @@ pub const Generator = struct {
                  // Publish progress once per chunk — same cadence discipline as
                  // `inflight_generated_tokens` (once per decode tick), never per token.
                  if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
@@ -1427,7 +1584,7 @@ index b026590c..dcca3d6e 100644
                  // Persist this chunk now: the KV bytes for [0, pos) are final.
                  if (options.write_through_hook) |wt| {
                      wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
-@@ -2989,6 +3248,14 @@ pub const Generator = struct {
+@@ -2989,6 +3381,14 @@ pub const Generator = struct {
              // With it, the cache restores to position 749 (~99% of the
              // prompt) and only the last token + new tail re-forwards.
              // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
@@ -1442,7 +1599,7 @@ index b026590c..dcca3d6e 100644
              if (want_ssm_cp and loop_end > 0) {
                  // The snapshot sits at the chunk loop's end — snapshot_backoff
                  // tokens BEFORE the prompt end, where the next turn's prefix
-@@ -3074,6 +3341,7 @@ pub const Generator = struct {
+@@ -3074,6 +3474,7 @@ pub const Generator = struct {
          errdefer if (dflash_active) {
              for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
          };
@@ -1450,7 +1607,7 @@ index b026590c..dcca3d6e 100644
          const raw_logits = if (tail_mtp_capture) blk: {
              has_captured_hidden = true;
              break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
-@@ -3081,6 +3349,7 @@ pub const Generator = struct {
+@@ -3081,6 +3482,7 @@ pub const Generator = struct {
              has_captured_hidden = true;
              break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
          } else try xfm.forwardWith(&ctx, last_input);
@@ -1458,7 +1615,7 @@ index b026590c..dcca3d6e 100644
          // History entries for the held-back span: (hidden[j], token[j+1]) for
          // j in [final_start, prefix_len) — same pairing as the chunk loop.
          // The last row's pair (hidden[last], t1) is appended by the first
-@@ -3995,7 +4264,11 @@ pub const Generator = struct {
+@@ -3995,7 +4397,11 @@ pub const Generator = struct {
      /// rollback without being counted.
      fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
          self.partial_rounds += 1;
@@ -1471,7 +1628,47 @@ index b026590c..dcca3d6e 100644
              try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
          }
      }
-@@ -5060,10 +5333,17 @@ pub const Generator = struct {
+@@ -4820,6 +5226,13 @@ pub const Generator = struct {
+         /// depth's row is its one-hot. len m_hi; [0..n_qp) valid.
+         q_probs: ?[]mlx.mlx_array,
+         n_qp: u32,
++        /// R64i: per depth, the shortlist's [32] candidate ids and their [1, 32] f32 proposal density (the
++        /// small form of q_probs, read on the host by the CPU acceptance); q_kind 1 = present, 2 = one-hot
++        /// (an argmax depth), 0 = unknown (use q_probs). Allocated with q_probs; [0..n_qs) valid.
++        q_cands: ?[]mlx.mlx_array = null,
++        q_small: ?[]mlx.mlx_array = null,
++        q_kind: ?[]u8 = null,
++        n_qs: u32 = 0,
+         /// Chain hidden after the last built step (owned) — a chunk-B
+         /// extension resumes from it; freed once the chain is complete.
+         h_chain: ?mlx.mlx_array,
+@@ -4842,6 +5255,15 @@ pub const Generator = struct {
+                 for (slots[0..self.n_qp]) |arr| _ = mlx.mlx_array_free(arr);
+                 allocator.free(slots);
+             }
++            if (self.q_small) |slots| {
++                for (slots[0..self.n_qs], self.q_cands.?[0..self.n_qs]) |a, c| {
++                    if (a.ctx != null) _ = mlx.mlx_array_free(a);
++                    if (c.ctx != null) _ = mlx.mlx_array_free(c);
++                }
++                allocator.free(slots);
++                allocator.free(self.q_cands.?);
++                allocator.free(self.q_kind.?);
++            }
+             if (self.h_chain) |h| _ = mlx.mlx_array_free(h);
+             allocator.free(self.drafts);
+         }
+@@ -4873,6 +5295,9 @@ pub const Generator = struct {
+             .n_conf = 0,
+             .q_probs = q_probs,
+             .n_qp = 0,
++            .q_cands = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null,
++            .q_small = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null,
++            .q_kind = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(u8, plan.m_hi) else null,
+             .h_chain = null,
+             .m = plan.m_lo,
+         };
+@@ -5060,10 +5485,17 @@ pub const Generator = struct {
              // Rerank drafts skip the head's own logits projection entirely:
              // the token comes off the coarse readout's re-scored shortlist,
              // greedily (argmax) or sampled from a q over those 32 rows.
@@ -1490,7 +1687,7 @@ index b026590c..dcca3d6e 100644
              );
              const use_rerank = path != .full_logits;
              // `want_logits: bool` could not tell a rerank draft from a history
-@@ -5117,6 +5397,14 @@ pub const Generator = struct {
+@@ -5117,15 +5549,40 @@ pub const Generator = struct {
              defer if (step_out.rerank_x.ctx != null) {
                  _ = mlx.mlx_array_free(step_out.rerank_x);
              };
@@ -1505,10 +1702,25 @@ index b026590c..dcca3d6e 100644
              if (use_rerank and chain.q_probs != null) {
                  const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
                  const slots = chain.q_probs.?;
-@@ -5126,6 +5414,11 @@ pub const Generator = struct {
-                     const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
+                 if (try head.draftShortlist(xfm, rerank_x, draft_sampling.suppress_mask)) |shortlist| {
+                     var sl = shortlist;
+                     defer sl.deinit();
+-                    const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
++                    const draw = self.mtpSamplingDraw(draft_sampling);
++                    var keep_c: mlx.mlx_array = .{ .ctx = null };
++                    var keep_q: mlx.mlx_array = .{ .ctx = null };
++                    const prop = if (chain.q_small != null and !isGreedyTemperature(draw.temperature))
++                        try shortlistProposalKeep(sl, draw, s, &keep_c, &keep_q)
++                    else
++                        try shortlistStepProposal(sl, draw, s);
                      chain.draft_arrs[i] = prop.id;
                      slots[i] = prop.q;
++                    if (chain.q_small) |qs| {
++                        qs[i] = keep_q;
++                        chain.q_cands.?[i] = keep_c;
++                        chain.q_kind.?[i] = if (keep_q.ctx != null) 1 else if (isGreedyTemperature(draw.temperature)) 2 else 0;
++                        chain.n_qs = i + 1;
++                    }
 +                    if (shortconf) {
 +                        chain.conf_arrs.?[i] = try shortlistConfidenceGraph(sl, prop.id, s);
 +                        chain.n_conf = i + 1;
@@ -1517,7 +1729,20 @@ index b026590c..dcca3d6e 100644
                  } else {
                      // The coarse head just retired: propose greedily and hand
                      // the verify the one-hot q that proposal really has.
-@@ -5147,11 +5440,16 @@ pub const Generator = struct {
+@@ -5133,6 +5590,12 @@ pub const Generator = struct {
+                     const prop = try argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
+                     chain.draft_arrs[i] = prop.id;
+                     slots[i] = prop.q;
++                    if (chain.q_small) |qs| {
++                        qs[i] = .{ .ctx = null };
++                        chain.q_cands.?[i] = .{ .ctx = null };
++                        chain.q_kind.?[i] = 2;
++                        chain.n_qs = i + 1;
++                    }
+                 }
+                 chain.n_qp = i + 1;
+             } else if (use_rerank) {
+@@ -5147,11 +5610,16 @@ pub const Generator = struct {
                  chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
              }
              chain.n_drafted = i + 1;
@@ -1536,7 +1761,210 @@ index b026590c..dcca3d6e 100644
                  chain.n_conf = i + 1;
              }
              if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
-@@ -6267,6 +6565,10 @@ pub const Generator = struct {
+@@ -5676,6 +6144,202 @@ pub const Generator = struct {
+         return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
+     }
+ 
++    /// R64 sparse acceptance (SUSHI_R64_SPARSE_ACCEPT=1, stage-head rounds): the exact acceptance graph over
++    /// each verify row's top-20 (the stage head's ids and values, best first) instead of `[1+m, vocab]`.
++    /// The filter is `probsAllPositions`' (temperature, top-k, the f32 nucleus with its exclusive scan,
++    /// a precise softmax), the residual and bonus law `mtpBatchedAcceptGraph`'s: the residual
++    /// max(p - q, 0) lives where p > 0, inside the 20. The categorical draws run over the 20 rather
++    /// than the vocabulary, so samples differ from the dense graph's for a given key; the law does not.
++    fn sparseAcceptGraph(
++        ids3: mlx.mlx_array,
++        vals3: mlx.mlx_array,
++        draft_arrs: []const mlx.mlx_array,
++        q_probs: ?[]const mlx.mlx_array,
++        m: u32,
++        sampling: SamplingParams,
++        s: mlx.mlx_stream,
++    ) !MtpBatchedGraph {
++        const rows: c_int = @intCast(1 + m);
++        const mi: c_int = @intCast(m);
++        const kk: c_int = if (sampling.top_k >= 1 and sampling.top_k < 20) @intCast(sampling.top_k) else 20;
++        const st1 = [_]c_int{ 1, 1, 1 };
++        var ids = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ids);
++        var vals = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(vals);
++        {
++            var a = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(a);
++            try mlx.check(mlx.mlx_slice(&a, ids3, &.{ 0, 0, 0 }, 3, &.{ 1, rows, kk }, 3, &st1, 3, s));
++            try mlx.check(mlx.mlx_reshape(&ids, a, &.{ rows, kk }, 2, s));
++            var b = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(b);
++            try mlx.check(mlx.mlx_slice(&b, vals3, &.{ 0, 0, 0 }, 3, &.{ 1, rows, kk }, 3, &st1, 3, s));
++            try mlx.check(mlx.mlx_reshape(&vals, b, &.{ rows, kk }, 2, s));
++        }
++        var logits = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(logits);
++        if (sampling.temperature != 1.0) {
++            const t = mlx.mlx_array_new_float(sampling.temperature);
++            defer _ = mlx.mlx_array_free(t);
++            try mlx.check(mlx.mlx_divide(&logits, vals, t, s));
++        } else try mlx.check(mlx.mlx_array_set(&logits, vals));
++        if (sampling.top_p < 1.0) {
++            var lf = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(lf);
++            try mlx.check(mlx.mlx_astype(&lf, logits, .float32, s));
++            var pf = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(pf);
++            try mlx.check(mlx.mlx_softmax_axis(&pf, lf, -1, true, s));
++            var above = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(above);
++            try mlx.check(mlx.mlx_cumsum(&above, pf, -1, false, false, s));
++            const thr = mlx.mlx_array_new_float(@max(sampling.top_p, std.math.floatMin(f32)));
++            defer _ = mlx.mlx_array_free(thr);
++            var keep = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(keep);
++            try mlx.check(mlx.mlx_less(&keep, above, thr, s));
++            const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
++            defer _ = mlx.mlx_array_free(ninf);
++            var masked = mlx.mlx_array_new();
++            try mlx.check(mlx.mlx_where(&masked, keep, logits, ninf, s));
++            _ = mlx.mlx_array_free(logits);
++            logits = masked;
++        }
++        var p = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(p);
++        try mlx.check(mlx.mlx_softmax_axis(&p, logits, -1, true, s));
++        const st2 = [_]c_int{ 1, 1 };
++        var p_rows = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(p_rows);
++        try mlx.check(mlx.mlx_slice(&p_rows, p, &.{ 0, 0 }, 2, &.{ mi, kk }, 2, &st2, 2, s));
++        var bonus = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(bonus);
++        try mlx.check(mlx.mlx_slice(&bonus, p, &.{ mi, 0 }, 2, &.{ mi + 1, kk }, 2, &st2, 2, s));
++        var ids_rows = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(ids_rows);
++        try mlx.check(mlx.mlx_slice(&ids_rows, ids, &.{ 0, 0 }, 2, &.{ mi, kk }, 2, &st2, 2, s));
++        var d2 = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(d2);
++        {
++            const vec = mlx.mlx_vector_array_new();
++            defer _ = mlx.mlx_vector_array_free(vec);
++            for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
++            var flat = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(flat);
++            try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
++            var flat32 = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(flat32);
++            try mlx.check(mlx.mlx_astype(&flat32, flat, .int32, s));
++            try mlx.check(mlx.mlx_reshape(&d2, flat32, &.{ mi, 1 }, 2, s));
++        }
++        var eq = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(eq);
++        try mlx.check(mlx.mlx_equal(&eq, ids_rows, d2, s));
++        // proposal densities at the candidate ids [m, kk] and at each draft [m]
++        var q_at = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(q_at);
++        var accept_q: mlx.mlx_array = .{ .ctx = null };
++        errdefer if (accept_q.ctx != null) {
++            _ = mlx.mlx_array_free(accept_q);
++        };
++        if (q_probs) |qs| {
++            const v_at = mlx.mlx_vector_array_new();
++            defer _ = mlx.mlx_vector_array_free(v_at);
++            const v_d = mlx.mlx_vector_array_new();
++            defer _ = mlx.mlx_vector_array_free(v_d);
++            for (qs[0..m], 0..) |q, k| {
++                const kc: c_int = @intCast(k);
++                var row_ids = mlx.mlx_array_new();
++                defer _ = mlx.mlx_array_free(row_ids);
++                try mlx.check(mlx.mlx_slice(&row_ids, ids_rows, &.{ kc, 0 }, 2, &.{ kc + 1, kk }, 2, &st2, 2, s));
++                var q2 = mlx.mlx_array_new();
++                defer _ = mlx.mlx_array_free(q2);
++                const qsh = mlx.getShape(q);
++                try mlx.check(mlx.mlx_reshape(&q2, q, &.{ 1, qsh[qsh.len - 1] }, 2, s));
++                var at = mlx.mlx_array_new();
++                defer _ = mlx.mlx_array_free(at);
++                try mlx.check(mlx.mlx_take_along_axis(&at, q2, row_ids, -1, s));
++                _ = mlx.mlx_vector_array_append_value(v_at, at);
++                var dk = mlx.mlx_array_new();
++                defer _ = mlx.mlx_array_free(dk);
++                try mlx.check(mlx.mlx_slice(&dk, d2, &.{ kc, 0 }, 2, &.{ kc + 1, 1 }, 2, &st2, 2, s));
++                var qd = mlx.mlx_array_new();
++                defer _ = mlx.mlx_array_free(qd);
++                try mlx.check(mlx.mlx_take_along_axis(&qd, q2, dk, -1, s));
++                _ = mlx.mlx_vector_array_append_value(v_d, qd);
++            }
++            try mlx.check(mlx.mlx_concatenate_axis(&q_at, v_at, 0, s));
++            var qd_all = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(qd_all);
++            try mlx.check(mlx.mlx_concatenate_axis(&qd_all, v_d, 0, s));
++            var qd_flat = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(qd_flat);
++            try mlx.check(mlx.mlx_reshape(&qd_flat, qd_all, &.{mi}, 1, s));
++            accept_q = mlx.mlx_array_new();
++            try mlx.check(mlx.mlx_astype(&accept_q, qd_flat, .float32, s));
++        } else {
++            try mlx.check(mlx.mlx_astype(&q_at, eq, mlx.mlx_array_dtype(p), s));
++        }
++        var corr_samples = mlx.mlx_array_new();
++        errdefer _ = mlx.mlx_array_free(corr_samples);
++        {
++            var diff = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(diff);
++            try mlx.check(mlx.mlx_subtract(&diff, p_rows, q_at, s));
++            const zero = mlx.mlx_array_new_float(0.0);
++            defer _ = mlx.mlx_array_free(zero);
++            var residual = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(residual);
++            try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
++            var stack = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(stack);
++            {
++                const vec = mlx.mlx_vector_array_new();
++                defer _ = mlx.mlx_vector_array_free(vec);
++                _ = mlx.mlx_vector_array_append_value(vec, residual);
++                _ = mlx.mlx_vector_array_append_value(vec, bonus);
++                try mlx.check(mlx.mlx_concatenate_axis(&stack, vec, 0, s));
++            }
++            var log_stack = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(log_stack);
++            try mlx.check(mlx.mlx_log(&log_stack, stack, s));
++            const key = seedKey(sampling);
++            defer _ = mlx.mlx_array_free(key);
++            var idx = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(idx);
++            try mlx.check(mlx.mlx_random_categorical(&idx, log_stack, -1, key, s));
++            var idx2 = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(idx2);
++            var idx32 = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(idx32);
++            try mlx.check(mlx.mlx_astype(&idx32, idx, .int32, s));
++            try mlx.check(mlx.mlx_reshape(&idx2, idx32, &.{ rows, 1 }, 2, s));
++            var picked = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(picked);
++            try mlx.check(mlx.mlx_take_along_axis(&picked, ids, idx2, -1, s));
++            var flat = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(flat);
++            try mlx.check(mlx.mlx_reshape(&flat, picked, &.{rows}, 1, s));
++            try mlx.check(mlx.mlx_astype(&corr_samples, flat, .int32, s));
++        }
++        var accept_p = mlx.mlx_array_new();
++        errdefer _ = mlx.mlx_array_free(accept_p);
++        {
++            var eqf = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(eqf);
++            try mlx.check(mlx.mlx_astype(&eqf, eq, mlx.mlx_array_dtype(p_rows), s));
++            var prod = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(prod);
++            try mlx.check(mlx.mlx_multiply(&prod, p_rows, eqf, s));
++            var sum = mlx.mlx_array_new();
++            defer _ = mlx.mlx_array_free(sum);
++            try mlx.check(mlx.mlx_sum_axis(&sum, prod, -1, false, s));
++            try mlx.check(mlx.mlx_astype(&accept_p, sum, .float32, s));
++        }
++        return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
++    }
++
+     pub fn mtpBatchedTypicalGraph(
+         probs_all: mlx.mlx_array,
+         draft_arrs: []const mlx.mlx_array,
+@@ -6267,6 +6931,10 @@ pub const Generator = struct {
      pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState, open: MtpRoundOpen };
  
      pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -1547,18 +1975,240 @@ index b026590c..dcca3d6e 100644
          var st = switch (try self.mtpRoundBegin(allocator)) {
              .done => |r| return r,
              .verify => |v| v,
-@@ -6592,6 +6894,10 @@ pub const Generator = struct {
+@@ -6590,8 +7258,20 @@ pub const Generator = struct {
+         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
+         // 4 evaluates anything. Other arches never set `ple_pending`.
          self.ctx.ple_defer = true;
++        @import("qwen4_exp.zig").verify_t0_ns = @import("qwen4_exp.zig").nowBootNs();
          self.ctx.verify_rows = xfm.config.isMimo();
          defer self.ctx.verify_rows = false;
 +        // R64: the verify's hidden captures ride the round's batched eval (Phase 4b) instead of two
 +        // blocking settles right after the forward (SUSHI_R64_VERIFY_NOSETTLE=1).
 +        self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
 +        defer self.ctx.capture_settle = true;
++        // R64 stage head (SUSHI_R64_STAGE_HEAD=1): the 5090 runs the mixer, the lm_head and a top-20; the verify
++        // logits are that top-20 (-inf elsewhere). Exact for a sampler that reads at most the top 20 (top-k
++        // first, no penalties or think shifts); a suppressed id in the top 20 falls back to the Mac's head.
++        self.ctx.stage_head = self.ctx.stage_split and r64EnvOn(&r64_stage_head_env, "SUSHI_R64_STAGE_HEAD") and
++            !penaltyActive(self.sampling) and !self.sampling.think_penalty.active() and self.sampling.call_force == null and
++            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20));
++        defer self.ctx.stage_head = false;
          var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
              self.ctx.ple_defer = false;
              self.ctx.capture_ssm_seq = false;
-@@ -9390,6 +9696,10 @@ pub const Generator = struct {
+@@ -6890,6 +7570,7 @@ pub const Generator = struct {
+         // The group already built and dispatched this row's Phase 4 with the rest
+         // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
+         const prepared = stochastic and st.accept_p.ctx != null;
++        var cpu_acc = false;
+         if (prepared) {
+             _ = mlx.mlx_array_free(accept_p_vec);
+             accept_p_vec = st.accept_p;
+@@ -6905,9 +7586,26 @@ pub const Generator = struct {
+             var live_logits = mlx.mlx_array_new();
+             defer _ = mlx.mlx_array_free(live_logits);
+             try mlx.check(mlx.mlx_slice(&live_logits, verify_logits, &.{ 0, 0, 0 }, 3, &.{ vl_shape[0], @intCast(1 + m), vl_shape[2] }, 3, &.{ 1, 1, 1 }, 3, s));
+-            const probs_all = try probsAllPositions(live_logits, self.sampling, s);
++            // R64: a stage-head round's top-20 rows feed the sparse acceptance (SUSHI_R64_SPARSE_ACCEPT=1).
++            const sparse = r64EnvOn(&r64_sparse_env, "SUSHI_R64_SPARSE_ACCEPT") and self.ctx.stage_head_ids.ctx != null and
++                !chain.lookup and self.acceptGraphFor(chain.lookup) == mtpBatchedExactGraph and
++                mlx.getShape(self.ctx.stage_head_ids)[1] == @as(c_int, @intCast(1 + m));
++            cpu_acc = sparse and r64CpuAccept();
++            if (!cpu_acc) {
++            const probs_all = if (sparse) mlx.mlx_array_new() else try probsAllPositions(live_logits, self.sampling, s);
+             defer _ = mlx.mlx_array_free(probs_all);
+-            const bg = try self.acceptGraphFor(chain.lookup)(
++            const bg = if (sparse) blk: {
++                r64_sparse_rounds += 1;
++                break :blk try sparseAcceptGraph(
++                    self.ctx.stage_head_ids,
++                    self.ctx.stage_head_vals,
++                    draft_arrs[0..m],
++                    if (q_probs) |qs| qs[0..m] else null,
++                    m,
++                    self.mtpSamplingDraw(self.sampling),
++                    s,
++                );
++            } else try self.acceptGraphFor(chain.lookup)(
+                 probs_all,
+                 draft_arrs[0..m],
+                 if (q_probs) |qs| qs[0..m] else null,
+@@ -6921,6 +7619,7 @@ pub const Generator = struct {
+             accept_p_vec = bg.accept_p;
+             accept_q_vec = bg.accept_q;
+             accept_defer_vec = bg.accept_defer;
++            }
+         }
+ 
+         const group_argmax = st.verify_argmax.present();
+@@ -6939,21 +7638,27 @@ pub const Generator = struct {
+ 
+         // ── Phase 4b: one batched async eval for the whole round ──
+         // A prepared row rode the group's eval; everything here is already on it.
++        // R64h (SUSHI_R64_DEFER_CAPTURES=1; 2 = alternate per 32-round trace window): leave the verify's hidden
++        // captures (next round's MTP input) out of this batch, so the acceptance values the host waits on
++        // are not queued behind them; they start right after the accepted count is known. Same values.
++        const defer_caps = !prepared and r64DeferCaptures();
+         const dispatch_lap = SubLap.start(tracing, self.timer.io);
+         if (!prepared) {
+             const eval_vec = mlx.mlx_vector_array_new();
+             defer _ = mlx.mlx_vector_array_free(eval_vec);
+             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+-            if (stochastic) {
++            if (stochastic and !cpu_acc) {
+                 _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
+                 if (accept_q_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
+                 if (accept_defer_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_defer_vec);
+                 _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
+-            } else {
++            } else if (!stochastic) {
+                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
+             }
+-            _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
+-            _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
++            if (!defer_caps) {
++                _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
++                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
++            }
+             try mlx.check(mlx.mlx_async_eval(eval_vec));
+         }
+         dispatch_lap.stop(&self.mtp_trace, .dispatch);
+@@ -6973,7 +7678,63 @@ pub const Generator = struct {
+ 
+         var accepted: u32 = 0;
+         var greedy_next_pending: u32 = 0;
+-        if (stochastic) {
++        // R64i host acceptance state (rows <= 17, top-20 each)
++        var ca_p: [17][20]f32 = undefined;
++        var ca_kk: usize = 20;
++        var ca_ids: [*]const i32 = undefined;
++        if (stochastic and cpu_acc) {
++            r64_cpuacc_n += 1;
++            const rows: usize = 1 + m;
++            ca_kk = if (self.sampling.top_k >= 1 and self.sampling.top_k < 20) self.sampling.top_k else 20;
++            ca_ids = mlx.mlx_array_data_int32(self.ctx.stage_head_ids) orelse return error.MlxArrayDataNull;
++            const vals_h = mlx.mlx_array_data_bfloat16(self.ctx.stage_head_vals) orelse return error.MlxArrayDataNull;
++            for (0..rows) |r| {
++                const lg = ca_p[r][0..ca_kk];
++                for (lg, 0..) |*x, j| {
++                    x.* = r64Bf16(vals_h[r * 20 + j]);
++                    if (self.sampling.temperature != 1.0) x.* /= self.sampling.temperature;
++                }
++                if (self.sampling.top_p < 1.0) {
++                    var pf: [20]f32 = undefined;
++                    @memcpy(pf[0..ca_kk], lg);
++                    r64Softmax(pf[0..ca_kk]);
++                    const thr = @max(self.sampling.top_p, std.math.floatMin(f32));
++                    var above: f32 = 0;
++                    for (lg, 0..) |*x, j| {
++                        if (!(above < thr)) x.* = -std.math.inf(f32);
++                        above += pf[j];
++                    }
++                }
++                r64Softmax(lg);
++            }
++            var acc_p: [16]f32 = undefined;
++            var acc_q: [16]f32 = undefined;
++            // one eval for every depth's small q (already computed with the drafts; skips per-array evals)
++            if (chain.q_small) |small| {
++                const ev = mlx.mlx_vector_array_new();
++                defer _ = mlx.mlx_vector_array_free(ev);
++                for (0..@min(m, chain.n_qs)) |k| if (chain.q_kind.?[k] == 1) {
++                    _ = mlx.mlx_vector_array_append_value(ev, small[k]);
++                    _ = mlx.mlx_vector_array_append_value(ev, chain.q_cands.?[k]);
++                };
++                if (mlx.mlx_vector_array_size(ev) > 0) try mlx.check(mlx.mlx_eval(ev));
++            }
++            for (0..m) |k| {
++                acc_p[k] = 0;
++                for (0..ca_kk) |j| {
++                    if (ca_ids[k * 20 + j] == @as(i32, @intCast(drafts[k]))) acc_p[k] = ca_p[k][j];
++                }
++                if (q_probs) |qs| {
++                    acc_q[k] = try r64HostQ(chain, qs, k, drafts[k]);
++                }
++            }
++            accepted = self.acceptPrefixFor(chain.lookup)(acc_p[0..m], if (q_probs != null) acc_q[0..m] else null, null, &self.prng);
++            accepted = capAcceptedForTokenBudget(
++                accepted,
++                self.completion_tokens,
++                self.max_tokens,
++            );
++        } else if (stochastic) {
+             // Sharp drafts: full Leviathan ratio min(1, p/q) against the
+             // proposal's own density. Greedy-forced drafts keep the exact
+             // one-hot rule min(1, target_p).
+@@ -7012,7 +7773,38 @@ pub const Generator = struct {
+         accepted = stop_prefix.accepted;
+         const next_pending: u32 = blk: {
+             if (stop_prefix.stop) |stop| break :blk stop;
+-            if (stochastic) {
++            if (stochastic and cpu_acc) {
++                // residual max(p - q, 0) at a rejected draft, p itself on the bonus row; within the top-20
++                const a: usize = accepted;
++                var w: [20]f32 = undefined;
++                var tot: f32 = 0;
++                for (0..ca_kk) |j| {
++                    const id = ca_ids[a * 20 + j];
++                    var qv: f32 = 0;
++                    if (a < m) {
++                        qv = if (q_probs) |qs| try r64HostQ(chain, qs, a, @intCast(id)) else if (id == @as(i32, @intCast(drafts[a]))) 1 else 0;
++                    }
++                    w[j] = @max(ca_p[a][j] - qv, 0);
++                    tot += w[j];
++                }
++                if (!(tot > 0)) {
++                    tot = 0;
++                    for (0..ca_kk) |j| {
++                        w[j] = ca_p[a][j];
++                        tot += w[j];
++                    }
++                }
++                const u = self.prng.random().float(f32) * tot;
++                var acc: f32 = 0;
++                var pick: usize = 0;
++                for (0..ca_kk) |j| {
++                    if (w[j] <= 0) continue;
++                    pick = j;
++                    acc += w[j];
++                    if (u < acc) break;
++                }
++                break :blk @intCast(ca_ids[a * 20 + pick]);
++            } else if (stochastic) {
+                 try mlx.check(mlx.mlx_array_eval(corr_batch));
+                 const d = mlx.mlx_array_data_int32(corr_batch) orelse {
+                     return error.MlxArrayDataNull;
+@@ -7023,6 +7815,13 @@ pub const Generator = struct {
+             }
+         };
+ 
++        if (defer_caps) {
++            const cv = mlx.mlx_vector_array_new();
++            defer _ = mlx.mlx_vector_array_free(cv);
++            _ = mlx.mlx_vector_array_append_value(cv, new_hidden);
++            _ = mlx.mlx_vector_array_append_value(cv, verify_hidden_all);
++            try mlx.check(mlx.mlx_async_eval(cv));
++        }
+         if (tracing) {
+             self.mtp_trace.add(.eval, ph.read());
+             ph.reset();
+@@ -9371,6 +10170,15 @@ pub const Generator = struct {
+                 t.subAvgMs(.chain),
+             },
+         );
++        if (qwen4_forward.r64_head_used + qwen4_forward.r64_head_fallback > 0) log.info("  [r64-head] used {d} fallback {d} sparse {d}\n", .{ qwen4_forward.r64_head_used, qwen4_forward.r64_head_fallback, r64_sparse_rounds });
++        if (r64_defcap_mode orelse 0 != 0) log.info("  [r64-defcap] window defer={d}\n", .{r64_defcap_window_mode});
++        if (r64_cpuacc_mode orelse 0 != 0) log.info("  [r64-cpuacc] window cpu={d} (host-accepted rounds {d})\n", .{ r64_cpuacc_window, r64_cpuacc_n });
++        {
++            const q4 = @import("qwen4_exp.zig");
++            if (q4.ple_h_n > 0 and q4.ple_p_n > 0) log.info("  [r64-ple-ab] pool {d}: mean {d:.3} ms, max {d:.2}, >1 ms {d} | lean-or-hybrid {d}: mean {d:.3} ms, max {d:.2}, >1 ms {d}, resident {d}/{d}\n", .{ q4.ple_p_n, @as(f64, @floatFromInt(q4.ple_p_ns)) / @as(f64, @floatFromInt(q4.ple_p_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_p_max_ns)) / 1e6, q4.ple_p_over1, q4.ple_h_n, @as(f64, @floatFromInt(q4.ple_h_ns)) / @as(f64, @floatFromInt(q4.ple_h_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_h_max_ns)) / 1e6, q4.ple_h_over1, q4.ple_res_resident, q4.ple_res_rows });
++            if (q4.ple_fl_n > 0) log.info("  [r64-ple-flush] {d} flushes: start {d:.3} ms into the verify, ids wait {d:.3} ms\n", .{ q4.ple_fl_n, @as(f64, @floatFromInt(q4.ple_fl_at_ns)) / @as(f64, @floatFromInt(q4.ple_fl_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_fl_wait_ns)) / @as(f64, @floatFromInt(q4.ple_fl_n)) / 1e6 });
++            if (q4.ple_g_n > 0) log.info("  [r64-ple] decode gathers {d}: mean {d:.3} ms, max {d:.2} ms, >1 ms {d}, >5 ms {d}; keep-alive reads {d}; resident {d}/{d}\n", .{ q4.ple_g_n, @as(f64, @floatFromInt(q4.ple_g_ns)) / @as(f64, @floatFromInt(q4.ple_g_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_g_max_ns)) / 1e6, q4.ple_g_over1, q4.ple_g_over5, q4.ple_keepalive_reads.load(.monotonic), q4.ple_res_resident, q4.ple_res_rows });
++        }
+         t.reset();
+     }
+ 
+@@ -9390,6 +10198,10 @@ pub const Generator = struct {
      pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
          var tick_prof = TickProf.begin();
          defer tick_prof.finish();
@@ -1569,7 +2219,7 @@ index b026590c..dcca3d6e 100644
          if (self.done) return null;
          if (self.sampling.constraint != null) return self.nextConstrained(allocator);
  
-@@ -10142,6 +10452,59 @@ fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx
+@@ -10142,6 +10954,59 @@ fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx
  /// = log p_head(draft). Two vocab reductions on the head's own (draft-head)
  /// logits — must be built BEFORE the caller frees the logits handle (lazy
  /// graphs hold their inputs internally). Returns a `[1]`-shaped lazy array.
@@ -1629,6 +2279,49 @@ index b026590c..dcca3d6e 100644
  fn draftConfidenceGraph(logits: mlx.mlx_array, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
      var lse = mlx.mlx_array_new();
      defer _ = mlx.mlx_array_free(lse);
+@@ -10433,6 +11298,42 @@ fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx
+     return .{ .id = id, .q = q };
+ }
+ 
++/// `shortlistProposal` that also hands out references to the shortlist's [32] candidate ids and the [1, 32]
++/// f32 density the draft was drawn from (R64i: the host acceptance reads q from them; both are computed
++/// with the draft id, so reading them adds no GPU work). Same graph, same draw.
++fn shortlistProposalKeep(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream, cands_out: *mlx.mlx_array, q32_out: *mlx.mlx_array) !StepProposal {
++    const shape = mlx.getShape(sl.exact);
++    const n = shape[shape.len - 1];
++    var rows = mlx.mlx_array_new();
++    {
++        var flat = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(flat);
++        const row_shape = [_]c_int{ 1, n };
++        try mlx.check(mlx.mlx_reshape(&flat, sl.exact, &row_shape, 2, s));
++        errdefer _ = mlx.mlx_array_free(rows);
++        try mlx.check(mlx.mlx_astype(&rows, flat, .float32, s));
++    }
++    var draft = sampling;
++    draft.suppress_mask = null;
++    const q32 = try filteredProbsRows(rows, draft, s);
++    errdefer _ = mlx.mlx_array_free(q32);
++    var id = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(id);
++    {
++        const pick = try sampleFromProbsLazy(q32, sampling, s);
++        defer _ = mlx.mlx_array_free(pick);
++        var picked = mlx.mlx_array_new();
++        defer _ = mlx.mlx_array_free(picked);
++        try mlx.check(mlx.mlx_take_axis(&picked, sl.cands, pick, 0, s));
++        try mlx.check(mlx.mlx_astype(&id, picked, .int32, s));
++    }
++    const q = try scatterShortlistQ(sl, q32, s);
++    cands_out.* = mlx.mlx_array_new();
++    _ = mlx.mlx_array_set(cands_out, sl.cands);
++    q32_out.* = q32;
++    return .{ .id = id, .q = q };
++}
++
+ /// An argmax depth of a chain that carries densities (consumes `amax`): the
+ /// id reshaped to the `[1]` a sampled depth drafts, since the verify
+ /// concatenates a chain's ids, and its one-hot q.
 diff --git a/src/kld.zig b/src/kld.zig
 index 1fd85276..765954cf 100644
 --- a/src/kld.zig
@@ -1895,11 +2588,327 @@ index 3595ba4d..10639ac7 100644
              for (out[0..built]) |*sl| sl.deinit();
              return false;
          };
+diff --git a/src/qwen4_exp.zig b/src/qwen4_exp.zig
+index 30cfaeb6..5fb9fc92 100644
+--- a/src/qwen4_exp.zig
++++ b/src/qwen4_exp.zig
+@@ -202,6 +202,136 @@ fn asGb(bytes: u64) f64 {
+     return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
+ }
+ 
++// R64f: decode PLE gather timing (always on: two clock reads per gather; printed with the MTP trace) and an SSD
++// keep-alive (SUSHI_R64_SSD_KEEPALIVE_MS=<ms>, default 0 = off) for a table read by row from SSD (past its
++// residency cap). While generation is active (a gather within the last 2 s), one 4 KiB uncached pread every
++// <ms> keeps the drive out of its idle state, so a round whose rows miss the page cache does not also pay a
++// wake-up. (Reported for this model on a DGX Spark: GB10 drives sleep after ~100 ms; cold rows 1.1-9.5 ms.)
++pub var ple_active_until_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
++pub var ple_keepalive_reads: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
++pub var ple_g_n: u64 = 0;
++pub var ple_g_ns: u64 = 0;
++pub var ple_g_max_ns: u64 = 0;
++pub var ple_g_over1: u64 = 0;
++pub var ple_g_over5: u64 = 0;
++
++var ple_walk_env: ?bool = null;
++fn pleWalkSmall() bool {
++    if (ple_walk_env == null) ple_walk_env = if (std.c.getenv("SUSHI_R64_PLE_WALK")) |v| v[0] == '1' else false;
++    return ple_walk_env.?;
++}
++var ple_hybrid_mode: ?u8 = null;
++var ple_alt: u64 = 0;
++pub var ple_last_hybrid: bool = false;
++/// SUSHI_R64_PLE_HYBRID: 1 = every decode gather hybrid; 2 = alternate pool / hybrid gather by gather (an
++/// in-process A/B: same content and page-cache state; separate stats per method in `[r64-ple]`).
++fn pleHybridNow() bool {
++    if (ple_hybrid_mode == null) ple_hybrid_mode = if (std.c.getenv("SUSHI_R64_PLE_HYBRID")) |v| v[0] -% '0' else 0;
++    return switch (ple_hybrid_mode.?) {
++        1 => true,
++        2 => blk: {
++            ple_alt +%= 1;
++            break :blk ple_alt & 1 == 1;
++        },
++        else => false,
++    };
++}
++pub var ple_h_n: u64 = 0;
++pub var ple_h_ns: u64 = 0;
++pub var ple_h_max_ns: u64 = 0;
++pub var ple_h_over1: u64 = 0;
++pub var ple_p_n: u64 = 0;
++pub var ple_p_ns: u64 = 0;
++pub var ple_p_max_ns: u64 = 0;
++pub var ple_p_over1: u64 = 0;
++var ple_res_env: ?bool = null;
++pub var ple_res_rows: u64 = 0;
++pub var ple_res_resident: u64 = 0;
++/// Diagnostic (SUSHI_R64_PLE_RESIDENCY=1): count how many of a decode gather's rows sit in resident pages.
++pub fn notePleResidency(table: *const NgramTable, row_ids: []const i64) void {
++    if (ple_res_env == null) ple_res_env = if (std.c.getenv("SUSHI_R64_PLE_RESIDENCY")) |v| v[0] == '1' else false;
++    if (!ple_res_env.? or row_ids.len > 256 or table.map.len == 0) return;
++    const page = std.heap.pageSize();
++    const need = table.rowBytes();
++    for (row_ids) |r| {
++        const off = table.w_off + @as(usize, @intCast(r)) * need;
++        const start = off & ~(page - 1);
++        var vec: [2]u8 = .{ 0, 0 };
++        const len = ((off + need + page - 1) & ~(page - 1)) - start;
++        if (std.c.mincore(@ptrCast(@alignCast(@constCast(table.map.ptr + start))), len, @ptrCast(&vec)) != 0) continue;
++        ple_res_rows += 1;
++        if (vec[0] & 1 != 0 and (len <= page or vec[1] & 1 != 0)) ple_res_resident += 1;
++    }
++}
++
++// R64g timeline: verify start (set by the generator), when the deferred-PLE flush starts, and how long its
++// ids sync waits for the draft chain.
++pub var verify_t0_ns: u64 = 0;
++pub var ple_fl_n: u64 = 0;
++pub var ple_fl_at_ns: u64 = 0;
++pub var ple_fl_wait_ns: u64 = 0;
++pub fn notePleFlush(start: u64, wait: u64) void {
++    if (verify_t0_ns == 0 or start < verify_t0_ns) return;
++    ple_fl_n += 1;
++    ple_fl_at_ns += start - verify_t0_ns;
++    ple_fl_wait_ns += wait;
++}
++
++pub fn nowBootNs() u64 {
++    const io = std.Io.Threaded.global_single_threaded.io();
++    return @intCast(std.Io.Timestamp.now(io, .boot).nanoseconds);
++}
++
++/// One decode/verify-sized gather took `dt` ns; generation counts as active for the next 2 s.
++pub fn notePleGather(dt: u64, rows: usize) void {
++    ple_active_until_ns.store(nowBootNs() + 2_000_000_000, .release);
++    if (rows > 256) return;
++    if (ple_last_hybrid) {
++        ple_h_n += 1;
++        ple_h_ns += dt;
++        if (dt > ple_h_max_ns) ple_h_max_ns = dt;
++        if (dt > 1_000_000) ple_h_over1 += 1;
++    } else {
++        ple_p_n += 1;
++        ple_p_ns += dt;
++        if (dt > ple_p_max_ns) ple_p_max_ns = dt;
++        if (dt > 1_000_000) ple_p_over1 += 1;
++    }
++    ple_g_n += 1;
++    ple_g_ns += dt;
++    if (dt > ple_g_max_ns) ple_g_max_ns = dt;
++    if (dt > 1_000_000) ple_g_over1 += 1;
++    if (dt > 5_000_000) ple_g_over5 += 1;
++}
++
++fn ssdKeepaliveMain(fd: std.c.fd_t, size: u64, interval_ns: u64) void {
++    var buf: [4096]u8 align(4096) = undefined;
++    var off: u64 = 0;
++    // a ~1 GiB stride walks the whole file, so most reads miss the page cache and reach the drive
++    const stride: u64 = (1 << 30) + 4096 * 7919;
++    var ts: std.c.timespec = .{ .sec = @intCast(interval_ns / 1_000_000_000), .nsec = @intCast(interval_ns % 1_000_000_000) };
++    while (true) {
++        _ = std.c.nanosleep(&ts, null);
++        if (nowBootNs() > ple_active_until_ns.load(.acquire)) continue;
++        off = ((off + stride) % (size - 8192)) & ~@as(u64, 4095);
++        _ = std.c.pread(fd, &buf, buf.len, @intCast(off));
++        _ = ple_keepalive_reads.fetchAdd(1, .monotonic);
++    }
++}
++
++fn startSsdKeepalive(fd: std.c.fd_t, size: u64) void {
++    const ms: u64 = if (std.c.getenv("SUSHI_R64_SSD_KEEPALIVE_MS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0 else 0;
++    if (ms == 0 or fd < 0 or size < (1 << 31)) return;
++    var path: [1024]u8 = undefined;
++    if (std.c.fcntl(fd, std.c.F.GETPATH, &path) != 0) return;
++    const kfd = std.c.open(@ptrCast(&path), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
++    if (kfd < 0) return;
++    _ = std.c.fcntl(kfd, std.c.F.NOCACHE, @as(c_int, 1));
++    const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, ssdKeepaliveMain, .{ kfd, size, ms * 1_000_000 }) catch return;
++    t.detach();
++    log.info("[qwen4] SSD keep-alive: one 4 KiB uncached read every {d} ms while generating\n", .{ms});
++}
++
+ pub const NgramTable = struct {
+     map: []align(std.heap.page_size_min) const u8,
+     rows: u64,
+@@ -518,6 +648,7 @@ pub const NgramTable = struct {
+         }
+         if (self.pastResidencyCap()) {
+             log.info("[qwen4] ngram table warm: skipped, {d:.1} GB exceeds the {d:.1} GB residency cap; prefill reads requested rows\n", .{ asGb(self.map.len), asGb(ngramCacheLimit()) });
++            startSsdKeepalive(self.fd, self.map.len);
+             return;
+         }
+         self.warm_stop.store(false, .release);
+@@ -579,7 +710,7 @@ pub const NgramTable = struct {
+     }
+ 
+     /// Bytes one row occupies across the table's regions.
+-    fn rowBytes(self: *const NgramTable) usize {
++    pub fn rowBytes(self: *const NgramTable) usize {
+         return if (self.bits == 16) self.dim * 2 else self.wcols * 4 + self.scols * 4;
+     }
+ 
+@@ -622,7 +753,10 @@ pub const NgramTable = struct {
+         const prefer_pool = oversized_bf16 or self.prefer_pool;
+         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
+         // Announce the arm that actually runs, not the lever that permits it.
+-        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
++        // R64g: SUSHI_R64_PLE_WALK=1 copies decode-sized gathers (<= 256 rows) straight from the mapping on the
++        // calling thread instead of waking the 48-thread pool twice (same bytes; a miss faults its page in).
++        const walk_small = row_ids.len <= 256 and pleWalkSmall();
++        const pooled = wide_ok and !walk_small and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
+         const whole_chunk = wide and oversized_bf16 and self.bits == 16;
+         if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
+         if (pooled and whole_chunk) {
+@@ -657,7 +791,53 @@ pub const NgramTable = struct {
+         const oversized = self.map.len > ngramCacheLimit();
+         const prefer_pool = oversized or self.prefer_pool;
+         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
+-        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
++        // R64g: SUSHI_R64_PLE_WALK=1 copies decode-sized gathers (<= 256 rows) straight from the mapping on the
++        // calling thread instead of waking the 48-thread pool twice (same bytes; a miss faults its page in).
++        const walk_small = row_ids.len <= 256 and pleWalkSmall();
++        const pooled = wide_ok and !walk_small and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
++        // R64g: SUSHI_R64_PLE_HYBRID=1: decode-sized gathers ask the kernel which rows' pages are resident
++        // (mincore), copy those from the mapping at once, start the kernel's reads of the rest with
++        // MADV_WILLNEED, then copy them (their faults wait on reads already in flight, in parallel). No pool,
++        // no thread wake-ups; every row gets the same bytes as the pooled pread.
++        ple_last_hybrid = false;
++        // R64g: SUSHI_R64_PLE_LEAN=1 (2 = alternate with the 48-thread pool): decode-sized gathers go to an
++        // 8-thread pool woken by one futex call; workers and the caller pull rows from an atomic counter and
++        // pread them, one dispatch per gather. Same bytes per row as the old pool.
++        if (row_ids.len <= 256 and pleLeanNow() and self.fd >= 0 and need <= PrefetchPool.ROW_BUF) {
++            if (leanPool()) |lp| {
++                ple_last_hybrid = true;
++                if (lp.run(self, row_ids, out)) return;
++                ple_last_hybrid = false;
++            }
++        }
++        if (row_ids.len <= 256 and pleHybridNow() and self.map.len > 0) {
++            ple_last_hybrid = true;
++            const page = std.heap.pageSize();
++            var miss: [256]u16 = undefined;
++            var nm: usize = 0;
++            for (row_ids, 0..) |r, i| {
++                const off = self.w_off + @as(usize, @intCast(r)) * need;
++                const start = off & ~(page - 1);
++                const len = ((off + need + page - 1) & ~(page - 1)) - start;
++                const addr: *align(std.heap.page_size_min) anyopaque = @ptrCast(@alignCast(@constCast(self.map.ptr + start)));
++                var vec: [2]u8 = .{ 0, 0 };
++                const resident = std.c.mincore(addr, len, @ptrCast(&vec)) == 0 and vec[0] & 1 != 0 and (len <= page or vec[1] & 1 != 0);
++                if (resident) {
++                    copyBf16Words(self.map[off..][0..need], out[i * self.dim ..][0..self.dim]);
++                } else {
++                    _ = std.c.madvise(addr, len, std.c.MADV.WILLNEED);
++                    miss[nm] = @intCast(i);
++                    nm += 1;
++                }
++            }
++            for (miss[0..nm]) |mi| {
++                const off = self.w_off + @as(usize, @intCast(row_ids[mi])) * need;
++                copyBf16Words(self.map[off..][0..need], out[@as(usize, mi) * self.dim ..][0..self.dim]);
++            }
++            ple_res_rows += row_ids.len;
++            ple_res_resident += row_ids.len - nm;
++            return;
++        }
+         const whole_chunk = wide and oversized;
+         if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
+         if (pooled and whole_chunk) {
+@@ -702,6 +882,90 @@ pub const NgramTable = struct {
+ };
+ 
+ /// The caller owns each job's table, rows and output until all workers finish.
++var ple_lean_mode: ?u8 = null;
++var ple_lean_alt: u64 = 0;
++fn pleLeanNow() bool {
++    if (ple_lean_mode == null) ple_lean_mode = if (std.c.getenv("SUSHI_R64_PLE_LEAN")) |v| v[0] -% '0' else 0;
++    return switch (ple_lean_mode.?) {
++        1 => true,
++        2 => blk: {
++            ple_lean_alt +%= 1;
++            break :blk ple_lean_alt & 1 == 1;
++        },
++        else => false,
++    };
++}
++var lean_pool: ?*LeanPool = null;
++var lean_pool_failed = false;
++fn leanPool() ?*LeanPool {
++    if (lean_pool == null and !lean_pool_failed) lean_pool = LeanPool.create() catch blk: {
++        lean_pool_failed = true;
++        break :blk null;
++    };
++    return lean_pool;
++}
++
++const LeanPool = struct {
++    const N = 8;
++    gen: u32 = 0,
++    next: std.atomic.Value(u32) = .init(0),
++    pending: std.atomic.Value(u32) = .init(0),
++    failed: std.atomic.Value(u32) = .init(0),
++    table: ?*const NgramTable = null,
++    rows: []const i64 = &.{},
++    out: []u16 = &.{},
++
++    fn create() !*LeanPool {
++        const p = try std.heap.page_allocator.create(LeanPool);
++        p.* = .{};
++        for (0..N) |_| {
++            const t = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{p});
++            t.detach();
++        }
++        return p;
++    }
++
++    fn work(self: *LeanPool) void {
++        const table = self.table.?;
++        const need = table.dim * 2;
++        var buf: [PrefetchPool.ROW_BUF]u8 = undefined;
++        while (true) {
++            const i = self.next.fetchAdd(1, .acq_rel);
++            if (i >= self.rows.len) return;
++            if (table.preadSite(@intCast(self.rows[i]), 0, &buf)) {
++                NgramTable.copyBf16Words(buf[0..need], self.out[@as(usize, i) * table.dim ..][0..table.dim]);
++            } else _ = self.failed.fetchAdd(1, .release);
++        }
++    }
++
++    fn worker(self: *LeanPool) void {
++        const io = std.Io.Threaded.global_single_threaded.io();
++        var seen: u32 = 0;
++        while (true) {
++            while (@atomicLoad(u32, &self.gen, .acquire) == seen) io.futexWaitUncancelable(u32, &self.gen, seen);
++            seen = @atomicLoad(u32, &self.gen, .acquire);
++            self.work();
++            _ = self.pending.fetchSub(1, .acq_rel);
++        }
++    }
++
++    /// Reads every row of `rows` into `out` (bf16 words, row-major); false if a pread failed.
++    fn run(self: *LeanPool, table: *const NgramTable, rows: []const i64, out: []u16) bool {
++        const io = std.Io.Threaded.global_single_threaded.io();
++        self.table = table;
++        self.rows = rows;
++        self.out = out;
++        self.next.store(0, .release);
++        self.failed.store(0, .release);
++        self.pending.store(N, .release);
++        _ = @atomicRmw(u32, &self.gen, .Add, 1, .release);
++        io.futexWake(u32, &self.gen, N);
++        self.work();
++        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
++        return self.failed.load(.acquire) == 0;
++    }
++};
++
+ const PrefetchPool = struct {
+     const N = 48;
+     const MAX_ROWS = 64;
 diff --git a/src/qwen4_forward.zig b/src/qwen4_forward.zig
-index 3ab27c9f..b80fa28d 100644
+index 3ab27c9f..86b1bb6c 100644
 --- a/src/qwen4_forward.zig
 +++ b/src/qwen4_forward.zig
-@@ -1,6 +1,227 @@
+@@ -1,6 +1,285 @@
  //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
  
  const trf = @import("transformer.zig");
@@ -1921,6 +2930,64 @@ index 3ab27c9f..b80fa28d 100644
 +    return r64_vladder.?;
 +}
 +extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_set_head(on: c_int) void;
++extern "c" fn stage_split_head_topk(dst: [*]u32, rows: c_int) c_int;
++pub var r64_head_used: u64 = 0;
++pub var r64_head_fallback: u64 = 0;
++
++/// R64 stage head: the 5090's top-20 per row (BF16 values, token ids) as `[1, rows, vocab]` BF16 logits,
++/// -inf outside them: exactly what a top-k <= 20 sampler (top-k first) reads of the full head. The ids and
++/// values stay on the context for the sparse acceptance.
++fn stageHeadLogits(self: *Transformer, ctx: *ForwardCtx, buf: *const [16 * 40]u32, rows: c_int) !mlx.mlx_array {
++    const n: usize = @intCast(rows);
++    var ids: [16 * 20]i32 = undefined;
++    var vals: [16 * 20]u16 = undefined;
++    for (0..n) |r| {
++        for (0..20) |j| {
++            vals[r * 20 + j] = @truncate(buf[r * 40 + j] >> 16); // an f32 holding a BF16 value
++            ids[r * 20 + j] = @intCast(buf[r * 40 + 20 + j]);
++        }
++    }
++    const shp = [_]c_int{ 1, rows, 20 };
++    const ids_a = mlx.mlx_array_new_data(&ids, &shp, 3, .int32);
++    const vals_a = mlx.mlx_array_new_data(&vals, &shp, 3, .bfloat16);
++    clearStageHead(ctx);
++    ctx.stage_head_ids = ids_a;
++    ctx.stage_head_vals = vals_a;
++    const fshape = [_]c_int{ 1, rows, @intCast(self.config.vocab_size) };
++    const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
++    defer _ = mlx.mlx_array_free(ninf);
++    var full = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(full);
++    try mlx.check(mlx.mlx_full(&full, &fshape, 3, ninf, .bfloat16, self.s));
++    var out = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(out);
++    try mlx.check(mlx.mlx_put_along_axis(&out, full, ids_a, vals_a, 2, self.s));
++    return out;
++}
++
++pub fn clearStageHead(ctx: *ForwardCtx) void {
++    if (ctx.stage_head_ids.ctx != null) _ = mlx.mlx_array_free(ctx.stage_head_ids);
++    if (ctx.stage_head_vals.ctx != null) _ = mlx.mlx_array_free(ctx.stage_head_vals);
++    ctx.stage_head_ids = .{ .ctx = null };
++    ctx.stage_head_vals = .{ .ctx = null };
++}
++
++/// R64 stage head: usable only if no returned id is suppressed (a reserved id in the top 20 means the
++/// sampler's top 20 reaches past what the stage returned: the Mac's own head serves that forward).
++fn stageHeadUsable(self: *const Transformer, buf: *const [16 * 40]u32, rows: c_int) bool {
++    const mask = self.suppress_mask orelse return true;
++    const mp = mlx.mlx_array_data_bool(mask) orelse return false;
++    const n: usize = @intCast(rows);
++    const vocab: usize = self.config.vocab_size;
++    for (0..n) |r| {
++        for (0..20) |j| {
++            const id: usize = buf[r * 40 + 20 + j];
++            if (id >= vocab or mp[id]) return false;
++        }
++    }
++    return true;
++}
 +extern "c" fn stage_split_prefill_begin(owner: u64) void;
 +extern "c" fn stage_split_bind(owner: u64) void;
 +extern "c" fn stage_split_resident(owner: u64) c_int;
@@ -2127,7 +3194,7 @@ index 3ab27c9f..b80fa28d 100644
  const Transformer = trf.Transformer;
  const std = @import("std");
  const sushi_exl3 = @import("sushi_exl3");
-@@ -1444,6 +1665,7 @@ pub fn forwardQwen4VerifyRows(
+@@ -1444,6 +1723,7 @@ pub fn forwardQwen4VerifyRows(
      out_last: []mlx.mlx_array,
      out_all: []mlx.mlx_array,
  ) !void {
@@ -2135,7 +3202,7 @@ index 3ab27c9f..b80fa28d 100644
      const previous_hc_prepared = mtp_verify_hc_prepared_active;
      mtp_verify_hc_prepared_active = true;
      defer mtp_verify_hc_prepared_active = previous_hc_prepared;
-@@ -1694,6 +1916,7 @@ pub fn forwardQwen4DecodeRows(
+@@ -1694,6 +1974,7 @@ pub fn forwardQwen4DecodeRows(
      ctxs: []const *ForwardCtx,
      hidden_rows: ?*?[]mlx.mlx_array,
  ) ![]mlx.mlx_array {
@@ -2143,7 +3210,7 @@ index 3ab27c9f..b80fa28d 100644
      const n = ctxs.len;
      std.debug.assert(n == next_tokens.len and n >= 1 and n <= MAX_BATCH_ROWS);
      if (!qwen4_rows_logged) {
-@@ -1969,9 +2192,61 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -1969,9 +2250,75 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
          !diagEnvOnCached(&trf.expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
      var deferred: ?DeferredQwenMoe = null;
      defer if (deferred) |*d| d.deinit();
@@ -2165,6 +3232,9 @@ index 3ab27c9f..b80fa28d 100644
 +    const vladder: u32 = if (seq_len > 1 and seq_len <= 16 and stage_first != null and ctx.stage_prefill == 0 and
 +        ctx.batch_slots == null and !prof.timing and !dt.on) r64VerifyLadder() else 0;
      var layer_idx: usize = 0;
++    // R64 stage head: the stage's top-20 rows when it ran the head for this forward.
++    var head_buf: [16 * 40]u32 = undefined;
++    var head_ready = false;
      while (layer_idx < layerCap(cfg.num_hidden_layers)) {
          const li: u32 = @intCast(layer_idx);
 +        if (stage_first) |first| if (layer_idx == first) {
@@ -2197,7 +3267,18 @@ index 3ab27c9f..b80fa28d 100644
 +            var out = mlx.mlx_array_new();
 +            // An M-RoPE request's decode rows are text: rope at row + its decode delta on all axes.
 +            const rope_delta: i32 = if (ctx.mrope_pos != null) ctx.mrope_delta else 0;
++            // R64 stage head: the stage also runs the mixer, the lm_head and a top-20 for this forward.
++            const want_head = ctx.stage_head and batch == 1;
++            clearStageHead(ctx);
++            stage_split_set_head(@intFromBool(want_head));
++            defer stage_split_set_head(0);
 +            if (stage_split_forward(h, &out, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
++            if (want_head) {
++                if (stage_split_head_topk(&head_buf, seq_len) == 0 and stageHeadUsable(self, &head_buf, seq_len)) {
++                    head_ready = true;
++                    r64_head_used += 1;
++                } else r64_head_fallback += 1;
++            }
 +            _ = mlx.mlx_array_free(h);
 +            h = out;
 +            break;
@@ -2205,7 +3286,7 @@ index 3ab27c9f..b80fa28d 100644
          if (dumping) trf.moe_dump_layer = li;
          const lw = &ml[layer_idx];
          const entry = &entries[layer_idx];
-@@ -2083,6 +2358,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -2083,6 +2430,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
              }
          }
  
@@ -2224,7 +3305,7 @@ index 3ab27c9f..b80fa28d 100644
          if (ctx.capture_layers) |cl| {
              for (cl.ids, cl.out) |cid, *slot| {
                  if (cid == li) {
-@@ -2119,9 +2406,9 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -2119,10 +2478,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
      // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
      // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
      if (ctx.capture_hidden) |target| {
@@ -2234,9 +3315,18 @@ index 3ab27c9f..b80fa28d 100644
 -    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, true);
 +    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, ctx.capture_settle);
  
++    if (head_ready and !self.embedding_mode and !ctx.skip_lm_head) {
++        // R64 stage head: the 5090 ran the mixer and the head; its exact top-20 replaces the Mac's head.
++        const logits = try stageHeadLogits(self, ctx, &head_buf, seq_len);
++        _ = mlx.mlx_array_free(h);
++        h = .{ .ctx = null };
++        if (self.expert_stream) |engine| engine.finishForward(@intCast(batch * seq_len));
++        return logits;
++    }
      const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
      // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
-@@ -3055,6 +3342,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
+     _ = mlx.mlx_array_free(h);
+@@ -3055,6 +3422,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
          switch (which) {
              0 => "sushi_hc_read_n",
              1 => "sushi_hc_read_d",
@@ -2244,7 +3334,7 @@ index 3ab27c9f..b80fa28d 100644
              else => "sushi_hc_read_u",
          },
          in_vec,
-@@ -3062,6 +3350,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
+@@ -3062,6 +3430,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
          switch (which) {
              0 => HC_FUSED_N_SOURCE,
              1 => HC_FUSED_D_SOURCE,
@@ -3181,7 +4271,7 @@ index 00000000..a2a64000
 +    try std.testing.expect(!restoreFits(128*gib,std.math.maxInt(u64)));
 +}
 diff --git a/src/transformer.zig b/src/transformer.zig
-index c90ff413..04c43d34 100644
+index c90ff413..80f16f19 100644
 --- a/src/transformer.zig
 +++ b/src/transformer.zig
 @@ -12860,6 +12860,9 @@ pub const ForwardCtx = struct {
@@ -3210,7 +4300,48 @@ index c90ff413..04c43d34 100644
      /// MiMo spec verify: every row of this multi-row forward computes with its
      /// own decode tick's arithmetic (`mimoVerifyRowsAttn`), so greedy MTP is serial.
      verify_rows: bool = false,
-@@ -25808,7 +25820,9 @@ const MTP_COARSE_PAIRS_SOURCE =
+@@ -12954,6 +12966,14 @@ pub const ForwardCtx = struct {
+     /// certified-below-the-winner elsewhere — exactly enough for an argmax,
+     /// not for a tail distribution. Default false = dense path everywhere.
+     argmax_only: bool = false,
++    /// R64 (SUSHI_R64_STAGE_HEAD=1, stage QD_STAGE_HEAD=1): ask the stage for the final mixer + lm_head +
++    /// top-20 of a split decode forward; the forward then returns sparse logits (the top-20, -inf elsewhere)
++    /// instead of running the Mac's head. Set only when the sampler reads at most the top 20.
++    stage_head: bool = false,
++    /// R64: the last stage-head forward's `[1, rows, 20]` token ids (int32) and BF16 values, best first
++    /// (null after a forward that did not use the stage head); the sparse acceptance reads them.
++    stage_head_ids: mlx.mlx_array = .{ .ctx = null },
++    stage_head_vals: mlx.mlx_array = .{ .ctx = null },
+     /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
+     /// Non-null means: this forward runs at `batch == batch_slots.len`,
+     /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
+@@ -16846,8 +16866,10 @@ pub const Transformer = struct {
+         const ids_c = try self.plePrepareIds(token_ids);
+         defer _ = mlx.mlx_array_free(ids_c);
+         var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
++        const f0 = qwen4_mod.nowBootNs();
+         try mlx.check(mlx.mlx_array_eval(ids_c));
+         self.verify_laps.ple_sync_ns = sync_lap.read();
++        qwen4_mod.notePleFlush(f0, qwen4_mod.nowBootNs() - f0);
+         return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
+     }
+ 
+@@ -16909,11 +16931,14 @@ pub const Transformer = struct {
+         defer if (!raw_bf16) self.allocator.free(host);
+         var gclk: ProfClock = if (diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
+         const kv_len: u64 = @intCast(ctx.moe_seq_offset.*);
++        if (raw_bf16) qwen4_mod.notePleResidency(&st.table, rows);
++        const g0 = qwen4_mod.nowBootNs();
+         if (raw_bf16) {
+             try st.table.gatherBf16Checked(self.allocator, rows, pk, kv_len);
+         } else {
+             try st.table.gatherChecked(rows, host, kv_len);
+         }
++        qwen4_mod.notePleGather(qwen4_mod.nowBootNs() - g0, rows.len);
+         if (diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
+         if (!raw_bf16) {
+             std.debug.assert(pk.len == host.len);
+@@ -25808,7 +25833,9 @@ const MTP_COARSE_PAIRS_SOURCE =
      \\}
  ;
  var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -3221,7 +4352,7 @@ index c90ff413..04c43d34 100644
  
  pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, gs: u32) !?mlx.mlx_array {
      if (!mlx.streamIsGpu(s) or !verifySharedHardware() or bits != 3 or gs != 64) return null;
-@@ -25818,7 +25832,11 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
+@@ -25818,7 +25845,11 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
      const ws = mlx.getShape(w);
      const ss = mlx.getShape(sc);
      if (xs.len != 3 or xs[0] < 2 or xs[0] > 8 or xs[1] != 1 or xs[2] != 2560) return null;
@@ -3234,7 +4365,7 @@ index c90ff413..04c43d34 100644
      const kernel = blk: {
          if (mtp_coarse_pairs_kernel) |value| break :blk value;
          const ins = [_][*:0]const u8{ "x", "w", "sc", "bi", "K_size", "N_size" };
-@@ -25833,17 +25851,18 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
+@@ -25833,17 +25864,18 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
          break :blk value;
      };
      const cfg = blk: {
@@ -3258,3 +4389,87 @@ index c90ff413..04c43d34 100644
      const iv = mlx.mlx_vector_array_new_data(&values, values.len);
      defer _ = mlx.mlx_vector_array_free(iv);
      var ov = mlx.mlx_vector_array_new();
+@@ -26215,6 +26247,66 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
+     return result;
+ }
+ 
++// R64e (SUSHI_R64_DQ_CACHE_MB=<MiB>, default 0 = off): keep each weight's dequantized [K,N] view for the
++// later prefill chunks instead of re-dequantizing it per chunk (~4% of a prefill chunk's GPU time). The same
++// dequantize feeds the same GEMM: bit-identical. Keyed by the packed weight's and scales' buffer addresses,
++// shape and output dtype; each entry holds its own reference to the packed weight, so that buffer cannot be
++// freed and reused under the key. First come, first cached, within the budget (the Mac's split layers
++// first). The entry's dequant evaluates with the chunk that first uses it and stays resident.
++const DqKey = struct { wp: usize, sp: usize, n: c_int, k: c_int, dt: c_int };
++const DqEntry = struct { w: mlx.mlx_array, dq_t: mlx.mlx_array };
++var dq_cache: std.AutoHashMapUnmanaged(DqKey, DqEntry) = .{};
++var dq_cache_budget: ?usize = null;
++pub var dq_cache_bytes: usize = 0;
++pub var dq_cache_hits: u64 = 0;
++pub var dq_cache_full: bool = false;
++
++fn dqCacheBudget() usize {
++    if (dq_cache_budget) |b| return b;
++    const mb: usize = if (std.c.getenv("SUSHI_R64_DQ_CACHE_MB")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0 else 0;
++    dq_cache_budget = mb << 20;
++    return mb << 20;
++}
++
++/// The cached transposed dequant of `w` (borrowed: owned by the cache), or null when the budget is spent.
++fn dqCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, xd: mlx.mlx_dtype, s: mlx.mlx_stream) !?mlx.mlx_array {
++    const shape = mlx.getShape(w);
++    if (shape.len != 2) return null;
++    // model weights are resident; eval is a no-op for them and makes the addresses valid for anything else
++    try mlx.check(mlx.mlx_array_eval(w));
++    try mlx.check(mlx.mlx_array_eval(sc));
++    const wp = @intFromPtr(mlx.mlx_array_data_uint8(w) orelse return null);
++    const sp = @intFromPtr(mlx.mlx_array_data_uint8(sc) orelse return null);
++    const key = DqKey{ .wp = wp, .sp = sp, .n = shape[0], .k = shape[1], .dt = @intCast(@intFromEnum(xd)) };
++    if (dq_cache.get(key)) |e| {
++        dq_cache_hits += 1;
++        return e.dq_t;
++    }
++    if (dq_cache_full) return null;
++    var dq = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(dq);
++    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
++    const dshape = mlx.getShape(dq);
++    if (dshape.len != 2) return null;
++    const bytes = @as(usize, @intCast(dshape[0])) * @as(usize, @intCast(dshape[1])) * 2;
++    if (dq_cache_bytes + bytes > dqCacheBudget()) {
++        dq_cache_full = true;
++        log.info("  [dq-cache] budget reached: {d} entries, {d} MiB\n", .{ dq_cache.count(), dq_cache_bytes >> 20 });
++        return null;
++    }
++    var dq_t = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(dq_t);
++    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
++    var keep = mlx.mlx_array_new();
++    errdefer _ = mlx.mlx_array_free(keep);
++    try mlx.check(mlx.mlx_array_set(&keep, w));
++    try dq_cache.put(std.heap.page_allocator, key, .{ .w = keep, .dq_t = dq_t });
++    dq_cache_bytes += bytes;
++    if ((dq_cache_bytes >> 30) != ((dq_cache_bytes - bytes) >> 30))
++        log.info("  [dq-cache] {d} entries, {d} MiB\n", .{ dq_cache.count(), dq_cache_bytes >> 20 });
++    return dq_t;
++}
++
+ /// The dequant+GEMM prefill route (see the block comment above
+ /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
+ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+@@ -26230,6 +26322,16 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
+     const xd = mlx.mlx_array_dtype(x);
+     if (xd != .bfloat16 and xd != .float16) return null;
+ 
++    if (dqCacheBudget() > 0) {
++        if (try dqCached(w, sc, bi, bits, group_size, xd, s)) |dq_t| {
++            var out = mlx.mlx_array_new();
++            errdefer _ = mlx.mlx_array_free(out);
++            try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
++            prefill_dq_gemm_engaged += 1;
++            return out;
++        }
++    }
++
+     var dq = mlx.mlx_array_new();
+     defer _ = mlx.mlx_array_free(dq);
+     try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));

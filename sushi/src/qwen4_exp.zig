@@ -202,6 +202,136 @@ fn asGb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
 }
 
+// R64f: decode PLE gather timing (always on: two clock reads per gather; printed with the MTP trace) and an SSD
+// keep-alive (SUSHI_R64_SSD_KEEPALIVE_MS=<ms>, default 0 = off) for a table read by row from SSD (past its
+// residency cap). While generation is active (a gather within the last 2 s), one 4 KiB uncached pread every
+// <ms> keeps the drive out of its idle state, so a round whose rows miss the page cache does not also pay a
+// wake-up. (Reported for this model on a DGX Spark: GB10 drives sleep after ~100 ms; cold rows 1.1-9.5 ms.)
+pub var ple_active_until_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var ple_keepalive_reads: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var ple_g_n: u64 = 0;
+pub var ple_g_ns: u64 = 0;
+pub var ple_g_max_ns: u64 = 0;
+pub var ple_g_over1: u64 = 0;
+pub var ple_g_over5: u64 = 0;
+
+var ple_walk_env: ?bool = null;
+fn pleWalkSmall() bool {
+    if (ple_walk_env == null) ple_walk_env = if (std.c.getenv("SUSHI_R64_PLE_WALK")) |v| v[0] == '1' else false;
+    return ple_walk_env.?;
+}
+var ple_hybrid_mode: ?u8 = null;
+var ple_alt: u64 = 0;
+pub var ple_last_hybrid: bool = false;
+/// SUSHI_R64_PLE_HYBRID: 1 = every decode gather hybrid; 2 = alternate pool / hybrid gather by gather (an
+/// in-process A/B: same content and page-cache state; separate stats per method in `[r64-ple]`).
+fn pleHybridNow() bool {
+    if (ple_hybrid_mode == null) ple_hybrid_mode = if (std.c.getenv("SUSHI_R64_PLE_HYBRID")) |v| v[0] -% '0' else 0;
+    return switch (ple_hybrid_mode.?) {
+        1 => true,
+        2 => blk: {
+            ple_alt +%= 1;
+            break :blk ple_alt & 1 == 1;
+        },
+        else => false,
+    };
+}
+pub var ple_h_n: u64 = 0;
+pub var ple_h_ns: u64 = 0;
+pub var ple_h_max_ns: u64 = 0;
+pub var ple_h_over1: u64 = 0;
+pub var ple_p_n: u64 = 0;
+pub var ple_p_ns: u64 = 0;
+pub var ple_p_max_ns: u64 = 0;
+pub var ple_p_over1: u64 = 0;
+var ple_res_env: ?bool = null;
+pub var ple_res_rows: u64 = 0;
+pub var ple_res_resident: u64 = 0;
+/// Diagnostic (SUSHI_R64_PLE_RESIDENCY=1): count how many of a decode gather's rows sit in resident pages.
+pub fn notePleResidency(table: *const NgramTable, row_ids: []const i64) void {
+    if (ple_res_env == null) ple_res_env = if (std.c.getenv("SUSHI_R64_PLE_RESIDENCY")) |v| v[0] == '1' else false;
+    if (!ple_res_env.? or row_ids.len > 256 or table.map.len == 0) return;
+    const page = std.heap.pageSize();
+    const need = table.rowBytes();
+    for (row_ids) |r| {
+        const off = table.w_off + @as(usize, @intCast(r)) * need;
+        const start = off & ~(page - 1);
+        var vec: [2]u8 = .{ 0, 0 };
+        const len = ((off + need + page - 1) & ~(page - 1)) - start;
+        if (std.c.mincore(@ptrCast(@alignCast(@constCast(table.map.ptr + start))), len, @ptrCast(&vec)) != 0) continue;
+        ple_res_rows += 1;
+        if (vec[0] & 1 != 0 and (len <= page or vec[1] & 1 != 0)) ple_res_resident += 1;
+    }
+}
+
+// R64g timeline: verify start (set by the generator), when the deferred-PLE flush starts, and how long its
+// ids sync waits for the draft chain.
+pub var verify_t0_ns: u64 = 0;
+pub var ple_fl_n: u64 = 0;
+pub var ple_fl_at_ns: u64 = 0;
+pub var ple_fl_wait_ns: u64 = 0;
+pub fn notePleFlush(start: u64, wait: u64) void {
+    if (verify_t0_ns == 0 or start < verify_t0_ns) return;
+    ple_fl_n += 1;
+    ple_fl_at_ns += start - verify_t0_ns;
+    ple_fl_wait_ns += wait;
+}
+
+pub fn nowBootNs() u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(std.Io.Timestamp.now(io, .boot).nanoseconds);
+}
+
+/// One decode/verify-sized gather took `dt` ns; generation counts as active for the next 2 s.
+pub fn notePleGather(dt: u64, rows: usize) void {
+    ple_active_until_ns.store(nowBootNs() + 2_000_000_000, .release);
+    if (rows > 256) return;
+    if (ple_last_hybrid) {
+        ple_h_n += 1;
+        ple_h_ns += dt;
+        if (dt > ple_h_max_ns) ple_h_max_ns = dt;
+        if (dt > 1_000_000) ple_h_over1 += 1;
+    } else {
+        ple_p_n += 1;
+        ple_p_ns += dt;
+        if (dt > ple_p_max_ns) ple_p_max_ns = dt;
+        if (dt > 1_000_000) ple_p_over1 += 1;
+    }
+    ple_g_n += 1;
+    ple_g_ns += dt;
+    if (dt > ple_g_max_ns) ple_g_max_ns = dt;
+    if (dt > 1_000_000) ple_g_over1 += 1;
+    if (dt > 5_000_000) ple_g_over5 += 1;
+}
+
+fn ssdKeepaliveMain(fd: std.c.fd_t, size: u64, interval_ns: u64) void {
+    var buf: [4096]u8 align(4096) = undefined;
+    var off: u64 = 0;
+    // a ~1 GiB stride walks the whole file, so most reads miss the page cache and reach the drive
+    const stride: u64 = (1 << 30) + 4096 * 7919;
+    var ts: std.c.timespec = .{ .sec = @intCast(interval_ns / 1_000_000_000), .nsec = @intCast(interval_ns % 1_000_000_000) };
+    while (true) {
+        _ = std.c.nanosleep(&ts, null);
+        if (nowBootNs() > ple_active_until_ns.load(.acquire)) continue;
+        off = ((off + stride) % (size - 8192)) & ~@as(u64, 4095);
+        _ = std.c.pread(fd, &buf, buf.len, @intCast(off));
+        _ = ple_keepalive_reads.fetchAdd(1, .monotonic);
+    }
+}
+
+fn startSsdKeepalive(fd: std.c.fd_t, size: u64) void {
+    const ms: u64 = if (std.c.getenv("SUSHI_R64_SSD_KEEPALIVE_MS")) |v| std.fmt.parseInt(u64, std.mem.span(v), 10) catch 0 else 0;
+    if (ms == 0 or fd < 0 or size < (1 << 31)) return;
+    var path: [1024]u8 = undefined;
+    if (std.c.fcntl(fd, std.c.F.GETPATH, &path) != 0) return;
+    const kfd = std.c.open(@ptrCast(&path), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (kfd < 0) return;
+    _ = std.c.fcntl(kfd, std.c.F.NOCACHE, @as(c_int, 1));
+    const t = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, ssdKeepaliveMain, .{ kfd, size, ms * 1_000_000 }) catch return;
+    t.detach();
+    log.info("[qwen4] SSD keep-alive: one 4 KiB uncached read every {d} ms while generating\n", .{ms});
+}
+
 pub const NgramTable = struct {
     map: []align(std.heap.page_size_min) const u8,
     rows: u64,
@@ -518,6 +648,7 @@ pub const NgramTable = struct {
         }
         if (self.pastResidencyCap()) {
             log.info("[qwen4] ngram table warm: skipped, {d:.1} GB exceeds the {d:.1} GB residency cap; prefill reads requested rows\n", .{ asGb(self.map.len), asGb(ngramCacheLimit()) });
+            startSsdKeepalive(self.fd, self.map.len);
             return;
         }
         self.warm_stop.store(false, .release);
@@ -579,7 +710,7 @@ pub const NgramTable = struct {
     }
 
     /// Bytes one row occupies across the table's regions.
-    fn rowBytes(self: *const NgramTable) usize {
+    pub fn rowBytes(self: *const NgramTable) usize {
         return if (self.bits == 16) self.dim * 2 else self.wcols * 4 + self.scols * 4;
     }
 
@@ -622,7 +753,10 @@ pub const NgramTable = struct {
         const prefer_pool = oversized_bf16 or self.prefer_pool;
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
-        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
+        // R64g: SUSHI_R64_PLE_WALK=1 copies decode-sized gathers (<= 256 rows) straight from the mapping on the
+        // calling thread instead of waking the 48-thread pool twice (same bytes; a miss faults its page in).
+        const walk_small = row_ids.len <= 256 and pleWalkSmall();
+        const pooled = wide_ok and !walk_small and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
         const whole_chunk = wide and oversized_bf16 and self.bits == 16;
         if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
         if (pooled and whole_chunk) {
@@ -657,7 +791,53 @@ pub const NgramTable = struct {
         const oversized = self.map.len > ngramCacheLimit();
         const prefer_pool = oversized or self.prefer_pool;
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
-        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
+        // R64g: SUSHI_R64_PLE_WALK=1 copies decode-sized gathers (<= 256 rows) straight from the mapping on the
+        // calling thread instead of waking the 48-thread pool twice (same bytes; a miss faults its page in).
+        const walk_small = row_ids.len <= 256 and pleWalkSmall();
+        const pooled = wide_ok and !walk_small and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
+        // R64g: SUSHI_R64_PLE_HYBRID=1: decode-sized gathers ask the kernel which rows' pages are resident
+        // (mincore), copy those from the mapping at once, start the kernel's reads of the rest with
+        // MADV_WILLNEED, then copy them (their faults wait on reads already in flight, in parallel). No pool,
+        // no thread wake-ups; every row gets the same bytes as the pooled pread.
+        ple_last_hybrid = false;
+        // R64g: SUSHI_R64_PLE_LEAN=1 (2 = alternate with the 48-thread pool): decode-sized gathers go to an
+        // 8-thread pool woken by one futex call; workers and the caller pull rows from an atomic counter and
+        // pread them, one dispatch per gather. Same bytes per row as the old pool.
+        if (row_ids.len <= 256 and pleLeanNow() and self.fd >= 0 and need <= PrefetchPool.ROW_BUF) {
+            if (leanPool()) |lp| {
+                ple_last_hybrid = true;
+                if (lp.run(self, row_ids, out)) return;
+                ple_last_hybrid = false;
+            }
+        }
+        if (row_ids.len <= 256 and pleHybridNow() and self.map.len > 0) {
+            ple_last_hybrid = true;
+            const page = std.heap.pageSize();
+            var miss: [256]u16 = undefined;
+            var nm: usize = 0;
+            for (row_ids, 0..) |r, i| {
+                const off = self.w_off + @as(usize, @intCast(r)) * need;
+                const start = off & ~(page - 1);
+                const len = ((off + need + page - 1) & ~(page - 1)) - start;
+                const addr: *align(std.heap.page_size_min) anyopaque = @ptrCast(@alignCast(@constCast(self.map.ptr + start)));
+                var vec: [2]u8 = .{ 0, 0 };
+                const resident = std.c.mincore(addr, len, @ptrCast(&vec)) == 0 and vec[0] & 1 != 0 and (len <= page or vec[1] & 1 != 0);
+                if (resident) {
+                    copyBf16Words(self.map[off..][0..need], out[i * self.dim ..][0..self.dim]);
+                } else {
+                    _ = std.c.madvise(addr, len, std.c.MADV.WILLNEED);
+                    miss[nm] = @intCast(i);
+                    nm += 1;
+                }
+            }
+            for (miss[0..nm]) |mi| {
+                const off = self.w_off + @as(usize, @intCast(row_ids[mi])) * need;
+                copyBf16Words(self.map[off..][0..need], out[@as(usize, mi) * self.dim ..][0..self.dim]);
+            }
+            ple_res_rows += row_ids.len;
+            ple_res_resident += row_ids.len - nm;
+            return;
+        }
         const whole_chunk = wide and oversized;
         if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
         if (pooled and whole_chunk) {
@@ -702,6 +882,90 @@ pub const NgramTable = struct {
 };
 
 /// The caller owns each job's table, rows and output until all workers finish.
+var ple_lean_mode: ?u8 = null;
+var ple_lean_alt: u64 = 0;
+fn pleLeanNow() bool {
+    if (ple_lean_mode == null) ple_lean_mode = if (std.c.getenv("SUSHI_R64_PLE_LEAN")) |v| v[0] -% '0' else 0;
+    return switch (ple_lean_mode.?) {
+        1 => true,
+        2 => blk: {
+            ple_lean_alt +%= 1;
+            break :blk ple_lean_alt & 1 == 1;
+        },
+        else => false,
+    };
+}
+var lean_pool: ?*LeanPool = null;
+var lean_pool_failed = false;
+fn leanPool() ?*LeanPool {
+    if (lean_pool == null and !lean_pool_failed) lean_pool = LeanPool.create() catch blk: {
+        lean_pool_failed = true;
+        break :blk null;
+    };
+    return lean_pool;
+}
+
+const LeanPool = struct {
+    const N = 8;
+    gen: u32 = 0,
+    next: std.atomic.Value(u32) = .init(0),
+    pending: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(u32) = .init(0),
+    table: ?*const NgramTable = null,
+    rows: []const i64 = &.{},
+    out: []u16 = &.{},
+
+    fn create() !*LeanPool {
+        const p = try std.heap.page_allocator.create(LeanPool);
+        p.* = .{};
+        for (0..N) |_| {
+            const t = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{p});
+            t.detach();
+        }
+        return p;
+    }
+
+    fn work(self: *LeanPool) void {
+        const table = self.table.?;
+        const need = table.dim * 2;
+        var buf: [PrefetchPool.ROW_BUF]u8 = undefined;
+        while (true) {
+            const i = self.next.fetchAdd(1, .acq_rel);
+            if (i >= self.rows.len) return;
+            if (table.preadSite(@intCast(self.rows[i]), 0, &buf)) {
+                NgramTable.copyBf16Words(buf[0..need], self.out[@as(usize, i) * table.dim ..][0..table.dim]);
+            } else _ = self.failed.fetchAdd(1, .release);
+        }
+    }
+
+    fn worker(self: *LeanPool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seen: u32 = 0;
+        while (true) {
+            while (@atomicLoad(u32, &self.gen, .acquire) == seen) io.futexWaitUncancelable(u32, &self.gen, seen);
+            seen = @atomicLoad(u32, &self.gen, .acquire);
+            self.work();
+            _ = self.pending.fetchSub(1, .acq_rel);
+        }
+    }
+
+    /// Reads every row of `rows` into `out` (bf16 words, row-major); false if a pread failed.
+    fn run(self: *LeanPool, table: *const NgramTable, rows: []const i64, out: []u16) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.table = table;
+        self.rows = rows;
+        self.out = out;
+        self.next.store(0, .release);
+        self.failed.store(0, .release);
+        self.pending.store(N, .release);
+        _ = @atomicRmw(u32, &self.gen, .Add, 1, .release);
+        io.futexWake(u32, &self.gen, N);
+        self.work();
+        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+        return self.failed.load(.acquire) == 0;
+    }
+};
+
 const PrefetchPool = struct {
     const N = 48;
     const MAX_ROWS = 64;

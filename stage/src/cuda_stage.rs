@@ -4,7 +4,7 @@
 //! runs the final mixer, lm_head and MTP head). Multi-row forwards keep per-row GDN states so a
 //! verify can commit any accepted prefix; attention layers append only the accepted rows.
 use crate::{
-    cuda::{Buffer, Device, Module, PreparedCall},
+    cuda::{Arg, Buffer, Device, Module, PreparedCall},
     cuda_lowbit_attention_layer as al, cuda_lowbit_layer as rl, gdn, hc,
     mcg_moe::Bank,
     projection::Pack,
@@ -47,6 +47,96 @@ pub fn attention_policy_for(rows: usize) -> al::Policy {
 }
 pub fn attention_policy() -> al::Policy {
     attention_policy_for(16)
+}
+/// R64: top-20 rows returned by the stage head (bf16 logit bit patterns as f32, best first; lower id first
+/// on equal values: the host sampler's order). Everything a top-k <= 20 sampler reads.
+pub const HEAD_TOPK: usize = 20;
+const HEAD_CHUNK: usize = 2048;
+const HEAD_BLOCKS: usize = crate::embedding::VOCAB.div_ceil(HEAD_CHUNK);
+/// R64 (QD_STAGE_HEAD=1): the final mixer, the canonical 8-bit lm_head and a GPU top-20 per row, run on
+/// the stage right after a decode forward, so the Mac can skip its own head for the verify rows.
+pub struct StageHead<'m, 'd> {
+    mixer: crate::cuda_hc::Hc<'m, 'd>,
+    head: crate::cuda_affine4::Packed<'m, 'd>,
+    logits: Buffer<'d>,
+    logits_bf: Buffer<'d>,
+    partial: crate::cuda::Kernel<'m, 'd>,
+    last: crate::cuda::Kernel<'m, 'd>,
+    cand_v: Buffer<'d>,
+    cand_i: Buffer<'d>,
+    out: Buffer<'d>,
+}
+impl<'m, 'd> StageHead<'m, 'd> {
+    /// `ops`: the R56 ops module (kernels/r56_ops.sm120.cubin: r56_topk_partial / r56_topk_final).
+    pub fn new(d: &'d Device, m: &'m rl::Modules<'d>, m8: &'m Module<'d>, ops: &'m Module<'d>, pack: &Pack) -> Result<Self> {
+        let w = crate::hc::Weights::load_mixer(pack)?;
+        let mixer = crate::cuda_hc::Hc::new_canonical(d, m8, &m.hc, &w)?;
+        // The 635 MB head exceeds the pack's bounded single read: load it in row tiles and join them.
+        let v = crate::embedding::VOCAB;
+        let mut a: Option<crate::dense::Affine8> = None;
+        let mut first = 0;
+        while first < v {
+            let n = 24832usize.min(v - first); // ten tiles, each under Affine8's 64M-element dense cap
+            let t = crate::dense::Affine8::load_rows(pack, "language_model.lm_head", hc::H, first, n)?;
+            match &mut a {
+                None => a = Some(t),
+                Some(all) => {
+                    ensure!(all.group == t.group && all.k == t.k, "stage head: row tile geometry");
+                    all.codes.extend_from_slice(&t.codes);
+                    all.scales.extend_from_slice(&t.scales);
+                    all.biases.extend_from_slice(&t.biases);
+                    all.n += t.n;
+                }
+            }
+            first += n;
+        }
+        let a = a.unwrap();
+        ensure!(a.n == v, "stage head: lm_head rows {} != vocab {v}", a.n);
+        let head = crate::cuda_affine4::Packed::new_affine8_head(d, m8, &a)?;
+        Ok(Self {
+            mixer,
+            head,
+            logits: d.alloc(hc::MAX_ROWS * v * 4 + GUARD)?,
+            logits_bf: d.alloc(hc::MAX_ROWS * v * 2 + GUARD)?,
+            partial: ops.kernel("r56_topk_partial")?,
+            last: ops.kernel("r56_topk_final")?,
+            cand_v: d.alloc(hc::MAX_ROWS * HEAD_BLOCKS * HEAD_TOPK * 4 + GUARD)?,
+            cand_i: d.alloc(hc::MAX_ROWS * HEAD_BLOCKS * HEAD_TOPK * 4 + GUARD)?,
+            out: d.alloc(hc::MAX_ROWS * 2 * HEAD_TOPK * 4 + GUARD)?,
+        })
+    }
+    /// The launches that follow a forward over `rows` rows: the mixer read of the stage output (no pending
+    /// write: the output stream is complete), the head, the two top-k launches. Enqueue in order.
+    pub fn record<'a>(&'a self, stage: &'a Stage<'m, 'd>, rows: usize) -> Result<Vec<PreparedCall<'a, 'm, 'd>>> {
+        ensure!((1..=hc::MAX_ROWS).contains(&rows) && HEAD_BLOCKS * HEAD_TOPK <= 4096, "stage head rows");
+        let x = stage.layers.last().unwrap().output();
+        let mut calls = self.mixer.record_from(x, None, rows, crate::cuda_hc::Policy { split_down: true, separate_write: false })?;
+        calls.push(self.head.record_into(self.mixer.mixed(), &self.logits, &self.logits_bf, rows, 0)?);
+        let v = crate::embedding::VOCAB as u32;
+        // SAFETY: r56_topk_* ABIs (kernels/r56_ops.cu); every buffer sized for MAX_ROWS rows above.
+        unsafe {
+            calls.push(self.partial.prepare(
+                vec![Arg::Buffer(&self.logits_bf), Arg::U32(v), Arg::U32(v), Arg::Buffer(&self.cand_v), Arg::Buffer(&self.cand_i)],
+                [HEAD_BLOCKS as u32, rows as u32, 1],
+                [256, 1, 1],
+            )?);
+            calls.push(self.last.prepare(
+                vec![Arg::Buffer(&self.cand_v), Arg::Buffer(&self.cand_i), Arg::U32((HEAD_BLOCKS * HEAD_TOPK) as u32), Arg::Buffer(&self.out)],
+                [1, rows as u32, 1],
+                [256, 1, 1],
+            )?);
+        }
+        Ok(calls)
+    }
+    /// After the launches completed: `rows` x (20 value bit patterns, 20 token ids), u32 little-endian.
+    pub fn read(&self, rows: usize, dst: &mut [u8]) -> Result<()> {
+        let n = rows * 2 * HEAD_TOPK * 4;
+        ensure!(dst.len() >= n, "stage head output room");
+        let mut raw = vec![0u8; self.out.byte_len()];
+        self.out.download(&mut raw)?;
+        dst[..n].copy_from_slice(&raw[..n]);
+        Ok(())
+    }
 }
 pub struct Stage<'m, 'd> {
     d: &'d Device,
@@ -508,6 +598,14 @@ impl<'m, 'd> Stage<'m, 'd> {
         }
         o.w.flush()?;
         Ok(o.at)
+    }
+    /// R62 (DFlash2 on the split): the HC stream (rows x 10240 BF16) after stage layer `layer`
+    /// from the last forward, downloaded into `out` (rows * 10240 * 2 bytes). The drafter's
+    /// target-layer taps for layers past the split point.
+    pub fn layer_stream(&self, layer: usize, rows: usize, out: &mut [u8]) -> Result<()> {
+        let l = self.layers.get(layer.wrapping_sub(self.first)).ok_or_else(|| anyhow::anyhow!("layer {layer} is not on the stage"))?;
+        ensure!(out.len() == rows * hc::F * 2 && rows >= 1 && rows <= hc::MAX_ROWS, "layer stream rows");
+        l.output().view(0, out.len())?.download(out)
     }
     /// Every recurrent layer's committed state (exact reads), in layer order. Diagnostic.
     pub fn recurrent_states(&self) -> Result<Vec<gdn::Initial>> {

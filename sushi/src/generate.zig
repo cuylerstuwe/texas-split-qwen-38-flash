@@ -2,6 +2,78 @@ const std = @import("std");
 var r64_nosettle_env: ?bool = null;
 var r64_chain_ladder_env: ?bool = null;
 var r64_shortconf_env: ?bool = null;
+var r64_defcap_mode: ?u8 = null;
+var r64_defcap_rounds: u64 = 0;
+pub var r64_defcap_window_mode: u8 = 0;
+fn r64DeferCaptures() bool {
+    if (r64_defcap_mode == null) r64_defcap_mode = if (std.c.getenv("SUSHI_R64_DEFER_CAPTURES")) |v| v[0] -% '0' else 0;
+    r64_defcap_rounds += 1;
+    const on = switch (r64_defcap_mode.?) {
+        1 => true,
+        2 => ((r64_defcap_rounds - 1) / 32) % 2 == 1,
+        else => false,
+    };
+    r64_defcap_window_mode = @intFromBool(on);
+    return on;
+}
+var r64_cpuacc_mode: ?u8 = null;
+var r64_cpuacc_rounds: u64 = 0;
+pub var r64_cpuacc_window: u8 = 0;
+pub var r64_cpuacc_n: u64 = 0;
+/// R64i (SUSHI_R64_CPU_ACCEPT=1; 2 = alternate per 32-round window): a stage-head round's acceptance runs on
+/// the host over the 1+m top-20 rows (the stage head's values and ids, already in unified memory) and the
+/// draft densities, instead of a GPU graph the host then waits on. Same filter and accept/residual/bonus law
+/// as sparseAcceptGraph; the draws come from the generator's PRNG (deterministic generator state).
+fn r64CpuAcceptPlanned() bool {
+    if (r64_cpuacc_mode == null) r64_cpuacc_mode = if (std.c.getenv("SUSHI_R64_CPU_ACCEPT")) |v| v[0] -% '0' else 0;
+    return r64_cpuacc_mode.? != 0;
+}
+fn r64CpuAccept() bool {
+    if (r64_cpuacc_mode == null) r64_cpuacc_mode = if (std.c.getenv("SUSHI_R64_CPU_ACCEPT")) |v| v[0] -% '0' else 0;
+    r64_cpuacc_rounds += 1;
+    const on = switch (r64_cpuacc_mode.?) {
+        1 => true,
+        2 => ((r64_cpuacc_rounds - 1) / 32) % 2 == 1,
+        else => false,
+    };
+    r64_cpuacc_window = @intFromBool(on);
+    return on;
+}
+/// R64i: the proposal density of depth `k` at `token`: from the shortlist's small form when the chain kept
+/// it (no GPU work: computed with the draft), one-hot for an argmax depth, else the dense q row (evaluated).
+fn r64HostQ(chain: anytype, qs: []mlx.mlx_array, k: usize, token: u32) !f32 {
+    if (chain.q_small) |small| if (k < chain.n_qs) switch (chain.q_kind.?[k]) {
+        1 => {
+            const qv = mlx.mlx_array_data_float32(small[k]) orelse return error.MlxArrayDataNull;
+            const cv = mlx.mlx_array_data_uint32(chain.q_cands.?[k]) orelse return error.MlxArrayDataNull;
+            const n: usize = @intCast(mlx.mlx_array_size(chain.q_cands.?[k]));
+            for (0..n) |j| if (cv[j] == token) return qv[j];
+            return 0;
+        },
+        2 => return if (chain.drafts[k] == token) 1 else 0,
+        else => {},
+    };
+    try mlx.check(mlx.mlx_array_eval(qs[k]));
+    const qd = mlx.mlx_array_data_float32(qs[k]) orelse return error.MlxArrayDataNull;
+    return qd[token];
+}
+inline fn r64Bf16(v: u16) f32 {
+    return @bitCast(@as(u32, v) << 16);
+}
+/// In place: softmax over xs (the f32 'precise' form: max shift, exp, sum, divide); -inf entries become 0.
+fn r64Softmax(xs: []f32) void {
+    var mx: f32 = -std.math.inf(f32);
+    for (xs) |x| mx = @max(mx, x);
+    var sum: f32 = 0;
+    for (xs) |*x| {
+        x.* = if (x.* == -std.math.inf(f32)) 0 else @exp(x.* - mx);
+        sum += x.*;
+    }
+    for (xs) |*x| x.* /= sum;
+}
+var r64_stage_head_env: ?bool = null;
+var r64_sparse_env: ?bool = null;
+pub var r64_sparse_rounds: u64 = 0;
 fn r64EnvOn(cache: *?bool, comptime name: [:0]const u8) bool {
     if (cache.* == null) {
         const raw = std.c.getenv(name);
@@ -1508,7 +1580,68 @@ pub fn splitChunkEndFull(pos: usize, end_in: usize, loop_end: usize, want_ssm_cp
         }
     }
     if (end > end_in and end - pos > SPLIT_SHAPE_MAX_ROWS) end = end_in;
+    // R64j (SUSHI_R64_SPLIT_PLAN=1): within the last two chunk widths, plan the whole covered tail at once
+    // instead of chunk by chunk: the current chunk is sized so that it, then cover(it), then cover(that), ...
+    // down to a final chunk of about `last` rows, sums to the rows left; a chunk in flight (`prev`) is
+    // still covered. Interior checkpoint boundaries in that stretch are skipped (the end-of-prompt
+    // snapshot always lands). Chunk placement only, as above.
+    if (last > 0 and default_chunk > 0 and splitPlanEnabled()) {
+        const rest = loop_end - pos;
+        if (rest <= 2 * default_chunk) {
+            const c = splitPlanTail(rest, prev, last);
+            if (std.c.getenv("SUSHI_R64_SPLIT_PLAN_LOG") != null) log.info("  [r64-plan] pos {d} (abs {d}) rest {d} prev {d} plain {d} default {d} -> chunk {d}\n", .{ pos, pos + offset, rest, prev, end_in - pos, default_chunk, @min(c, SPLIT_SHAPE_MAX_ROWS) });
+            return pos + @min(c, SPLIT_SHAPE_MAX_ROWS);
+        }
+    }
     return end;
+}
+
+var split_plan_env: ?bool = null;
+fn splitPlanEnabled() bool {
+    if (split_plan_env == null) split_plan_env = if (std.c.getenv("SUSHI_R64_SPLIT_PLAN")) |v| v[0] == '1' else false;
+    return split_plan_env.?;
+}
+
+/// Rows the covered tail starting with a `c`-row chunk spans: c, then splitCoverRows(c), ... until the next
+/// chunk would be under `2 * last` (that remainder becomes the final chunk, so it is at least `last`).
+fn splitTailSpan(c: usize, last: usize) usize {
+    var total: usize = c;
+    var cur = c;
+    var guard: usize = 0;
+    while (guard < 16) : (guard += 1) {
+        const nxt = splitCoverRows(cur);
+        if (nxt >= cur or nxt < 2 * last) return total + @max(nxt, last);
+        total += nxt;
+        cur = nxt;
+    }
+    return total;
+}
+
+/// The current chunk's rows for a covered tail of exactly `rest` rows (`prev` = the chunk in flight):
+/// the largest c whose tail span fits `rest`, at least cover(prev) (else the Mac would stall now).
+pub fn splitPlanTail(rest: usize, prev: usize, last: usize) usize {
+    if (rest <= 2 * last) return rest;
+    const floor_c: usize = if (prev > 0) @min(splitCoverRows(prev), rest) else 1;
+    var lo: usize = 1;
+    var hi: usize = rest;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2;
+        if (splitTailSpan(mid, last) <= rest) lo = mid else hi = mid - 1;
+    }
+    var c = @max(lo, floor_c);
+    // a remainder too small to be its own chunk rides with this one
+    if (rest - @min(c, rest) < last) c = rest;
+    return @min(c, rest);
+}
+
+test "R64j covered tail plan" {
+    // A2-like: 4720 rows, nothing in flight -> a chunk of ~half, the rest covered down to a small final
+    const c1 = splitPlanTail(4720, 0, 384);
+    try std.testing.expect(c1 > 2000 and c1 < 3000);
+    const c2 = splitPlanTail(4720 - c1, c1, 384);
+    try std.testing.expect(c2 >= splitCoverRows(c1));
+    // a tiny remainder is one chunk
+    try std.testing.expectEqual(@as(usize, 500), splitPlanTail(500, 4096, 384));
 }
 
 fn splitEnvRows(name: [*:0]const u8, comptime default: usize) usize {
@@ -5093,6 +5226,13 @@ pub const Generator = struct {
         /// depth's row is its one-hot. len m_hi; [0..n_qp) valid.
         q_probs: ?[]mlx.mlx_array,
         n_qp: u32,
+        /// R64i: per depth, the shortlist's [32] candidate ids and their [1, 32] f32 proposal density (the
+        /// small form of q_probs, read on the host by the CPU acceptance); q_kind 1 = present, 2 = one-hot
+        /// (an argmax depth), 0 = unknown (use q_probs). Allocated with q_probs; [0..n_qs) valid.
+        q_cands: ?[]mlx.mlx_array = null,
+        q_small: ?[]mlx.mlx_array = null,
+        q_kind: ?[]u8 = null,
+        n_qs: u32 = 0,
         /// Chain hidden after the last built step (owned) — a chunk-B
         /// extension resumes from it; freed once the chain is complete.
         h_chain: ?mlx.mlx_array,
@@ -5114,6 +5254,15 @@ pub const Generator = struct {
             if (self.q_probs) |slots| {
                 for (slots[0..self.n_qp]) |arr| _ = mlx.mlx_array_free(arr);
                 allocator.free(slots);
+            }
+            if (self.q_small) |slots| {
+                for (slots[0..self.n_qs], self.q_cands.?[0..self.n_qs]) |a, c| {
+                    if (a.ctx != null) _ = mlx.mlx_array_free(a);
+                    if (c.ctx != null) _ = mlx.mlx_array_free(c);
+                }
+                allocator.free(slots);
+                allocator.free(self.q_cands.?);
+                allocator.free(self.q_kind.?);
             }
             if (self.h_chain) |h| _ = mlx.mlx_array_free(h);
             allocator.free(self.drafts);
@@ -5146,6 +5295,9 @@ pub const Generator = struct {
             .n_conf = 0,
             .q_probs = q_probs,
             .n_qp = 0,
+            .q_cands = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null,
+            .q_small = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null,
+            .q_kind = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(u8, plan.m_hi) else null,
             .h_chain = null,
             .m = plan.m_lo,
         };
@@ -5411,9 +5563,21 @@ pub const Generator = struct {
                 if (try head.draftShortlist(xfm, rerank_x, draft_sampling.suppress_mask)) |shortlist| {
                     var sl = shortlist;
                     defer sl.deinit();
-                    const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
+                    const draw = self.mtpSamplingDraw(draft_sampling);
+                    var keep_c: mlx.mlx_array = .{ .ctx = null };
+                    var keep_q: mlx.mlx_array = .{ .ctx = null };
+                    const prop = if (chain.q_small != null and !isGreedyTemperature(draw.temperature))
+                        try shortlistProposalKeep(sl, draw, s, &keep_c, &keep_q)
+                    else
+                        try shortlistStepProposal(sl, draw, s);
                     chain.draft_arrs[i] = prop.id;
                     slots[i] = prop.q;
+                    if (chain.q_small) |qs| {
+                        qs[i] = keep_q;
+                        chain.q_cands.?[i] = keep_c;
+                        chain.q_kind.?[i] = if (keep_q.ctx != null) 1 else if (isGreedyTemperature(draw.temperature)) 2 else 0;
+                        chain.n_qs = i + 1;
+                    }
                     if (shortconf) {
                         chain.conf_arrs.?[i] = try shortlistConfidenceGraph(sl, prop.id, s);
                         chain.n_conf = i + 1;
@@ -5426,6 +5590,12 @@ pub const Generator = struct {
                     const prop = try argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
                     chain.draft_arrs[i] = prop.id;
                     slots[i] = prop.q;
+                    if (chain.q_small) |qs| {
+                        qs[i] = .{ .ctx = null };
+                        chain.q_cands.?[i] = .{ .ctx = null };
+                        chain.q_kind.?[i] = 2;
+                        chain.n_qs = i + 1;
+                    }
                 }
                 chain.n_qp = i + 1;
             } else if (use_rerank) {
@@ -5971,6 +6141,202 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_astype(&accept_q, flat, .float32, s));
         }
 
+        return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
+    }
+
+    /// R64 sparse acceptance (SUSHI_R64_SPARSE_ACCEPT=1, stage-head rounds): the exact acceptance graph over
+    /// each verify row's top-20 (the stage head's ids and values, best first) instead of `[1+m, vocab]`.
+    /// The filter is `probsAllPositions`' (temperature, top-k, the f32 nucleus with its exclusive scan,
+    /// a precise softmax), the residual and bonus law `mtpBatchedAcceptGraph`'s: the residual
+    /// max(p - q, 0) lives where p > 0, inside the 20. The categorical draws run over the 20 rather
+    /// than the vocabulary, so samples differ from the dense graph's for a given key; the law does not.
+    fn sparseAcceptGraph(
+        ids3: mlx.mlx_array,
+        vals3: mlx.mlx_array,
+        draft_arrs: []const mlx.mlx_array,
+        q_probs: ?[]const mlx.mlx_array,
+        m: u32,
+        sampling: SamplingParams,
+        s: mlx.mlx_stream,
+    ) !MtpBatchedGraph {
+        const rows: c_int = @intCast(1 + m);
+        const mi: c_int = @intCast(m);
+        const kk: c_int = if (sampling.top_k >= 1 and sampling.top_k < 20) @intCast(sampling.top_k) else 20;
+        const st1 = [_]c_int{ 1, 1, 1 };
+        var ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids);
+        var vals = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vals);
+        {
+            var a = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(a);
+            try mlx.check(mlx.mlx_slice(&a, ids3, &.{ 0, 0, 0 }, 3, &.{ 1, rows, kk }, 3, &st1, 3, s));
+            try mlx.check(mlx.mlx_reshape(&ids, a, &.{ rows, kk }, 2, s));
+            var b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(b);
+            try mlx.check(mlx.mlx_slice(&b, vals3, &.{ 0, 0, 0 }, 3, &.{ 1, rows, kk }, 3, &st1, 3, s));
+            try mlx.check(mlx.mlx_reshape(&vals, b, &.{ rows, kk }, 2, s));
+        }
+        var logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logits);
+        if (sampling.temperature != 1.0) {
+            const t = mlx.mlx_array_new_float(sampling.temperature);
+            defer _ = mlx.mlx_array_free(t);
+            try mlx.check(mlx.mlx_divide(&logits, vals, t, s));
+        } else try mlx.check(mlx.mlx_array_set(&logits, vals));
+        if (sampling.top_p < 1.0) {
+            var lf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(lf);
+            try mlx.check(mlx.mlx_astype(&lf, logits, .float32, s));
+            var pf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pf);
+            try mlx.check(mlx.mlx_softmax_axis(&pf, lf, -1, true, s));
+            var above = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(above);
+            try mlx.check(mlx.mlx_cumsum(&above, pf, -1, false, false, s));
+            const thr = mlx.mlx_array_new_float(@max(sampling.top_p, std.math.floatMin(f32)));
+            defer _ = mlx.mlx_array_free(thr);
+            var keep = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(keep);
+            try mlx.check(mlx.mlx_less(&keep, above, thr, s));
+            const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
+            defer _ = mlx.mlx_array_free(ninf);
+            var masked = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_where(&masked, keep, logits, ninf, s));
+            _ = mlx.mlx_array_free(logits);
+            logits = masked;
+        }
+        var p = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p);
+        try mlx.check(mlx.mlx_softmax_axis(&p, logits, -1, true, s));
+        const st2 = [_]c_int{ 1, 1 };
+        var p_rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p_rows);
+        try mlx.check(mlx.mlx_slice(&p_rows, p, &.{ 0, 0 }, 2, &.{ mi, kk }, 2, &st2, 2, s));
+        var bonus = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bonus);
+        try mlx.check(mlx.mlx_slice(&bonus, p, &.{ mi, 0 }, 2, &.{ mi + 1, kk }, 2, &st2, 2, s));
+        var ids_rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_rows);
+        try mlx.check(mlx.mlx_slice(&ids_rows, ids, &.{ 0, 0 }, 2, &.{ mi, kk }, 2, &st2, 2, s));
+        var d2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d2);
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
+            var flat32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat32);
+            try mlx.check(mlx.mlx_astype(&flat32, flat, .int32, s));
+            try mlx.check(mlx.mlx_reshape(&d2, flat32, &.{ mi, 1 }, 2, s));
+        }
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_equal(&eq, ids_rows, d2, s));
+        // proposal densities at the candidate ids [m, kk] and at each draft [m]
+        var q_at = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_at);
+        var accept_q: mlx.mlx_array = .{ .ctx = null };
+        errdefer if (accept_q.ctx != null) {
+            _ = mlx.mlx_array_free(accept_q);
+        };
+        if (q_probs) |qs| {
+            const v_at = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(v_at);
+            const v_d = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(v_d);
+            for (qs[0..m], 0..) |q, k| {
+                const kc: c_int = @intCast(k);
+                var row_ids = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(row_ids);
+                try mlx.check(mlx.mlx_slice(&row_ids, ids_rows, &.{ kc, 0 }, 2, &.{ kc + 1, kk }, 2, &st2, 2, s));
+                var q2 = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(q2);
+                const qsh = mlx.getShape(q);
+                try mlx.check(mlx.mlx_reshape(&q2, q, &.{ 1, qsh[qsh.len - 1] }, 2, s));
+                var at = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(at);
+                try mlx.check(mlx.mlx_take_along_axis(&at, q2, row_ids, -1, s));
+                _ = mlx.mlx_vector_array_append_value(v_at, at);
+                var dk = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(dk);
+                try mlx.check(mlx.mlx_slice(&dk, d2, &.{ kc, 0 }, 2, &.{ kc + 1, 1 }, 2, &st2, 2, s));
+                var qd = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(qd);
+                try mlx.check(mlx.mlx_take_along_axis(&qd, q2, dk, -1, s));
+                _ = mlx.mlx_vector_array_append_value(v_d, qd);
+            }
+            try mlx.check(mlx.mlx_concatenate_axis(&q_at, v_at, 0, s));
+            var qd_all = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(qd_all);
+            try mlx.check(mlx.mlx_concatenate_axis(&qd_all, v_d, 0, s));
+            var qd_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(qd_flat);
+            try mlx.check(mlx.mlx_reshape(&qd_flat, qd_all, &.{mi}, 1, s));
+            accept_q = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&accept_q, qd_flat, .float32, s));
+        } else {
+            try mlx.check(mlx.mlx_astype(&q_at, eq, mlx.mlx_array_dtype(p), s));
+        }
+        var corr_samples = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(corr_samples);
+        {
+            var diff = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(diff);
+            try mlx.check(mlx.mlx_subtract(&diff, p_rows, q_at, s));
+            const zero = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var residual = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(residual);
+            try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
+            var stack = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stack);
+            {
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                _ = mlx.mlx_vector_array_append_value(vec, residual);
+                _ = mlx.mlx_vector_array_append_value(vec, bonus);
+                try mlx.check(mlx.mlx_concatenate_axis(&stack, vec, 0, s));
+            }
+            var log_stack = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(log_stack);
+            try mlx.check(mlx.mlx_log(&log_stack, stack, s));
+            const key = seedKey(sampling);
+            defer _ = mlx.mlx_array_free(key);
+            var idx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(idx);
+            try mlx.check(mlx.mlx_random_categorical(&idx, log_stack, -1, key, s));
+            var idx2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(idx2);
+            var idx32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(idx32);
+            try mlx.check(mlx.mlx_astype(&idx32, idx, .int32, s));
+            try mlx.check(mlx.mlx_reshape(&idx2, idx32, &.{ rows, 1 }, 2, s));
+            var picked = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(picked);
+            try mlx.check(mlx.mlx_take_along_axis(&picked, ids, idx2, -1, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, picked, &.{rows}, 1, s));
+            try mlx.check(mlx.mlx_astype(&corr_samples, flat, .int32, s));
+        }
+        var accept_p = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(accept_p);
+        {
+            var eqf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eqf);
+            try mlx.check(mlx.mlx_astype(&eqf, eq, mlx.mlx_array_dtype(p_rows), s));
+            var prod = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(prod);
+            try mlx.check(mlx.mlx_multiply(&prod, p_rows, eqf, s));
+            var sum = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sum);
+            try mlx.check(mlx.mlx_sum_axis(&sum, prod, -1, false, s));
+            try mlx.check(mlx.mlx_astype(&accept_p, sum, .float32, s));
+        }
         return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
     }
 
@@ -6892,12 +7258,20 @@ pub const Generator = struct {
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
         self.ctx.ple_defer = true;
+        @import("qwen4_exp.zig").verify_t0_ns = @import("qwen4_exp.zig").nowBootNs();
         self.ctx.verify_rows = xfm.config.isMimo();
         defer self.ctx.verify_rows = false;
         // R64: the verify's hidden captures ride the round's batched eval (Phase 4b) instead of two
         // blocking settles right after the forward (SUSHI_R64_VERIFY_NOSETTLE=1).
         self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
         defer self.ctx.capture_settle = true;
+        // R64 stage head (SUSHI_R64_STAGE_HEAD=1): the 5090 runs the mixer, the lm_head and a top-20; the verify
+        // logits are that top-20 (-inf elsewhere). Exact for a sampler that reads at most the top 20 (top-k
+        // first, no penalties or think shifts); a suppressed id in the top 20 falls back to the Mac's head.
+        self.ctx.stage_head = self.ctx.stage_split and r64EnvOn(&r64_stage_head_env, "SUSHI_R64_STAGE_HEAD") and
+            !penaltyActive(self.sampling) and !self.sampling.think_penalty.active() and self.sampling.call_force == null and
+            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20));
+        defer self.ctx.stage_head = false;
         var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
@@ -7196,6 +7570,7 @@ pub const Generator = struct {
         // The group already built and dispatched this row's Phase 4 with the rest
         // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
         const prepared = stochastic and st.accept_p.ctx != null;
+        var cpu_acc = false;
         if (prepared) {
             _ = mlx.mlx_array_free(accept_p_vec);
             accept_p_vec = st.accept_p;
@@ -7211,9 +7586,26 @@ pub const Generator = struct {
             var live_logits = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(live_logits);
             try mlx.check(mlx.mlx_slice(&live_logits, verify_logits, &.{ 0, 0, 0 }, 3, &.{ vl_shape[0], @intCast(1 + m), vl_shape[2] }, 3, &.{ 1, 1, 1 }, 3, s));
-            const probs_all = try probsAllPositions(live_logits, self.sampling, s);
+            // R64: a stage-head round's top-20 rows feed the sparse acceptance (SUSHI_R64_SPARSE_ACCEPT=1).
+            const sparse = r64EnvOn(&r64_sparse_env, "SUSHI_R64_SPARSE_ACCEPT") and self.ctx.stage_head_ids.ctx != null and
+                !chain.lookup and self.acceptGraphFor(chain.lookup) == mtpBatchedExactGraph and
+                mlx.getShape(self.ctx.stage_head_ids)[1] == @as(c_int, @intCast(1 + m));
+            cpu_acc = sparse and r64CpuAccept();
+            if (!cpu_acc) {
+            const probs_all = if (sparse) mlx.mlx_array_new() else try probsAllPositions(live_logits, self.sampling, s);
             defer _ = mlx.mlx_array_free(probs_all);
-            const bg = try self.acceptGraphFor(chain.lookup)(
+            const bg = if (sparse) blk: {
+                r64_sparse_rounds += 1;
+                break :blk try sparseAcceptGraph(
+                    self.ctx.stage_head_ids,
+                    self.ctx.stage_head_vals,
+                    draft_arrs[0..m],
+                    if (q_probs) |qs| qs[0..m] else null,
+                    m,
+                    self.mtpSamplingDraw(self.sampling),
+                    s,
+                );
+            } else try self.acceptGraphFor(chain.lookup)(
                 probs_all,
                 draft_arrs[0..m],
                 if (q_probs) |qs| qs[0..m] else null,
@@ -7227,6 +7619,7 @@ pub const Generator = struct {
             accept_p_vec = bg.accept_p;
             accept_q_vec = bg.accept_q;
             accept_defer_vec = bg.accept_defer;
+            }
         }
 
         const group_argmax = st.verify_argmax.present();
@@ -7245,21 +7638,27 @@ pub const Generator = struct {
 
         // ── Phase 4b: one batched async eval for the whole round ──
         // A prepared row rode the group's eval; everything here is already on it.
+        // R64h (SUSHI_R64_DEFER_CAPTURES=1; 2 = alternate per 32-round trace window): leave the verify's hidden
+        // captures (next round's MTP input) out of this batch, so the acceptance values the host waits on
+        // are not queued behind them; they start right after the accepted count is known. Same values.
+        const defer_caps = !prepared and r64DeferCaptures();
         const dispatch_lap = SubLap.start(tracing, self.timer.io);
         if (!prepared) {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
-            if (stochastic) {
+            if (stochastic and !cpu_acc) {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
                 if (accept_q_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
                 if (accept_defer_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_defer_vec);
                 _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
-            } else {
+            } else if (!stochastic) {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
-            _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
+            if (!defer_caps) {
+                _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
+            }
             try mlx.check(mlx.mlx_async_eval(eval_vec));
         }
         dispatch_lap.stop(&self.mtp_trace, .dispatch);
@@ -7279,7 +7678,63 @@ pub const Generator = struct {
 
         var accepted: u32 = 0;
         var greedy_next_pending: u32 = 0;
-        if (stochastic) {
+        // R64i host acceptance state (rows <= 17, top-20 each)
+        var ca_p: [17][20]f32 = undefined;
+        var ca_kk: usize = 20;
+        var ca_ids: [*]const i32 = undefined;
+        if (stochastic and cpu_acc) {
+            r64_cpuacc_n += 1;
+            const rows: usize = 1 + m;
+            ca_kk = if (self.sampling.top_k >= 1 and self.sampling.top_k < 20) self.sampling.top_k else 20;
+            ca_ids = mlx.mlx_array_data_int32(self.ctx.stage_head_ids) orelse return error.MlxArrayDataNull;
+            const vals_h = mlx.mlx_array_data_bfloat16(self.ctx.stage_head_vals) orelse return error.MlxArrayDataNull;
+            for (0..rows) |r| {
+                const lg = ca_p[r][0..ca_kk];
+                for (lg, 0..) |*x, j| {
+                    x.* = r64Bf16(vals_h[r * 20 + j]);
+                    if (self.sampling.temperature != 1.0) x.* /= self.sampling.temperature;
+                }
+                if (self.sampling.top_p < 1.0) {
+                    var pf: [20]f32 = undefined;
+                    @memcpy(pf[0..ca_kk], lg);
+                    r64Softmax(pf[0..ca_kk]);
+                    const thr = @max(self.sampling.top_p, std.math.floatMin(f32));
+                    var above: f32 = 0;
+                    for (lg, 0..) |*x, j| {
+                        if (!(above < thr)) x.* = -std.math.inf(f32);
+                        above += pf[j];
+                    }
+                }
+                r64Softmax(lg);
+            }
+            var acc_p: [16]f32 = undefined;
+            var acc_q: [16]f32 = undefined;
+            // one eval for every depth's small q (already computed with the drafts; skips per-array evals)
+            if (chain.q_small) |small| {
+                const ev = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(ev);
+                for (0..@min(m, chain.n_qs)) |k| if (chain.q_kind.?[k] == 1) {
+                    _ = mlx.mlx_vector_array_append_value(ev, small[k]);
+                    _ = mlx.mlx_vector_array_append_value(ev, chain.q_cands.?[k]);
+                };
+                if (mlx.mlx_vector_array_size(ev) > 0) try mlx.check(mlx.mlx_eval(ev));
+            }
+            for (0..m) |k| {
+                acc_p[k] = 0;
+                for (0..ca_kk) |j| {
+                    if (ca_ids[k * 20 + j] == @as(i32, @intCast(drafts[k]))) acc_p[k] = ca_p[k][j];
+                }
+                if (q_probs) |qs| {
+                    acc_q[k] = try r64HostQ(chain, qs, k, drafts[k]);
+                }
+            }
+            accepted = self.acceptPrefixFor(chain.lookup)(acc_p[0..m], if (q_probs != null) acc_q[0..m] else null, null, &self.prng);
+            accepted = capAcceptedForTokenBudget(
+                accepted,
+                self.completion_tokens,
+                self.max_tokens,
+            );
+        } else if (stochastic) {
             // Sharp drafts: full Leviathan ratio min(1, p/q) against the
             // proposal's own density. Greedy-forced drafts keep the exact
             // one-hot rule min(1, target_p).
@@ -7318,7 +7773,38 @@ pub const Generator = struct {
         accepted = stop_prefix.accepted;
         const next_pending: u32 = blk: {
             if (stop_prefix.stop) |stop| break :blk stop;
-            if (stochastic) {
+            if (stochastic and cpu_acc) {
+                // residual max(p - q, 0) at a rejected draft, p itself on the bonus row; within the top-20
+                const a: usize = accepted;
+                var w: [20]f32 = undefined;
+                var tot: f32 = 0;
+                for (0..ca_kk) |j| {
+                    const id = ca_ids[a * 20 + j];
+                    var qv: f32 = 0;
+                    if (a < m) {
+                        qv = if (q_probs) |qs| try r64HostQ(chain, qs, a, @intCast(id)) else if (id == @as(i32, @intCast(drafts[a]))) 1 else 0;
+                    }
+                    w[j] = @max(ca_p[a][j] - qv, 0);
+                    tot += w[j];
+                }
+                if (!(tot > 0)) {
+                    tot = 0;
+                    for (0..ca_kk) |j| {
+                        w[j] = ca_p[a][j];
+                        tot += w[j];
+                    }
+                }
+                const u = self.prng.random().float(f32) * tot;
+                var acc: f32 = 0;
+                var pick: usize = 0;
+                for (0..ca_kk) |j| {
+                    if (w[j] <= 0) continue;
+                    pick = j;
+                    acc += w[j];
+                    if (u < acc) break;
+                }
+                break :blk @intCast(ca_ids[a * 20 + pick]);
+            } else if (stochastic) {
                 try mlx.check(mlx.mlx_array_eval(corr_batch));
                 const d = mlx.mlx_array_data_int32(corr_batch) orelse {
                     return error.MlxArrayDataNull;
@@ -7329,6 +7815,13 @@ pub const Generator = struct {
             }
         };
 
+        if (defer_caps) {
+            const cv = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(cv);
+            _ = mlx.mlx_vector_array_append_value(cv, new_hidden);
+            _ = mlx.mlx_vector_array_append_value(cv, verify_hidden_all);
+            try mlx.check(mlx.mlx_async_eval(cv));
+        }
         if (tracing) {
             self.mtp_trace.add(.eval, ph.read());
             ph.reset();
@@ -9677,6 +10170,15 @@ pub const Generator = struct {
                 t.subAvgMs(.chain),
             },
         );
+        if (qwen4_forward.r64_head_used + qwen4_forward.r64_head_fallback > 0) log.info("  [r64-head] used {d} fallback {d} sparse {d}\n", .{ qwen4_forward.r64_head_used, qwen4_forward.r64_head_fallback, r64_sparse_rounds });
+        if (r64_defcap_mode orelse 0 != 0) log.info("  [r64-defcap] window defer={d}\n", .{r64_defcap_window_mode});
+        if (r64_cpuacc_mode orelse 0 != 0) log.info("  [r64-cpuacc] window cpu={d} (host-accepted rounds {d})\n", .{ r64_cpuacc_window, r64_cpuacc_n });
+        {
+            const q4 = @import("qwen4_exp.zig");
+            if (q4.ple_h_n > 0 and q4.ple_p_n > 0) log.info("  [r64-ple-ab] pool {d}: mean {d:.3} ms, max {d:.2}, >1 ms {d} | lean-or-hybrid {d}: mean {d:.3} ms, max {d:.2}, >1 ms {d}, resident {d}/{d}\n", .{ q4.ple_p_n, @as(f64, @floatFromInt(q4.ple_p_ns)) / @as(f64, @floatFromInt(q4.ple_p_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_p_max_ns)) / 1e6, q4.ple_p_over1, q4.ple_h_n, @as(f64, @floatFromInt(q4.ple_h_ns)) / @as(f64, @floatFromInt(q4.ple_h_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_h_max_ns)) / 1e6, q4.ple_h_over1, q4.ple_res_resident, q4.ple_res_rows });
+            if (q4.ple_fl_n > 0) log.info("  [r64-ple-flush] {d} flushes: start {d:.3} ms into the verify, ids wait {d:.3} ms\n", .{ q4.ple_fl_n, @as(f64, @floatFromInt(q4.ple_fl_at_ns)) / @as(f64, @floatFromInt(q4.ple_fl_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_fl_wait_ns)) / @as(f64, @floatFromInt(q4.ple_fl_n)) / 1e6 });
+            if (q4.ple_g_n > 0) log.info("  [r64-ple] decode gathers {d}: mean {d:.3} ms, max {d:.2} ms, >1 ms {d}, >5 ms {d}; keep-alive reads {d}; resident {d}/{d}\n", .{ q4.ple_g_n, @as(f64, @floatFromInt(q4.ple_g_ns)) / @as(f64, @floatFromInt(q4.ple_g_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_g_max_ns)) / 1e6, q4.ple_g_over1, q4.ple_g_over5, q4.ple_keepalive_reads.load(.monotonic), q4.ple_res_resident, q4.ple_res_rows });
+        }
         t.reset();
     }
 
@@ -10793,6 +11295,42 @@ fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx
 
     const q = try scatterShortlistQ(sl, q32, s);
     _ = mlx.mlx_array_free(q32);
+    return .{ .id = id, .q = q };
+}
+
+/// `shortlistProposal` that also hands out references to the shortlist's [32] candidate ids and the [1, 32]
+/// f32 density the draft was drawn from (R64i: the host acceptance reads q from them; both are computed
+/// with the draft id, so reading them adds no GPU work). Same graph, same draw.
+fn shortlistProposalKeep(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream, cands_out: *mlx.mlx_array, q32_out: *mlx.mlx_array) !StepProposal {
+    const shape = mlx.getShape(sl.exact);
+    const n = shape[shape.len - 1];
+    var rows = mlx.mlx_array_new();
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const row_shape = [_]c_int{ 1, n };
+        try mlx.check(mlx.mlx_reshape(&flat, sl.exact, &row_shape, 2, s));
+        errdefer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_astype(&rows, flat, .float32, s));
+    }
+    var draft = sampling;
+    draft.suppress_mask = null;
+    const q32 = try filteredProbsRows(rows, draft, s);
+    errdefer _ = mlx.mlx_array_free(q32);
+    var id = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(id);
+    {
+        const pick = try sampleFromProbsLazy(q32, sampling, s);
+        defer _ = mlx.mlx_array_free(pick);
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, sl.cands, pick, 0, s));
+        try mlx.check(mlx.mlx_astype(&id, picked, .int32, s));
+    }
+    const q = try scatterShortlistQ(sl, q32, s);
+    cands_out.* = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(cands_out, sl.cands);
+    q32_out.* = q32;
     return .{ .id = id, .q = q };
 }
 

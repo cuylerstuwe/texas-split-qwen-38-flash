@@ -14,13 +14,17 @@ texas-split cuts the stack after layer 27:
 ```
             Apple Silicon Mac (Sushi, MLX/Metal)                    RTX 5090 (stage server, CUDA)
  tokens ─► embeddings, n-gram table, layers 0–27 ──HC stream──► layers 28–47 (5 attention, 15 GDN, MoE)
- sample ◄─ final mixer, LM head, MTP draft head ◄──HC stream───┘
+ sample ◄─ final mixer, LM head, MTP draft head ◄──HC stream───┤
+ accept ◄─ (MTP verify rounds) ◄──── top-20 per row ──────────── final mixer, 8-bit LM head, top-20
 ```
 
-Each row crossing the cut is 20 KB each way over Thunderbolt. The 5090 holds layers 28–47's weights and
-their per-sequence state (attention KV in 8-bit affine form, the QSA index, the recurrent states), sized for
-262,160 positions. Sushi keeps every layer's weights resident as well, which is what lets it carry on
-alone when the 5090 fails.
+Each row crossing the cut is 20 KB each way over Thunderbolt. For an MTP verify round the 5090 also runs the
+final mixer, the 8-bit LM head and a top-20 per row right after layer 47, and returns those 20 candidates
+(160 bytes a row) with the stream; the Mac decides acceptance on them instead of running its own head for
+those rows ([sushi/FORK.md](../sushi/FORK.md) §6). The 5090 holds layers 28–47's weights, the head, and their
+per-sequence state (attention KV in 8-bit affine form, the QSA index, the recurrent states), sized for
+262,160 positions; about 0.6 GB of the card stays free. Sushi keeps every layer's weights resident as well,
+which is what lets it carry on alone when the 5090 fails.
 
 ## Sushi side (`sushi/`)
 
@@ -34,16 +38,18 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
   in pieces: finished layers of the verify go to the GPU while the CPU builds the rest of the graph, each
   draft step starts as soon as it is built, and the verify's captured hidden states are read in the
   round's one batched eval ([sushi/FORK.md](../sushi/FORK.md) §5). The n-gram embedding a verify gathers
-  late is filled before the rows go to the stage (§3).
-- **Prefill** — prompt chunks (up to 2,048 rows) are pipelined two deep: while the 5090 runs chunk *n*, the
-  Mac runs layers 0–27 of chunk *n+1*. With each chunk the stage returns its layer state for those rows
-  (the "pull-back"), so Sushi's caches stay complete. The prefix cache, MTP history and SSM checkpoints
-  work as without the split, and a later request can seed the stage from them. The stage prefills about
-  2K rows per 324 ms (~6.3K tok/s); the Mac's layers 0–27 are the bottleneck: 2.8–3.4K tok/s on cold
-  64K–192K-token prompts, and 1.5× stock Sushi on the same cold 54K-token prompt. A split at layer 28 can
-  reach at most ~1.6× (the Mac's share of stock prefill time is ~62–65%). Chunk ends are shaped so the
-  pipeline rarely waits: no sliver chunks next to SSM checkpoint boundaries, and a tail sized so the Mac's
-  chunk covers the stage's previous one, leaving a short final chunk to drain (§4).
+  late is filled before the rows go to the stage (§3). With the stage head (§6), the verify's logits are the
+  5090's top-20 per row, which is exact for a sampler that reads at most 20 candidates (the thinking
+  defaults; other requests keep the Mac's head).
+- **Prefill** — prompt chunks (4,096 rows, reshaped near checkpoint boundaries and at the end) are pipelined
+  two deep: while the 5090 runs chunk *n* (in 1,536-row pieces), the Mac runs layers 0–27 of chunk *n+1*.
+  With each chunk the stage returns its layer state for those rows (the "pull-back"), so Sushi's caches stay
+  complete. The prefix cache, MTP history and SSM checkpoints work as without the split, and a later request
+  can seed the stage from them. The stage prefills at ~5.6–6.3K tok/s; the Mac's layers 0–27 are the
+  bottleneck (~3.5–3.8K tok/s on cold 20K–54K-token prompts). The Mac keeps each dense weight's dequantized
+  bf16 copy instead of rebuilding it for every chunk (§7). The last two chunk widths of a prompt are planned
+  together, so each Mac chunk covers the stage's work on the previous one and the final chunk is short
+  (§4, §7).
 - **Seeding** — when the stage does not hold the request's sequence (a new request with a prefix-cache hit,
   say), Sushi uploads its exact committed state for layers 28–47 (about 5.9 KB per position plus 48 MB of
   recurrent state; up to 1.56 GB at full context, through a 2 GiB shared file).

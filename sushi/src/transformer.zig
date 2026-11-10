@@ -12966,6 +12966,14 @@ pub const ForwardCtx = struct {
     /// certified-below-the-winner elsewhere — exactly enough for an argmax,
     /// not for a tail distribution. Default false = dense path everywhere.
     argmax_only: bool = false,
+    /// R64 (SUSHI_R64_STAGE_HEAD=1, stage QD_STAGE_HEAD=1): ask the stage for the final mixer + lm_head +
+    /// top-20 of a split decode forward; the forward then returns sparse logits (the top-20, -inf elsewhere)
+    /// instead of running the Mac's head. Set only when the sampler reads at most the top 20.
+    stage_head: bool = false,
+    /// R64: the last stage-head forward's `[1, rows, 20]` token ids (int32) and BF16 values, best first
+    /// (null after a forward that did not use the stage head); the sparse acceptance reads them.
+    stage_head_ids: mlx.mlx_array = .{ .ctx = null },
+    stage_head_vals: mlx.mlx_array = .{ .ctx = null },
     /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
     /// Non-null means: this forward runs at `batch == batch_slots.len`,
     /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
@@ -16858,8 +16866,10 @@ pub const Transformer = struct {
         const ids_c = try self.plePrepareIds(token_ids);
         defer _ = mlx.mlx_array_free(ids_c);
         var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
+        const f0 = qwen4_mod.nowBootNs();
         try mlx.check(mlx.mlx_array_eval(ids_c));
         self.verify_laps.ple_sync_ns = sync_lap.read();
+        qwen4_mod.notePleFlush(f0, qwen4_mod.nowBootNs() - f0);
         return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
     }
 
@@ -16921,11 +16931,14 @@ pub const Transformer = struct {
         defer if (!raw_bf16) self.allocator.free(host);
         var gclk: ProfClock = if (diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
         const kv_len: u64 = @intCast(ctx.moe_seq_offset.*);
+        if (raw_bf16) qwen4_mod.notePleResidency(&st.table, rows);
+        const g0 = qwen4_mod.nowBootNs();
         if (raw_bf16) {
             try st.table.gatherBf16Checked(self.allocator, rows, pk, kv_len);
         } else {
             try st.table.gatherChecked(rows, host, kv_len);
         }
+        qwen4_mod.notePleGather(qwen4_mod.nowBootNs() - g0, rows.len);
         if (diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         if (!raw_bf16) {
             std.debug.assert(pk.len == host.len);
@@ -26234,6 +26247,66 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
     return result;
 }
 
+// R64e (SUSHI_R64_DQ_CACHE_MB=<MiB>, default 0 = off): keep each weight's dequantized [K,N] view for the
+// later prefill chunks instead of re-dequantizing it per chunk (~4% of a prefill chunk's GPU time). The same
+// dequantize feeds the same GEMM: bit-identical. Keyed by the packed weight's and scales' buffer addresses,
+// shape and output dtype; each entry holds its own reference to the packed weight, so that buffer cannot be
+// freed and reused under the key. First come, first cached, within the budget (the Mac's split layers
+// first). The entry's dequant evaluates with the chunk that first uses it and stays resident.
+const DqKey = struct { wp: usize, sp: usize, n: c_int, k: c_int, dt: c_int };
+const DqEntry = struct { w: mlx.mlx_array, dq_t: mlx.mlx_array };
+var dq_cache: std.AutoHashMapUnmanaged(DqKey, DqEntry) = .{};
+var dq_cache_budget: ?usize = null;
+pub var dq_cache_bytes: usize = 0;
+pub var dq_cache_hits: u64 = 0;
+pub var dq_cache_full: bool = false;
+
+fn dqCacheBudget() usize {
+    if (dq_cache_budget) |b| return b;
+    const mb: usize = if (std.c.getenv("SUSHI_R64_DQ_CACHE_MB")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0 else 0;
+    dq_cache_budget = mb << 20;
+    return mb << 20;
+}
+
+/// The cached transposed dequant of `w` (borrowed: owned by the cache), or null when the budget is spent.
+fn dqCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, xd: mlx.mlx_dtype, s: mlx.mlx_stream) !?mlx.mlx_array {
+    const shape = mlx.getShape(w);
+    if (shape.len != 2) return null;
+    // model weights are resident; eval is a no-op for them and makes the addresses valid for anything else
+    try mlx.check(mlx.mlx_array_eval(w));
+    try mlx.check(mlx.mlx_array_eval(sc));
+    const wp = @intFromPtr(mlx.mlx_array_data_uint8(w) orelse return null);
+    const sp = @intFromPtr(mlx.mlx_array_data_uint8(sc) orelse return null);
+    const key = DqKey{ .wp = wp, .sp = sp, .n = shape[0], .k = shape[1], .dt = @intCast(@intFromEnum(xd)) };
+    if (dq_cache.get(key)) |e| {
+        dq_cache_hits += 1;
+        return e.dq_t;
+    }
+    if (dq_cache_full) return null;
+    var dq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq);
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
+    const dshape = mlx.getShape(dq);
+    if (dshape.len != 2) return null;
+    const bytes = @as(usize, @intCast(dshape[0])) * @as(usize, @intCast(dshape[1])) * 2;
+    if (dq_cache_bytes + bytes > dqCacheBudget()) {
+        dq_cache_full = true;
+        log.info("  [dq-cache] budget reached: {d} entries, {d} MiB\n", .{ dq_cache.count(), dq_cache_bytes >> 20 });
+        return null;
+    }
+    var dq_t = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(dq_t);
+    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+    var keep = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(keep);
+    try mlx.check(mlx.mlx_array_set(&keep, w));
+    try dq_cache.put(std.heap.page_allocator, key, .{ .w = keep, .dq_t = dq_t });
+    dq_cache_bytes += bytes;
+    if ((dq_cache_bytes >> 30) != ((dq_cache_bytes - bytes) >> 30))
+        log.info("  [dq-cache] {d} entries, {d} MiB\n", .{ dq_cache.count(), dq_cache_bytes >> 20 });
+    return dq_t;
+}
+
 /// The dequant+GEMM prefill route (see the block comment above
 /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
 fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
@@ -26248,6 +26321,16 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     if (rows < PREFILL_DQ_GEMM_MIN_M) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
+
+    if (dqCacheBudget() > 0) {
+        if (try dqCached(w, sc, bi, bits, group_size, xd, s)) |dq_t| {
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
+            prefill_dq_gemm_engaged += 1;
+            return out;
+        }
+    }
 
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);

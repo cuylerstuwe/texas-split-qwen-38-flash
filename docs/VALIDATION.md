@@ -6,21 +6,25 @@ revision `f25c0c4`. Evidence files are in [evidence/](evidence/); the tests are 
 ## Speed and quality
 
 - **Total task time** on recorded agentic coding sessions, replayed request by request (prefill + decode +
-  queueing, the thinking sampler): 1.28×, 1.33× and 1.34× faster than stock Sushi on the same pack (pooled
-  1.32×). Decode ~98–111 tok/s vs ~79–84 tok/s.
+  queueing, the thinking sampler, 1,024 tokens per turn, three seeds): 1.42×, 1.47× and 1.51× faster than
+  stock Sushi on the same pack (pooled 1.46×, 392.7 → 268.1 s) with the 2026-11-10 build; the first
+  release measured 1.28×, 1.33× and 1.34× (pooled 1.32×). Decode ~108–122 tok/s (first release ~98–111)
+  vs ~79–84 tok/s. The stock runs are the first release's (same harness and seeds; stock Sushi has not
+  changed).
 - **Prefill** (cold prompts, nothing cached):
 
   | Prompt | Stock Sushi, Mac only | texas-split |
   |---|---|---|
-  | 54K tokens, first turn of a recorded agent session (time to first token, same prompt) | 27.5 s (~2.0K tok/s) | 18.2 s (~3.0K tok/s): 1.52× |
+  | 54K tokens, first turn of a recorded agent session (time to first token, same prompt) | 27.5 s (~2.0K tok/s) | 16.8–17.2 s (~3.2K tok/s): 1.6× (first release 18.2 s, 1.52×) |
   | 63,596 tokens (two runs) | not run | 3,443 and 3,101 tok/s |
   | 192,008 tokens (two runs) | not run | 2,814 and 3,289 tok/s |
   | 8K / 32K tokens, separate runs with prefix caching off | 2,048–2,714 / 2,105–2,539 tok/s | — |
 
   Across the multi-turn sessions (later turns mostly cached), summed time to first token fell from 15.3 to
-  11.4 s (1.34×) in one session and from 38.7 to 25.8 s (1.50×) in the other. The 5090 runs its 20 layers'
-  prefill at ~6,300 tok/s (324 ms per 2,048 rows), so the Mac's 28 layers set the pace: a split at layer 28
-  can reach at most ~1.6×, and the 54K turn was within ~1.1 s of that. Run-to-run spread is about ±10%
+  10.3–10.6 s in one session and from 38.7 to 24.6–25.3 s in the other (first release: 11.4 and 25.8 s).
+  The 5090 runs its 20 layers' prefill at ~5,600–6,300 tok/s, so the Mac's 28 layers set the pace: the
+  split alone can reach about 1.6× (the Mac's share of stock prefill time is ~62–65%); the bf16 weight
+  cache speeds up the Mac's layers themselves. Run-to-run spread is about ±10%
   (heat, and whether the 95 GiB n-gram table is in the page cache). Two 63.6K runs that were parked
   mid-prefill by the priority tests (2,692 and 2,943 tok/s, pause included) are left out above.
 - **Quality**: mean KL divergence to a teacher model on a fixed prompt panel: 0.004463 split vs 0.004581
@@ -102,6 +106,43 @@ is dropped; a cancelled stream frees the engine.
 - **Disk.** Sushi parks a background request only when the SSD has the checkpoint size plus 32 GiB free.
   With less, the pause holds the request in RAM instead: resume is still exact, `park_error` shows in the
   priority status, and the engine log says `checkpoint SSD reserve unavailable`.
+
+## 2026-11-10 update (see CHANGELOG.md)
+
+- **Stage head.** Greedy continuations (A and B prompts, 512 tokens) are byte-identical with the head on and
+  off; 341 of 341 verify forwards used it. Over 2,164 sampled forwards, 6 fell back to the Mac's head (a
+  reserved special in the top 20). Production configuration, adaptive drafting, the agentic replay, two
+  seeds in counterbalanced order: a decode round 27.63 → 26.85 ms, the Mac's post-verify work 2.22 →
+  0.58 ms; 3,780 of 3,780 verify forwards used the head. At the 262,160-row capacity the card has
+  0.58 GiB free with 1,536-row prefill pieces (with 2,048 the first decode of a full-context sequence ran
+  out of memory); time to first token with 1,536-row pieces was not worse (counterbalanced runs).
+- **Dequant cache.** Fixed-depth replays of both sessions, two seeds: all twelve turns byte-identical with
+  the cache on and off. Summed time to first token per pair 38.3 / 37.3 → 36.4 / 35.4 s (cold 54K turn
+  18.3 → 16.6 s). Minimum available memory during the runs 3–4 GiB lower (24.8 GiB).
+- **Whole-tail chunk planning.** Time to first token per turn (single runs, the same prompts):
+
+  | turn | before | after |
+  |---|---|---|
+  | A0, cold 20K | 5.40–5.42 s | 5.41 s |
+  | A1, +7.9K | 2.60 s | 2.53 s |
+  | A2, +4.7K | 2.14 s | 1.71 s |
+  | B0, cold 54K | 15.2–16.4 s | 14.7 s |
+  | B1, +10.1K | 4.04–4.15 s | 3.41 s |
+  | B2, +10.1K | 4.02–4.11 s | 3.65 s |
+
+  Numerics (cold A0 and B0, then 24 greedy tokens with top-20 logprobs, speculation off), before vs after:
+  A0 greedy 11/24, mean KL 3.4e-3 (max 2.2e-2); B0 24/24, 2.4e-3 (3.6e-2). Switching the chunk width from
+  4,096 to 2,048 rows gives 11/24 (the same near-tie token), 2.5e-3 (1.4e-2) and 24/24, 4.3e-3 (4.1e-2).
+  The most likely next token at the end of prefill is unchanged in both.
+- **Replay benchmark** (the README's numbers; same harness and seeds as the first release's stock
+  comparison, the production configuration, adaptive drafting): seeds 61 / 62 / 63 total task 1.42× /
+  1.47× / 1.51× (session A 1.33–1.50×, B 1.48–1.52×), decode 108.4 / 111.8 / 121.8 tok/s, cold 54K first
+  turn 16.80 / 17.20 / 16.98 s.
+- **Qualification of the final build** (all three changes): priority suite 8/8 exact with SSD parking
+  ([evidence/priority-suite.json](evidence/priority-suite.json)); with `{"presence_penalty": 0}` added to
+  every case, 2,894 of 2,894 verify forwards used the stage head and the suite was again 8/8 exact;
+  smoke.py 10/10; `fault.py term`; `FAULT_NONCE=x fault.py prefill` (the stage killed 4 s into a cold
+  124K-token prefill; the Mac finished it correctly in 66.9 s).
 
 ## Not covered
 

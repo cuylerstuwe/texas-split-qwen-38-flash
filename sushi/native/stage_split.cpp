@@ -43,6 +43,16 @@ uint64_t g_rows = 0;    // rows of the last forward (uncommitted)
 size_t g_at = 0;        // seed blob cursor
 uint64_t g_forwards = 0, g_seeds = 0, g_partials = 0;
 double g_rpc_us = 0, g_copy_us = 0;
+// R64 stage head: request the final mixer + lm_head + top-20 with the next forward (op 1 aux bit 2); the reply's
+// per-row (20 BF16-valued f32 bit patterns, 20 token ids) are copied out of the shared file at receive time.
+int g_want_head = 0, g_head_rows = 0;
+uint32_t g_head_buf[16 * 40];
+// R64 (SUSHI_STAGE_INFER_COMMIT=1, a stage server that infers commits from positions): no op 2 round trip.
+static int infer_commit() {
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("SUSHI_STAGE_INFER_COMMIT"); v = (e && e[0] == '1') ? 1 : 0; }
+  return v;
+}
 // R60 S4 (prefill v2): pipelined chunk prefill through the stage (op 6). Two shm slots after the
 // forward/seed area; replies arrive in send order. While chunks are in flight no other op may run.
 constexpr size_t kSlotBase = size_t(256) << 20;
@@ -439,15 +449,21 @@ int stage_split_forward(mlx_array h, mlx_array* out, uint64_t position, int32_t 
   const double t1 = now_us();
   // infer the commit of the previous forward
   if (g_rows && position < g_base + g_rows) {
-    if (rpc(2, 0, 0, position - g_base)) return -1;
+    if (!infer_commit() && rpc(2, 0, 0, position - g_base)) return -1;
     g_partials++;
   }
   if (rope_delta < -(1 << 23) || rope_delta >= (1 << 23)) { fprintf(stderr, "[stage] rope delta %d out of range\n", rope_delta); return -1; }
-  if (rpc(1, rows, position, 0, (uint32_t(rope_delta) & 0xFFFFFFu) << 8)) return -1;
+  const int want_head = g_want_head;
+  g_head_rows = 0;
+  if (rpc(1, rows, position, 0, ((uint32_t(rope_delta) & 0xFFFFFFu) << 8) | (want_head ? 4u : 0u))) return -1;
   const double t2 = now_us();
   g_base = position;
   g_rows = rows;
   resident_add(g_owner);
+  if (want_head) {
+    memcpy(g_head_buf, g_shm + size_t(rows) * kF * 2, size_t(rows) * 40 * 4);
+    g_head_rows = int(rows);
+  }
   int oshape[3] = {1, int(rows), kF};
   mlx_array ob = mlx_array_new_data(g_shm, oshape, 3, MLX_BFLOAT16);
   const mlx_dtype want = mlx_array_dtype(h);
@@ -465,6 +481,14 @@ int stage_split_forward(mlx_array h, mlx_array* out, uint64_t position, int32_t 
     fprintf(stderr, "[stage] %llu forwards: rpc %.0f us, copies %.0f us avg; %llu partial commits, %llu seeds\n",
             (unsigned long long)g_forwards, g_rpc_us / g_forwards, g_copy_us / g_forwards,
             (unsigned long long)g_partials, (unsigned long long)g_seeds);
+  return 0;
+}
+void stage_split_set_head(int on) { g_want_head = on; }
+// The last forward's head rows (per row 20 BF16-valued f32 bit patterns then 20 token ids); -1 unless it
+// carried them for exactly `rows` rows.
+int stage_split_head_topk(uint32_t* dst, int rows) {
+  if (rows < 1 || rows > 16 || g_head_rows != rows) return -1;
+  memcpy(dst, g_head_buf, size_t(rows) * 40 * 4);
   return 0;
 }
 // R60 S4 (prefill v2): the empty state at position 0 (a request with no cached prefix): zero

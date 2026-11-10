@@ -108,3 +108,48 @@ the old path. The host sets all of them.
   extending a chain, its gate needs ln p(draft) for the first steps; that came from a full 248K-row head
   readout per draft step and now comes from the 32-candidate rerank shortlist. Drafter side only (the gate
   only sizes the draft). +2% decode throughput under the adaptive controller (three seeds).
+
+## 6. The head on the 5090: stage head, sparse acceptance, commit inference
+
+With `SUSHI_R64_STAGE_HEAD=1` (`src/generate.zig`, `src/qwen4_forward.zig`, `native/stage_split.cpp`) an MTP
+verify forward on the split asks the stage (op 1 aux bit 2, `QD_STAGE_HEAD=1` on the stage) to run the final
+HC mixer, the 8-bit lm_head (248,320 × 2560) and a top-20 per row right after layer 47. The verify logits are
+those 20 values per row (−inf elsewhere) and the Mac skips its own mixer + head for them.
+
+- Engaged only where it is exact: a sampler that reads at most the top 20 (top-k ≤ 20, or greedy) with no
+  presence/repeat penalty, logit bias or think penalty — Qwen's thinking defaults. MTP already excludes
+  logprobs, grammars and forced calls. A row whose top 20 holds a suppressed special falls back to the
+  Mac head for that forward.
+- `SUSHI_R64_SPARSE_ACCEPT=1`: the acceptance graph runs on those rows (`sparseAcceptGraph`): the same
+  filter as `probsAllPositions` (temperature, top-k, the f32 nucleus with its exclusive scan, a precise
+  softmax) and the same accept/residual/bonus law, over 20 candidates instead of the vocabulary. The law
+  is unchanged; the categorical draws differ, so a seeded sampled run's text differs from older builds
+  (greedy text does not).
+- `SUSHI_STAGE_INFER_COMMIT=1`: no separate COMMIT round trip; the stage infers a partial accept from the
+  next FORWARD's position (and PARK commits the same way).
+- The stage needs `QD_STAGE_PREFILL_ROWS=1536` at the 262K capacity for the head's 0.71 GB to fit.
+- −0.78 ms per decode round in the production configuration (the Mac's post-verify eval 2.22 → 0.58 ms).
+
+## 7. Prefill: dequant cache and whole-tail chunk planning
+
+- `SUSHI_R64_DQ_CACHE_MB=<MiB>` (`src/transformer.zig`, `prefillDqGemm`): keep each 8-bit dense weight's
+  dequantized bf16 copy for later prefill chunks instead of re-dequantizing it for every chunk (keyed by
+  the packed weight's and scales' buffer addresses, shape and dtype; each entry holds a reference to the
+  packed weight). Same operands for the same GEMM: bit-identical. ~4.1 GB for the split's 28 Mac layers;
+  time to first token −5% per agentic session pair (−10% on a cold 54K prompt).
+- `SUSHI_R64_SPLIT_PLAN=1` (`src/generate.zig`, `splitPlanTail`): within the last two chunk widths of a
+  split prefill, the chunks are planned together: the current chunk is sized so that it, then the chunk
+  that just covers the stage's work on it, and so on down to a ~384-row final chunk, sum to the rows left.
+  Interior checkpoint boundaries in that stretch are skipped (the end-of-prompt snapshot always lands).
+  Removes the stalls the per-chunk rules of §4 left (a boundary cutting a 4,557 + 163-row pair; a small
+  remainder after a big chunk; a 1.3–1.4K-row final chunk draining). Chunk placement only: end-of-prefill
+  logprobs move as much as switching the chunk width does.
+
+## 8. Instrumentation and switches that are off
+
+- Decode PLE gather timing (`src/qwen4_exp.zig`, `notePleGather`): printed as `[r64-ple]` with
+  `SUSHI_MTP_TRACE=1`. `SUSHI_R64_PLE_RESIDENCY=1` counts how many rows sit in resident pages.
+- Measured and left off (each exact): `SUSHI_R64_SSD_KEEPALIVE_MS` (an uncached 4 KiB read every N ms
+  while generating), `SUSHI_R64_PLE_WALK` / `SUSHI_R64_PLE_HYBRID` / `SUSHI_R64_PLE_LEAN` (other ways to
+  gather decode-sized PLE rows), `SUSHI_R64_DEFER_CAPTURES` (verify captures outside the accept batch),
+  `SUSHI_R64_CPU_ACCEPT` (the sparse acceptance on the host). None paid on this machine.

@@ -476,7 +476,12 @@ class Host:
                    # every restore of a parked background re-reads the live stage state and must equal
                    # its park file byte for byte (a mismatch fails the restore: the request re-runs
                    # Mac-only); TEXAS_SPLIT_VERIFY_PARKS=0 skips the re-read
-                   QD_STAGE_RESTORE_VERIFY=CFG.get('TEXAS_SPLIT_VERIFY_PARKS') or '1')
+                   QD_STAGE_RESTORE_VERIFY=CFG.get('TEXAS_SPLIT_VERIFY_PARKS') or '1',
+                   # the stage head (final mixer + 8-bit lm_head + top-20 on the 5090; sushi/FORK.md section 6).
+                   # Its 0.71 GB fits beside the 262K-row state only with 1536-row prefill pieces (2048 leaves
+                   # too little for the first decode); time to first token is unchanged. QD_STAGE_HEAD='0'
+                   # (with SUSHI_R64_STAGE_HEAD='0') disables it.
+                   QD_STAGE_HEAD='1', QD_STAGE_PREFILL_ROWS='1536')
         self.hold_display()
         slog = open(self.run_dir / 'stage.log', 'ab', buffering=0)
         self.stage = subprocess.Popen(['sh', str(MACUDA / 'tools/nv_shim_step.sh'), 'local', 'probe', str(STAGE_BIN),
@@ -538,7 +543,7 @@ class Host:
                    DYLD_LIBRARY_PATH=str(LIBS), TEXAS_PRIORITY_IPC=str(self.ipc.path),
                    TEXAS_PRIORITY_CHECKPOINTS=str(self.checkpoint_dir))
         env.update(stage_env)
-        # Exact or noise-level speedups (sushi/FORK.md sections 3-4; each switch '0' restores the old path):
+        # Exact or noise-level speedups (sushi/FORK.md sections 4-7; each switch '0' restores the old path):
         # - bit-identical 4-row router/gate kernels, and a coarse MTP draft head over vocab ids [0, 98304)
         #   (proposal side only: acceptance stays exact, so the output distribution is unchanged);
         env.update(SUSHI_MTP_DENSE_ROWS='1', SUSHI_MTP_DRAFT_HEAD_ROWS='98304')
@@ -551,6 +556,13 @@ class Host:
         # - the adaptive draft controller's extension gate reads its confidence from the 32-candidate rerank
         #   shortlist instead of a full 248K-row head per draft step (drafter side only).
         env.update(SUSHI_R64_SHORTLIST_CONF='1')
+        # - the verify's head on the 5090 with the acceptance law computed on its top-20 rows (the same law,
+        #   so the same output distribution; engaged only for top-k <= 20 with no penalty, logit bias or think
+        #   penalty, i.e. the thinking defaults), and no separate COMMIT round trip (sushi/FORK.md section 6);
+        env.update(SUSHI_R64_STAGE_HEAD='1', SUSHI_R64_SPARSE_ACCEPT='1', SUSHI_STAGE_INFER_COMMIT='1')
+        # - prefill keeps each 8-bit weight's dequantized bf16 copy (~4.1 GB; bit-identical), and plans the
+        #   last two chunk widths of a split prefill as one covered tail (chunk placement only; section 7).
+        env.update(SUSHI_R64_DQ_CACHE_MB='6144', SUSHI_R64_SPLIT_PLAN='1')
         # qualification only: extra Sushi variables as a JSON object (e.g. a fixed MTP width)
         extra = json.loads(CFG.get('TEXAS_SPLIT_SUSHI_ENV') or '{}')
         env.update({k: str(v) for k, v in extra.items() if k.startswith('SUSHI_')})

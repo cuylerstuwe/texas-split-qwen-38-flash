@@ -6,7 +6,12 @@
 //! op 1 FORWARD: shm[0..rows*10240*2] holds the BF16 HC stream after layer FIRST-1 for absolute
 //!   positions [position, position+rows); the reply leaves the stream after layer 47 in place.
 //!   Rows still pending from the previous forward are committed first (full accept / serial).
-//! op 2 COMMIT: keep `arg` rows of the pending forward (a partial speculative accept).
+//!   aux bit 1 (R62): also write the stream after each stage layer set in `arg` (bit l = layer l),
+//!   ascending, after the output (DFlash2's target-layer taps past the split point).
+//!   aux bit 2 (R64, QD_STAGE_HEAD=1): also run the final mixer, the 8-bit lm_head and a top-20 per row,
+//!   written after the output (and taps): per row 20 BF16-valued f32 bit patterns then 20 token ids, u32.
+//! op 2 COMMIT: keep `arg` rows of the pending forward (a partial speculative accept). Optional since
+//!   R64: a FORWARD with no COMMIT before it commits position - committed rows of the pending forward.
 //! op 3 SEED: shm holds a state blob (see `seed`); the stage's committed length becomes `position`.
 //! op 4 INFO: reply aux = stage layers, position = committed length.
 //! op 5 QUIT.
@@ -30,7 +35,7 @@ use qwen_hybrid::{
     cuda::Device,
     cuda_affine8, cuda_lowbit_attention,
     cuda_lowbit_layer::Modules,
-    cuda_stage::Stage,
+    cuda_stage::{HEAD_TOPK, Stage, StageHead},
     gdn::{C, Initial, STATE},
     hc::F,
     projection::Pack,
@@ -246,6 +251,13 @@ fn main() -> Result<()> {
     {
         let m = Modules::load(&d)?;
         let stage = Stage::new(&d, &m, &am, &m8, &pack, first, capacity)?;
+        // R64: the stage head (QD_STAGE_HEAD=1): final mixer + lm_head + GPU top-20 after a forward on request
+        let r56 = if std::env::var("QD_STAGE_HEAD").as_deref() == Ok("1") {
+            Some(d.module(&Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/r56_ops.sm120.cubin"),
+                "af3efba49e41f2f9218726d9937c9015cb84b9cade4434f5bd393d9b7f0dc1fd")?)
+        } else { None };
+        let head = match &r56 { Some(ops) => Some(StageHead::new(&d, &m, &m8, ops, &pack)?), None => None };
+        let mut head_runs = 0u64;
         // prefill v2 scratch (QD_STAGE_PREFILL_ROWS, default 2048; 0 turns the PREFILL op off)
         let pf_rows: usize = std::env::var("QD_STAGE_PREFILL_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
         let pf = if pf_rows > 0 { Some(stage.prefill_scratch(&k4, pf_rows, 256)?) } else { None };
@@ -288,7 +300,16 @@ fn main() -> Result<()> {
             let result: Result<(u32, u64)> = (|| match op {
                 1 => {
                     let prev = stage.pending();
-                    let accept = pending_commit.take().unwrap_or(prev);
+                    // R64: with no COMMIT before it, the accepted rows follow from the position (a forward
+                    // at P commits P - committed of the pending rows), so a client may skip op 2.
+                    let accept = match pending_commit.take() {
+                        Some(a) => a,
+                        None => {
+                            let base = stage.position();
+                            ensure!(position >= base && position - base <= prev, "forward at {position}, stage at {base} + {prev} pending");
+                            position - base
+                        }
+                    };
                     if prev > 0 {
                         commits += 1;
                     }
@@ -318,11 +339,35 @@ fn main() -> Result<()> {
                             c.enqueue()?;
                         }
                     }
+                    // R64: aux bit 2 = the head right behind the forward, same stream, one sync
+                    let want_head = aux & 4 != 0;
+                    ensure!(!want_head || head.is_some(), "stage head requested but QD_STAGE_HEAD is off");
+                    if want_head {
+                        for c in &head.as_ref().unwrap().record(&stage, rows)? {
+                            c.enqueue()?;
+                        }
+                    }
                     d.sync()?;
                     drop(commits);
                     let out = stage.finish(rows)?;
                     for (dst, v) in shm.bytes()[..rows * F * 2].chunks_exact_mut(2).zip(out) {
                         dst.copy_from_slice(&v.to_le_bytes());
+                    }
+                    // R62: aux bit 1 = also return the streams after the stage layers set in `arg`
+                    // (bit l = layer l), in ascending layer order after the output
+                    let mut at = rows * F * 2;
+                    if aux & 2 != 0 {
+                        for l in first..48 {
+                            if arg >> l & 1 == 1 {
+                                stage.layer_stream(l, rows, &mut shm.bytes()[at..at + rows * F * 2])?;
+                                at += rows * F * 2;
+                            }
+                        }
+                    }
+                    if want_head {
+                        let n = rows * 2 * HEAD_TOPK * 4;
+                        head.as_ref().unwrap().read(rows, &mut shm.bytes()[at..at + n])?;
+                        head_runs += 1;
                     }
                     forwards += 1;
                     rows_total += rows as u64;
@@ -460,6 +505,7 @@ fn main() -> Result<()> {
         println!("{}", json!({"kind":"park_stats","parks":parks,"restores":restores}));
         println!("{}", json!({"kind":"prefill_stats","prefills":prefills,"rows":prefill_rows,"ms_total":prefill_us/1e3,
             "rows_per_s":if prefill_us > 0. { prefill_rows as f64 / (prefill_us / 1e6) } else { 0. }}));
+        println!("{}", json!({"kind":"head_stats","head_runs":head_runs,"head_on":head.is_some()}));
         println!("{}", json!({"kind":"stats","final":true,"forwards":forwards,"rows":rows_total,"forward_us_mean":if forwards>0 {fw_us/forwards as f64} else {0.},
             "commits":commits,"partial_commits":partial,"rows_hist":hist,"graph_replays":replays,"graph_captures":captures}));
         drop(graphs);

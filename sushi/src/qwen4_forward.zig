@@ -19,6 +19,64 @@ fn r64VerifyLadder() u32 {
     return r64_vladder.?;
 }
 extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
+extern "c" fn stage_split_set_head(on: c_int) void;
+extern "c" fn stage_split_head_topk(dst: [*]u32, rows: c_int) c_int;
+pub var r64_head_used: u64 = 0;
+pub var r64_head_fallback: u64 = 0;
+
+/// R64 stage head: the 5090's top-20 per row (BF16 values, token ids) as `[1, rows, vocab]` BF16 logits,
+/// -inf outside them: exactly what a top-k <= 20 sampler (top-k first) reads of the full head. The ids and
+/// values stay on the context for the sparse acceptance.
+fn stageHeadLogits(self: *Transformer, ctx: *ForwardCtx, buf: *const [16 * 40]u32, rows: c_int) !mlx.mlx_array {
+    const n: usize = @intCast(rows);
+    var ids: [16 * 20]i32 = undefined;
+    var vals: [16 * 20]u16 = undefined;
+    for (0..n) |r| {
+        for (0..20) |j| {
+            vals[r * 20 + j] = @truncate(buf[r * 40 + j] >> 16); // an f32 holding a BF16 value
+            ids[r * 20 + j] = @intCast(buf[r * 40 + 20 + j]);
+        }
+    }
+    const shp = [_]c_int{ 1, rows, 20 };
+    const ids_a = mlx.mlx_array_new_data(&ids, &shp, 3, .int32);
+    const vals_a = mlx.mlx_array_new_data(&vals, &shp, 3, .bfloat16);
+    clearStageHead(ctx);
+    ctx.stage_head_ids = ids_a;
+    ctx.stage_head_vals = vals_a;
+    const fshape = [_]c_int{ 1, rows, @intCast(self.config.vocab_size) };
+    const ninf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(ninf);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_full(&full, &fshape, 3, ninf, .bfloat16, self.s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_put_along_axis(&out, full, ids_a, vals_a, 2, self.s));
+    return out;
+}
+
+pub fn clearStageHead(ctx: *ForwardCtx) void {
+    if (ctx.stage_head_ids.ctx != null) _ = mlx.mlx_array_free(ctx.stage_head_ids);
+    if (ctx.stage_head_vals.ctx != null) _ = mlx.mlx_array_free(ctx.stage_head_vals);
+    ctx.stage_head_ids = .{ .ctx = null };
+    ctx.stage_head_vals = .{ .ctx = null };
+}
+
+/// R64 stage head: usable only if no returned id is suppressed (a reserved id in the top 20 means the
+/// sampler's top 20 reaches past what the stage returned: the Mac's own head serves that forward).
+fn stageHeadUsable(self: *const Transformer, buf: *const [16 * 40]u32, rows: c_int) bool {
+    const mask = self.suppress_mask orelse return true;
+    const mp = mlx.mlx_array_data_bool(mask) orelse return false;
+    const n: usize = @intCast(rows);
+    const vocab: usize = self.config.vocab_size;
+    for (0..n) |r| {
+        for (0..20) |j| {
+            const id: usize = buf[r * 40 + 20 + j];
+            if (id >= vocab or mp[id]) return false;
+        }
+    }
+    return true;
+}
 extern "c" fn stage_split_prefill_begin(owner: u64) void;
 extern "c" fn stage_split_bind(owner: u64) void;
 extern "c" fn stage_split_resident(owner: u64) c_int;
@@ -2210,6 +2268,9 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     const vladder: u32 = if (seq_len > 1 and seq_len <= 16 and stage_first != null and ctx.stage_prefill == 0 and
         ctx.batch_slots == null and !prof.timing and !dt.on) r64VerifyLadder() else 0;
     var layer_idx: usize = 0;
+    // R64 stage head: the stage's top-20 rows when it ran the head for this forward.
+    var head_buf: [16 * 40]u32 = undefined;
+    var head_ready = false;
     while (layer_idx < layerCap(cfg.num_hidden_layers)) {
         const li: u32 = @intCast(layer_idx);
         if (stage_first) |first| if (layer_idx == first) {
@@ -2242,7 +2303,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             var out = mlx.mlx_array_new();
             // An M-RoPE request's decode rows are text: rope at row + its decode delta on all axes.
             const rope_delta: i32 = if (ctx.mrope_pos != null) ctx.mrope_delta else 0;
+            // R64 stage head: the stage also runs the mixer, the lm_head and a top-20 for this forward.
+            const want_head = ctx.stage_head and batch == 1;
+            clearStageHead(ctx);
+            stage_split_set_head(@intFromBool(want_head));
+            defer stage_split_set_head(0);
             if (stage_split_forward(h, &out, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
+            if (want_head) {
+                if (stage_split_head_topk(&head_buf, seq_len) == 0 and stageHeadUsable(self, &head_buf, seq_len)) {
+                    head_ready = true;
+                    r64_head_used += 1;
+                } else r64_head_fallback += 1;
+            }
             _ = mlx.mlx_array_free(h);
             h = out;
             break;
@@ -2410,6 +2482,14 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     }
     if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, ctx.capture_settle);
 
+    if (head_ready and !self.embedding_mode and !ctx.skip_lm_head) {
+        // R64 stage head: the 5090 ran the mixer and the head; its exact top-20 replaces the Mac's head.
+        const logits = try stageHeadLogits(self, ctx, &head_buf, seq_len);
+        _ = mlx.mlx_array_free(h);
+        h = .{ .ctx = null };
+        if (self.expert_stream) |engine| engine.finishForward(@intCast(batch * seq_len));
+        return logits;
+    }
     const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
     // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
     _ = mlx.mlx_array_free(h);

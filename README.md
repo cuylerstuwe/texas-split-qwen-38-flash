@@ -4,8 +4,8 @@
 Mac with an NVIDIA RTX 5090 attached over Thunderbolt, splitting the model between them.** The Mac runs
 [Sushi](https://github.com/beamivalice/sushi) (included here as a fork) on the
 [Sushi 4bpw pack](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (EXL3 4-bit routed experts,
-8-bit affine dense weights). Transformer layers 28–47 run on the 5090; the rest of the model, the MTP draft head
-and sampling stay on the Mac. One OpenAI-compatible HTTP endpoint serves it, with tools, reasoning, images,
+8-bit affine dense weights). Transformer layers 28–47 run on the 5090, which also runs the LM head for
+speculative-decoding verify rounds; the rest of the model, the MTP draft head and sampling stay on the Mac. One OpenAI-compatible HTTP endpoint serves it, with tools, reasoning, images,
 video and the full 262,144-token context.
 
 No NVIDIA macOS driver is involved. The GPU side uses [macuda](https://github.com/Davinchy/macuda)'s userspace
@@ -13,27 +13,29 @@ driver (`libtinynv`, a C port of tinygrad's NVIDIA driver) through tinygrad's si
 
 | | Mac only (stock Sushi) | texas-split |
 |---|---|---|
-| Decode, agentic coding sessions | ~79–84 tok/s | **~98–111 tok/s** |
-| Total task time, same sessions | 1.00× | **1.28–1.34× faster** |
-| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **18.2 s (~3.0K tok/s), 1.5× faster** |
-| Prefill, cold 64K / 192K-token prompts | not measured at these lengths | 3.1–3.4K / 2.8–3.3K tok/s |
+| Decode, agentic coding sessions | ~79–84 tok/s | **~108–122 tok/s** |
+| Total task time, same sessions | 1.00× | **1.42–1.51× faster** (pooled 1.46×) |
+| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **16.8–17.2 s (~3.2K tok/s), 1.6× faster** |
+| Prefill, cold 64K / 192K-token prompts | not measured at these lengths | 3.1–3.4K / 2.8–3.3K tok/s (earlier build) |
 | Quality vs. a teacher model (KL, short panel) | .00458 | .00446 (same level) |
 
-Measured on an M5 Max (128 GB) with an RTX 5090, macOS 27.2. Speedups come from the 5090 taking 20 of the
-48 layers' work; prefill is pipelined between the two machines and limited by the Mac's 28 layers (the
-5090 runs its 20 at ~6.3K tok/s). Details in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/VALIDATION.md](docs/VALIDATION.md).
+Measured on an M5 Max (128 GB) with an RTX 5090, macOS 27.2, replaying two recorded agentic coding
+sessions request by request with the thinking sampler (three seeds; stock Sushi measured with the same
+harness and seeds). Speedups come from the 5090 taking 20 of the 48 layers' work and the verify rounds'
+LM head; prefill is pipelined between the two machines and limited by the Mac's 28 layers (the 5090 runs
+its 20 at ~5.6–6.3K tok/s). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+[docs/VALIDATION.md](docs/VALIDATION.md).
 
-**Update 2026-11-09:** a correctness fix for MTP decoding on the split, exact decode-round and prefill
-speedups. See [CHANGELOG.md](CHANGELOG.md); existing installs: `git pull`, `./install.sh sushi pins`,
-`bin/texas-split restart`.
+**Update 2026-11-10:** the verify rounds' LM head moved to the 5090 (faster decode), and two prefill
+speedups (a bf16 weight cache and better pipelining of the last chunks). See [CHANGELOG.md](CHANGELOG.md);
+existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart`.
 
 ## What you need
 
 - An **Apple Silicon Mac with 128 GB** of unified memory, macOS 26.2 or later (tested: M5 Max, macOS 27.2).
   The engine needs 82 GiB reclaimable memory when it starts.
 - An **RTX 5090** (GB202, 32 GB) in a Thunderbolt eGPU enclosure. At the full context the stage uses all
-  but ~0.8 GB of its memory.
+  but ~0.6 GB of its memory.
 - **~175 GB free disk** for the model download (63.7 GiB of weights plus a 95.4 GiB n-gram table that
   stays on the SSD), plus a few GB for builds.
 - Xcode command line tools, Homebrew (`webp`, `hf`, Python 3.12+), Rust 1.85+. The installer checks
