@@ -22,7 +22,9 @@ TEXAS_SPLIT_* environment variables, which win. The host listens on 127.0.0.1:80
 - shutdown that never signals the stage server while it puts the card down: Sushi stops first,
   the stage server exits by itself when its socket closes, signals only after 90 s;
 - a memory/thermal guard (12 GiB reclaimable floor, swap/compression growth, critical thermals): a
-  trip stops the engine and the host answers 503 until restarted.
+  trip stops the engine and the host answers 503 until restarted. Compression growth is not counted
+  while the idle engine has released its wiring (macOS unwires Sushi's Metal memory ~60 s after its
+  last request; compressing those pages is the engine giving memory back): see MemoryGuard.
 """
 import argparse, fcntl, hashlib, hmac, http.client, json, os, plistlib, re, select, signal, socket, subprocess, sys, threading, time
 import urllib.error
@@ -246,6 +248,83 @@ class SplitController(Controller):
         value = super().snapshot()
         value['backend'] = BACKEND
         return value
+
+
+# --- the memory/thermal guard -----------------------------------------------------------------------------
+class MemoryGuard:
+    """The memory/thermal limits, applied to one kernel reading every 0.5 s. Pure (no I/O), so
+    tests/test_guard.py can drive it with synthetic readings or replay a run's memory.jsonl.
+
+    A trip stops the engine: reclaimable memory below 12 GiB; compressor occupancy more than 16 GiB above
+    its low; swap more than 256 MiB above its low; critical thermal pressure. The lows follow the current
+    reading after 300 s idle (growth while the engine sits unused is not its doing).
+
+    Compression growth also stops counting once the idle engine has released its wiring. About a minute
+    after Sushi goes idle, macOS unwires its Metal memory (~70-77 GiB wired while it works, ~5-6 GiB some
+    61-63 s after the last request; it rewires within 1-2 s of the next one). From then on the kernel may
+    compress those pages to make room for other apps: memory the engine gives back, not pressure it puts
+    on the Mac. Before 2026-11-10 that could trip the guard (+17.7 GiB of compressor in one 6 s step at
+    ~97 s idle, swap flat, ~29 GiB still reclaimable), and the service then stayed down until restarted.
+    So while the engine is idle and its wired memory is below half its level while working, the
+    compression low follows the reading too. The reclaimable floor, the swap check and the thermal check
+    are unchanged."""
+
+    RECLAIMABLE_FLOOR = 12 * GIB
+    COMPRESSION_GROWTH = 16 * GIB
+    SWAP_GROWTH = 256 * 1024 ** 2
+    IDLE_RESET_S = 300
+
+    def __init__(self, baseline, now):
+        self.compressor_low = baseline.compressor_bytes
+        self.swap_low = baseline.swap_used_bytes
+        self.last_busy = now
+        # the most wired memory seen while the engine worked (never lowered: a short request may end before
+        # Sushi has finished rewiring, ~1-2 s, so its own peak would understate the level)
+        self.busy_wired = baseline.wired_bytes
+        self.unwired = False                     # idle, and wired below half of busy_wired
+        self.unwired_low = None                  # compressor low since the engine released its wiring
+        self.noted = False                       # the uncounted-growth note: once per idle period
+        self.note = None
+
+    def update(self, reading, busy, thermal, now):
+        """One reading; returns the fault that stops the engine, or None. Afterwards self.unwired says
+        whether the engine counted as unwired, and self.note holds a log line (at most once per idle
+        period) when compression grew past the limit while that was so."""
+        self.note = None
+        if busy:
+            self.busy_wired = max(self.busy_wired, reading.wired_bytes)
+            self.last_busy = now
+            self.noted = False
+        unwired = not busy and reading.wired_bytes < self.busy_wired / 2
+        compressor, swap = reading.compressor_bytes, reading.swap_used_bytes
+        if unwired and compressor is not None:
+            if not self.unwired or self.unwired_low is None:
+                self.unwired_low = self.compressor_low if self.compressor_low is not None else compressor
+            self.unwired_low = min(self.unwired_low, compressor)
+            if compressor - self.unwired_low > self.COMPRESSION_GROWTH and not self.noted:
+                self.noted = True
+                self.note = (f'guard: compression grew {(compressor - self.unwired_low) / GIB:.1f} GiB while the '
+                             f'engine was idle and unwired (its own pages); not counted')
+        elif not unwired:
+            self.unwired_low = None
+        self.unwired = unwired
+        if now - self.last_busy > self.IDLE_RESET_S:
+            self.compressor_low, self.swap_low = compressor, swap
+        elif unwired:
+            self.compressor_low = compressor
+        if compressor is not None:
+            self.compressor_low = compressor if self.compressor_low is None else min(self.compressor_low, compressor)
+        if swap is not None:
+            self.swap_low = swap if self.swap_low is None else min(self.swap_low, swap)
+        if reading.available_bytes < self.RECLAIMABLE_FLOOR:
+            return 'reclaimable memory below 12 GiB'
+        if compressor is not None and compressor - self.compressor_low > self.COMPRESSION_GROWTH:
+            return 'compression growth above 16 GiB'
+        if swap is not None and swap - self.swap_low > self.SWAP_GROWTH:
+            return 'swap growth above 256 MiB'
+        if thermal in {'trapping', 'sleeping'}:
+            return 'critical thermal pressure'
+        return None
 
 
 # --- the host ---------------------------------------------------------------------------------------------
@@ -705,8 +784,7 @@ class Host:
         if baseline is None:
             self.fault = 'memory probe unavailable'
             return 'guard'
-        compressor_low, swap_low = baseline.compressor_bytes, baseline.swap_used_bytes
-        last_busy = time.monotonic()
+        guard = MemoryGuard(baseline, time.monotonic())
         with (self.run_dir / 'memory.jsonl').open('a', buffering=1) as mem:
             while not self.stopping.wait(0.5):
                 reading = _read_kernel()
@@ -716,22 +794,13 @@ class Host:
                 thermal = level_name(self.thermal())
                 with self.lock:
                     busy = sum(self.inflight.values()) > 0 or self.waiting > 0
-                if busy:
-                    last_busy = time.monotonic()
-                if time.monotonic() - last_busy > 300:
-                    compressor_low, swap_low = reading.compressor_bytes, reading.swap_used_bytes
-                compressor_low = min(compressor_low, reading.compressor_bytes)
-                swap_low = min(swap_low, reading.swap_used_bytes)
-                mem.write(json.dumps(reading.to_dict() | dict(time=time.time(), thermal=thermal, busy=busy)) + '\n')
-                if reading.available_bytes < 12 * GIB:
-                    self.fault = 'reclaimable memory below 12 GiB'
-                elif reading.compressor_bytes - compressor_low > 16 * GIB:
-                    self.fault = 'compression growth above 16 GiB'
-                elif reading.swap_used_bytes - swap_low > 256 * 1024 ** 2:
-                    self.fault = 'swap growth above 256 MiB'
-                elif thermal in {'trapping', 'sleeping'}:
-                    self.fault = 'critical thermal pressure'
-                if self.fault:
+                fault = guard.update(reading, busy, thermal, time.monotonic())
+                if guard.note:
+                    log(guard.note)
+                mem.write(json.dumps(reading.to_dict() | dict(time=time.time(), thermal=thermal, busy=busy,
+                                                              engine_unwired=guard.unwired)) + '\n')
+                if fault:
+                    self.fault = fault
                     return 'guard'
                 if self.engine is None or self.engine.poll() is not None:
                     return 'engine'
@@ -752,7 +821,7 @@ class Host:
                         threading.Thread(target=self.stop_stage, name='stage-stop', daemon=True).start()
                         self.schedule_restore()
                 elif (self.restore_at is not None and time.monotonic() >= self.restore_at
-                      and time.monotonic() - last_busy > 120):
+                      and time.monotonic() - guard.last_busy > 120):
                     return 'restore'
         return 'stop'
 

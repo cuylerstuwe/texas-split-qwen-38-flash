@@ -113,6 +113,8 @@ backoff if Sushi crashes. On shutdown it stops Sushi first, so the stage server 
 socket closes; signals come only after 90 s. `texas-split stop` signals the host itself and waits for this
 teardown before unloading the launchd job (`launchctl bootout` alone kills the job about 20 s after its
 SIGTERM, which could leave the GPU lock behind). It keeps the memory/thermal guard (stops the engine below 12
-GiB reclaimable memory, on swap or compression growth, or at critical thermal pressure), holds the display
+GiB reclaimable memory, on swap or compression growth, or at critical thermal pressure; compression growth
+does not count while the idle engine has released its wiring: about a minute after Sushi's last request
+macOS unwires its Metal memory, and compressing those pages is the engine giving memory back), holds the display
 awake around the GPU's cold boot, keeps the Mac awake while running, and pins every binary it runs by
 SHA-256.

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-11-10, later: memory guard fix
+
+Existing installs already on the 2026-11-10 release below: `git pull`, `bin/texas-split restart` (host only;
+nothing to rebuild).
+
+### Fixed: the memory guard could stop an idle engine
+
+The host stops the engine when memory gets tight (and answers 503 until `bin/texas-split restart`). One of
+its signals is compression growth: more than 16 GiB of compressor above its recent low. It could trip on
+the engine's own memory:
+
+- About 61–63 s after Sushi goes idle, macOS unwires its Metal memory: wired falls from ~70–77 GiB to
+  ~5–6 GiB, and Sushi rewires it within 1–2 s of the next request. The kernel may then compress those pages
+  when another app needs room.
+- That is the engine giving memory back, but the guard counted compression growth until 5 minutes of idle.
+  On our machine the compressor grew 17.7 GiB in one 6 s step at ~97 s idle (swap flat, ~29 GiB still
+  reclaimable), the guard tripped, and the service stayed down until restarted.
+
+Now (`MemoryGuard` in `host/texas_split.py`):
+
+- While the engine is idle and wired memory is below half the most seen while it worked, compression growth
+  is not counted. The host logs one line per idle period when it would have tripped.
+- Unchanged: the 12 GiB reclaimable floor, the 256 MiB swap-growth check (not reset by unwiring), the
+  5-minute idle reset and the critical-thermal stop.
+- Compression growth counts again from the moment a request arrives.
+- `memory.jsonl` rows in the run directory carry `engine_unwired`.
+
+`host/tests/test_guard.py` checks the rule without a running service. Synthetic cases cover trips while
+working or still wired, the reclaimable, swap and thermal trips while unwired, the 5-minute rule, and a short
+request that ends before Sushi rewires. Pass run directories to replay their `memory.jsonl` through the old
+and new rules.
+
 ## 2026-11-10
 
 Existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart` (the stage server
