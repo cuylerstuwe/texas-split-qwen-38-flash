@@ -434,3 +434,22 @@ int tinynv_qmd_r44_edge(tinynv_qmd_t *prev, tinynv_qmd_t *next,
 #undef R44_SET
   return 0;
 }
+
+int tinynv_qmd_r65_fields(tinynv_qmd_t *prev, tinynv_qmd_t *next, int early, uint32_t wait, uint32_t arrive) {
+  if ((prev && prev->v3) || next->v3) return tinynv_fail("R65 requires Blackwell QMD V05");
+  if (early && !prev) return tinynv_fail("R65 early launch without a predecessor in the chain");
+#define R65_SET(q,f,v) do { if (tinynv_qmd_set((q),TINYNV_QMD_##f##_LO,TINYNV_QMD_##f##_HI,(v))) return -1; } while (0)
+  if (early) R65_SET(prev,PRE_EXIT_AT_LAST_CTA_LAUNCH,1);
+  if (wait) {
+    R65_SET(next,WAIT_ON_LATCH_ID,wait);
+    R65_SET(next,WAIT_ON_LATCH_VALID,1);
+    R65_SET(next,LATCH_ACQUIRE_INVALIDATE_SHADER_DATA_CACHE,1);
+    R65_SET(next,LATCH_ACQUIRE_INVALIDATE_TEXTURE_DATA_CACHE,1);
+  }
+  if (arrive) {
+    R65_SET(next,ARRIVE_AT_LATCH_ID,arrive);
+    R65_SET(next,ARRIVE_AT_LATCH_VALID,1);
+  }
+#undef R65_SET
+  return 0;
+}

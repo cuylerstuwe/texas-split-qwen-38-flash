@@ -1,0 +1,177 @@
+diff --git a/driver-r38/include/tinynv.h b/driver-r38/include/tinynv.h
+index 5b46a97..6bc9be0 100644
+--- a/driver-r38/include/tinynv.h
++++ b/driver-r38/include/tinynv.h
+@@ -150,6 +150,10 @@ tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t, int mode);
+ tinynv_status_t tinynv_r53_stamp(tinynv_stream_t, uint64_t va, uint32_t slots);
+ tinynv_status_t tinynv_r54_graph_patch(tinynv_stream_t, tinynv_graph_t, uint32_t launch, uint32_t offset,
+                                        const void *data, uint32_t len);
++// Isolated R65 side-branch build only, inside a capture: the next recorded launch arrives at latch `arrive` when it
++// completes, waits for latch `wait` (arrived at by an earlier launch) before it starts, and with `early` may start
++// once its chain predecessor's last CTA has launched rather than when it completes. 0 = none; ids < 4096.
++tinynv_status_t tinynv_r65_edge(tinynv_stream_t, uint32_t arrive, uint32_t wait, int early);
+ tinynv_status_t tinynv_graph_end(tinynv_stream_t, tinynv_graph_t *out);
+ tinynv_status_t tinynv_graph_launch(tinynv_stream_t, tinynv_graph_t);
+ void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);
+diff --git a/driver-r38/libtinynv/src/exec.c b/driver-r38/libtinynv/src/exec.c
+index f992a82..e11d980 100644
+--- a/driver-r38/libtinynv/src/exec.c
++++ b/driver-r38/libtinynv/src/exec.c
+@@ -1875,11 +1875,15 @@ int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out) {
+     r->failed=1;
+     tinynv_fail("R44 side probe requires exactly A/side/B/C/join in one chain");
+   }
++  if (r->r65_pending) { r->failed = 1; tinynv_fail("R65: an edge was set after the last launch"); }
+   int failed = r->failed, n = (int)r->n;
+   if (failed || !n) {
+     tinynv_exec_graph_free(ex, r);
+     return failed ? -1 : tinynv_fail("the recording holds no launches");
+   }
++  if (r->r65_edges)
++    fprintf(stderr, "libtinynv: R65 side branches: %u edges in %u launches, %d chains, %u dependencies dropped at chain starts\n",
++            r->r65_edges, r->n, r->nchains, r->r65_dropped);
+   { tinynv_graph_chain_t *ch = &r->chains[r->nchains - 1];   // the last chain ends at the last descriptor
+     ch->tail_va = (uint64_t)(r->prev_host - (uint8_t *)r->mirror.dma.va) + r->mem.va;
+     ch->tail_qmd = r->prev_qmd; }
+@@ -2339,6 +2343,14 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+     r->failed = 1;
+     return tinynv_fail("R53 stamp: the descriptor's last release slot is taken");
+   }
++  // R65 side branches: this launch's edge, consumed here whichever chain the launch lands in
++  const int r65 = r->r65_pending, r65_early = r->r65_early;
++  const uint32_t r65_wait = r->r65_wait, r65_arrive = r->r65_arrive;
++  r->r65_pending = 0;
++  if (r65 && r65_wait && !r->r65_latch_chain[r65_wait]) {
++    r->failed = 1;
++    return tinynv_fail("R65: launch %u waits on latch %u, which no earlier launch arrives at", r->n, r65_wait);
++  }
+   tinynv_graph_chain_t *ch = r->nchains ? &r->chains[r->nchains - 1] : NULL;
+   if (ch && ch->n >= (uint32_t)ex->chain_max) {
+     // this chain is full: it ends at the previous descriptor and the next one starts here
+@@ -2347,6 +2359,13 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+     ch = NULL;
+   }
+   if (ch) {
++    // R65: a wait on a latch arrived at in an earlier chain is dropped (that chain has completed before this one starts)
++    if (r65) {
++      const uint32_t w = (r65_wait && r->r65_latch_chain[r65_wait] == (uint8_t)r->nchains) ? r65_wait : 0;
++      if (r65_wait && !w) r->r65_dropped++;
++      if (tinynv_qmd_r65_fields(&r->prev_qmd, &q, r65_early, w, r65_arrive)) { r->failed = 1; return -1; }
++      r->r65_edges++;
++    }
+     // R38 experiment: early dependent launch fields, written before the link and before either descriptor is copied
+     if (ex->pdl_mode == 64) {
+       // A arrives1; side has no shader wait and can run independently.
+@@ -2381,7 +2400,14 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
+     memset(ch, 0, sizeof(*ch));
+     ch->head_va = qmd_va;
+     ch->head_host = host;
++    // R65: a chain's first launch starts after the previous chain has completed: early launch and waits are moot
++    if (r65) {
++      if (r65_early || r65_wait) r->r65_dropped++;
++      if (tinynv_qmd_r65_fields(NULL, &q, 0, 0, r65_arrive)) { r->failed = 1; return -1; }
++      r->r65_edges++;
++    }
+   }
++  if (r65 && r65_arrive) r->r65_latch_chain[r65_arrive] = (uint8_t)r->nchains;
+   ch->n++;
+   memcpy(host, q.b, TINYNV_QMD_BYTES);
+   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);
+diff --git a/driver-r38/libtinynv/src/exec.h b/driver-r38/libtinynv/src/exec.h
+index 48be48d..0731558 100644
+--- a/driver-r38/libtinynv/src/exec.h
++++ b/driver-r38/libtinynv/src/exec.h
+@@ -80,6 +80,7 @@ typedef struct {
+ // thirteen of 128 (2026-09-19 16:42, -6.5%), so a replay issues the chains as consecutive batches under one
+ // announcement, each acquiring on the previous one's tail release.
+ #define TINYNV_GRAPH_CHAINS 128
++#define TINYNV_R65_LATCHES 4096   // R65 side branches: latch ids per recording
+ typedef struct { uint64_t head_va, tail_va; uint8_t *head_host; tinynv_qmd_t tail_qmd; uint32_t n; } tinynv_graph_chain_t;
+ typedef struct tinynv_graph_rec {
+   tinynv_vmap_t mem;       // video memory: what the engine reads on every replay
+@@ -102,6 +103,13 @@ typedef struct tinynv_graph_rec {
+   uint32_t npatch, patch_cap;
+   int prev_trig;           // R53: the previous descriptor's kernel name ends in _trig (it calls
+                            // griddepcontrol.launch_dependents itself; see TINYNV_R38_PDL bit 128)
++  // R65 side branches (tinynv_r65_edge): the next launch's edge, and for each latch id the chain (index + 1) whose
++  // launch arrives at it (0: none yet). A wait on a latch arrived at in an earlier chain is dropped: chains run one
++  // after another, so that launch has completed. Counters for the caller's log.
++  uint32_t r65_arrive, r65_wait;
++  int r65_early, r65_pending;
++  uint8_t r65_latch_chain[TINYNV_R65_LATCHES];
++  uint32_t r65_edges, r65_dropped;
+ } tinynv_graph_rec_t;
+ typedef struct {
+   const void *key;    // the kernel descriptor's address: one row per instantiation
+diff --git a/driver-r38/libtinynv/src/qmd.c b/driver-r38/libtinynv/src/qmd.c
+index a980563..1066f22 100644
+--- a/driver-r38/libtinynv/src/qmd.c
++++ b/driver-r38/libtinynv/src/qmd.c
+@@ -434,3 +434,22 @@ int tinynv_qmd_r44_edge(tinynv_qmd_t *prev, tinynv_qmd_t *next,
+ #undef R44_SET
+   return 0;
+ }
++
++int tinynv_qmd_r65_fields(tinynv_qmd_t *prev, tinynv_qmd_t *next, int early, uint32_t wait, uint32_t arrive) {
++  if ((prev && prev->v3) || next->v3) return tinynv_fail("R65 requires Blackwell QMD V05");
++  if (early && !prev) return tinynv_fail("R65 early launch without a predecessor in the chain");
++#define R65_SET(q,f,v) do { if (tinynv_qmd_set((q),TINYNV_QMD_##f##_LO,TINYNV_QMD_##f##_HI,(v))) return -1; } while (0)
++  if (early) R65_SET(prev,PRE_EXIT_AT_LAST_CTA_LAUNCH,1);
++  if (wait) {
++    R65_SET(next,WAIT_ON_LATCH_ID,wait);
++    R65_SET(next,WAIT_ON_LATCH_VALID,1);
++    R65_SET(next,LATCH_ACQUIRE_INVALIDATE_SHADER_DATA_CACHE,1);
++    R65_SET(next,LATCH_ACQUIRE_INVALIDATE_TEXTURE_DATA_CACHE,1);
++  }
++  if (arrive) {
++    R65_SET(next,ARRIVE_AT_LATCH_ID,arrive);
++    R65_SET(next,ARRIVE_AT_LATCH_VALID,1);
++  }
++#undef R65_SET
++  return 0;
++}
+diff --git a/driver-r38/libtinynv/src/qmd.h b/driver-r38/libtinynv/src/qmd.h
+index 499da48..d271dd7 100644
+--- a/driver-r38/libtinynv/src/qmd.h
++++ b/driver-r38/libtinynv/src/qmd.h
+@@ -134,6 +134,10 @@ int tinynv_qmd_r38_pdl(tinynv_qmd_t *prev, tinynv_qmd_t *next, uint32_t latch, i
+ // side node and a later mandatory drain; not enabled in ordinary graphs.
+ int tinynv_qmd_r44_edge(tinynv_qmd_t *prev, tinynv_qmd_t *next,
+                        uint32_t arrive, uint32_t wait, int early);
++// R65 side branches (the R44 fields, one launch at a time): with early, prev pre-exits at its last CTA launch; next
++// waits for latch `wait` (0: none) with the latch-acquire L1/texture invalidates and arrives at `arrive` (0: none).
++// prev may be NULL when early is 0.
++int tinynv_qmd_r65_fields(tinynv_qmd_t *prev, tinynv_qmd_t *next, int early, uint32_t wait, uint32_t arrive);
+ 
+ // Constant buffer 0's driver parameters, which are where a kernel finds the windows its shared and local memory live in.
+ // Returns how many dwords were written, or 0 if the buffer is too short for them.
+diff --git a/driver-r38/libtinynv/src/tinynv.c b/driver-r38/libtinynv/src/tinynv.c
+index acb6c90..eb497d7 100644
+--- a/driver-r38/libtinynv/src/tinynv.c
++++ b/driver-r38/libtinynv/src/tinynv.c
+@@ -837,6 +837,25 @@ tinynv_status_t tinynv_r53_stamp(tinynv_stream_t s, uint64_t va, uint32_t slots)
+   return WITH_LOCK(ex->rec ? TINYNV_ERR_INVALID : (ex->r53_va = va, ex->r53_slots = va ? slots : 0, TINYNV_OK));
+ }
+ 
++// R65 project-local side branches, inside a capture only: the next recorded launch's edge (see tinynv.h). Refused
++// while an R38/R45 early-launch mode is on (one owner of the dependency fields) or with an edge already pending.
++static int r65_set(tinynv_exec_t *ex, uint32_t arrive, uint32_t wait, int early) {
++  tinynv_graph_rec_t *r = ex->rec;
++  if (!r || r->r65_pending || ex->pdl_mode) return 1;
++  r->r65_arrive = arrive;
++  r->r65_wait = wait;
++  r->r65_early = early ? 1 : 0;
++  r->r65_pending = 1;
++  return 0;
++}
++tinynv_status_t tinynv_r65_edge(tinynv_stream_t s, uint32_t arrive, uint32_t wait, int early) {
++  if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
++  NEED_GPU(s);
++  if (arrive >= TINYNV_R65_LATCHES || wait >= TINYNV_R65_LATCHES || (arrive && arrive == wait)) return TINYNV_ERR_INVALID;
++  tinynv_exec_t *ex = &s->dev->exec;
++  return WITH_LOCK(r65_set(ex, arrive, wait, early)) ? TINYNV_ERR_INVALID : TINYNV_OK;
++}
++
+ tinynv_status_t tinynv_graph_begin(tinynv_stream_t s) {
+   if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
+   NEED_GPU(s);

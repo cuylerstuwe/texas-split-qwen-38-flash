@@ -54,7 +54,7 @@ xcrun clang++ -std=c++20 -O2 -mmacosx-version-min=26.2 -Ilib/mlx-src -Ilib/mlxc-
 - The parking helper depends on the exact MLX 0.32.3 library of the Sushi v1.3.0 release bundle (it reads
   MLX's random-number state by symbol name); a different MLX build fails closed.
 
-`build.zig` links the two native objects.
+`build.zig` links the two native objects (and, since §8, `lib/gpu_warm.m`).
 
 ## 3. Bug fix: fill the deferred PLE leaf before the stage send
 
@@ -145,7 +145,19 @@ those 20 values per row (−inf elsewhere) and the Mac skips its own mixer + hea
   remainder after a big chunk; a 1.3–1.4K-row final chunk draining). Chunk placement only: end-of-prefill
   logprobs move as much as switching the chunk width does.
 
-## 8. Instrumentation and switches that are off
+## 8. Mac GPU warm-up while the stage runs
+
+- `SUSHI_R65_GPU_WARM=1` (`native/stage_split.cpp`, `lib/gpu_warm.m`, `build.zig`): while a split decode
+  forward's reply is awaited, the stage client waits in 0.5 ms `select()` slices and commits a 256-thread
+  kernel on a Metal queue of its own between them. An idle Apple GPU clocks down within a few ms (on an M5
+  Max the same work after a 3–12 ms gap ran ~40% slower than back to back), and the Mac idles ~6.5 ms per
+  decode round while the 5090 runs layers 28–47, so the post-stage work used to start on a slow GPU. The tick
+  touches only its own 1 KB buffer: outputs are unchanged. Post-stage eval 0.57 → 0.31 ms per round; prefill
+  and time to first token unchanged. `2` alternates the warm-up per 32-round trace window
+  (`[r65-warm] window warm=N` with `SUSHI_MTP_TRACE=1`) for in-process A/Bs. A socket fd at or above
+  `FD_SETSIZE` takes the plain `poll()` wait without the warm-up.
+
+## 9. Instrumentation and switches that are off
 
 - Decode PLE gather timing (`src/qwen4_exp.zig`, `notePleGather`): printed as `[r64-ple]` with
   `SUSHI_MTP_TRACE=1`. `SUSHI_R64_PLE_RESIDENCY=1` counts how many rows sit in resident pages.

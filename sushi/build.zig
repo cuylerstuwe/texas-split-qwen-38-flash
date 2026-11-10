@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
+    mod.addCSourceFile(.{ .file = b.path("lib/gpu_warm.m"), .flags = &.{ "-O2", "-fobjc-arc" } }); // R65
     mod.addIncludePath(b.path("lib"));
 
     // The staged MLX library path must precede Homebrew's.
@@ -141,6 +142,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
+    test_mod.addCSourceFile(.{ .file = b.path("lib/gpu_warm.m"), .flags = &.{ "-O2", "-fobjc-arc" } }); // R65
     test_mod.addIncludePath(b.path("lib"));
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);

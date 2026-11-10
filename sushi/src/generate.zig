@@ -1,4 +1,10 @@
 const std = @import("std");
+// R65 GPU warm-up during the stage wait (native/stage_split.cpp, lib/gpu_warm.m): 0 off, 1 on, 2 alternating per
+// 32-round trace window (starting off); the arm is logged after each trace line as `[r65-warm] window warm=N`.
+extern "c" fn stage_split_warm_mode() c_int;
+extern "c" fn stage_split_warm_get() c_int;
+extern "c" fn stage_split_warm_set(on: c_int) void;
+extern "c" fn stage_split_warm_ticks() c_ulonglong;
 var r64_nosettle_env: ?bool = null;
 var r64_chain_ladder_env: ?bool = null;
 var r64_shortconf_env: ?bool = null;
@@ -10173,6 +10179,13 @@ pub const Generator = struct {
         if (qwen4_forward.r64_head_used + qwen4_forward.r64_head_fallback > 0) log.info("  [r64-head] used {d} fallback {d} sparse {d}\n", .{ qwen4_forward.r64_head_used, qwen4_forward.r64_head_fallback, r64_sparse_rounds });
         if (r64_defcap_mode orelse 0 != 0) log.info("  [r64-defcap] window defer={d}\n", .{r64_defcap_window_mode});
         if (r64_cpuacc_mode orelse 0 != 0) log.info("  [r64-cpuacc] window cpu={d} (host-accepted rounds {d})\n", .{ r64_cpuacc_window, r64_cpuacc_n });
+        {
+            const wm = stage_split_warm_mode();
+            if (wm != 0) {
+                log.info("  [r65-warm] window warm={d} (ticks so far {d})\n", .{ stage_split_warm_get(), stage_split_warm_ticks() });
+                if (wm == 2) stage_split_warm_set(1 - stage_split_warm_get());
+            }
+        }
         {
             const q4 = @import("qwen4_exp.zig");
             if (q4.ple_h_n > 0 and q4.ple_p_n > 0) log.info("  [r64-ple-ab] pool {d}: mean {d:.3} ms, max {d:.2}, >1 ms {d} | lean-or-hybrid {d}: mean {d:.3} ms, max {d:.2}, >1 ms {d}, resident {d}/{d}\n", .{ q4.ple_p_n, @as(f64, @floatFromInt(q4.ple_p_ns)) / @as(f64, @floatFromInt(q4.ple_p_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_p_max_ns)) / 1e6, q4.ple_p_over1, q4.ple_h_n, @as(f64, @floatFromInt(q4.ple_h_ns)) / @as(f64, @floatFromInt(q4.ple_h_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_h_max_ns)) / 1e6, q4.ple_h_over1, q4.ple_res_resident, q4.ple_res_rows });

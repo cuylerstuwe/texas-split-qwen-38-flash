@@ -13,9 +13,9 @@ driver (`libtinynv`, a C port of tinygrad's NVIDIA driver) through tinygrad's si
 
 | | Mac only (stock Sushi) | texas-split |
 |---|---|---|
-| Decode, agentic coding sessions | ~79–84 tok/s | **~108–122 tok/s** |
-| Total task time, same sessions | 1.00× | **1.42–1.51× faster** (pooled 1.46×) |
-| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **16.8–17.2 s (~3.2K tok/s), 1.6× faster** |
+| Decode, agentic coding sessions | ~79–84 tok/s | **~119–120 tok/s** |
+| Total task time, same sessions | 1.00× | **1.47–1.54× faster** (pooled 1.51×) |
+| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **16.8–17.4 s (~3.2K tok/s), 1.6× faster** |
 | Prefill, cold 64K / 192K-token prompts | not measured at these lengths | 3.1–3.4K / 2.8–3.3K tok/s (earlier build) |
 | Quality vs. a teacher model (KL, short panel) | .00458 | .00446 (same level) |
 
@@ -26,9 +26,11 @@ LM head; prefill is pipelined between the two machines and limited by the Mac's 
 its 20 at ~5.6–6.3K tok/s). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/VALIDATION.md](docs/VALIDATION.md).
 
-**Update 2026-11-10:** the verify rounds' LM head moved to the 5090 (faster decode), and two prefill
-speedups (a bf16 weight cache and better pipelining of the last chunks). See [CHANGELOG.md](CHANGELOG.md);
-existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart`.
+**Updates 2026-11-10:** the verify rounds' LM head moved to the 5090, two prefill speedups (a bf16 weight
+cache and better pipelining of the last chunks), and later the same day ~4% more decode speed: the 5090 runs
+each layer's shared expert beside the routed experts, the Mac's GPU stays clocked up while it waits for the
+5090, and the split uses Sushi's windowed draft-depth controller. See [CHANGELOG.md](CHANGELOG.md);
+existing installs: `git pull`, `./install.sh driver stage sushi pins`, `bin/texas-split restart`.
 
 ## What you need
 

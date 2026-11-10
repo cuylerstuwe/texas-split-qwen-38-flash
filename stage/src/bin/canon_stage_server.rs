@@ -248,9 +248,19 @@ fn main() -> Result<()> {
     let m8 = cuda_affine8::module(&d)?;
     let am = cuda_lowbit_attention::module(&d)?;
     let k4 = qwen_hybrid::cuda_mcg_tensor::module_k4(&d)?;
+    // R65 (QD_STAGE_SIDE=1): the shared-expert side branches' wait kernels
+    #[cfg(feature = "r65-driver")]
+    let r65w = if qwen_hybrid::cuda_stage::side_branches() { Some(qwen_hybrid::cuda_stage::r65_wait_module(&d)?) } else { None };
+    #[cfg(feature = "r65-driver")]
+    let r65k = match &r65w { Some(w) => Some(qwen_hybrid::cuda_stage::r65_wait_kernels(w)?), None => None };
+    #[cfg(not(feature = "r65-driver"))]
+    let r65k: Option<[qwen_hybrid::cuda::Kernel<'_, '_>; 3]> = None;
     {
         let m = Modules::load(&d)?;
         let stage = Stage::new(&d, &m, &am, &m8, &pack, first, capacity)?;
+        if r65k.is_some() {
+            eprintln!("canon-stage-server: R65 shared-expert side branches on");
+        }
         // R64: the stage head (QD_STAGE_HEAD=1): final mixer + lm_head + GPU top-20 after a forward on request
         let r56 = if std::env::var("QD_STAGE_HEAD").as_deref() == Ok("1") {
             Some(d.module(&Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/r56_ops.sm120.cubin"),
@@ -321,7 +331,7 @@ fn main() -> Result<()> {
                     for c in &commits {
                         c.enqueue()?;
                     }
-                    let fresh = stage.record_forward(rows)?;
+                    let fresh = match &r65k { Some(k) => stage.record_forward_side(rows, k)?, None => stage.record_forward(rows)? };
                     let patched = match graphs.get_mut(&rows) {
                         Some(g) if use_graphs => g.patch_diff(fresh)?.is_some(),
                         _ => false,
@@ -330,12 +340,12 @@ fn main() -> Result<()> {
                         graphs[&rows].launch()?;
                         replays += 1;
                     } else if use_graphs {
-                        let g = d.capture_model_diagnostic(stage.record_forward(rows)?)?;
+                        let g = d.capture_model_diagnostic(match &r65k { Some(k) => stage.record_forward_side(rows, k)?, None => stage.record_forward(rows)? })?;
                         g.launch()?;
                         graphs.insert(rows, g);
                         captures += 1;
                     } else {
-                        for c in &stage.record_forward(rows)? {
+                        for c in &(match &r65k { Some(k) => stage.record_forward_side(rows, k)?, None => stage.record_forward(rows)? }) {
                             c.enqueue()?;
                         }
                     }
@@ -513,6 +523,14 @@ fn main() -> Result<()> {
     k4.close()?;
     am.close()?;
     m8.close()?;
+    #[cfg(feature = "r65-driver")]
+    {
+        drop(r65k);
+        let taken = r65w; // moved here, so its borrow of the device ends in this block
+        if let Some(w) = taken {
+            w.close()?;
+        }
+    }
     d.close()?;
     println!("{}", json!({"kind":"summary","passed":true,"cleanup_completed":true}));
     Ok(())

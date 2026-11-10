@@ -1875,11 +1875,15 @@ int tinynv_exec_graph_end(tinynv_exec_t *ex, tinynv_graph_rec_t **out) {
     r->failed=1;
     tinynv_fail("R44 side probe requires exactly A/side/B/C/join in one chain");
   }
+  if (r->r65_pending) { r->failed = 1; tinynv_fail("R65: an edge was set after the last launch"); }
   int failed = r->failed, n = (int)r->n;
   if (failed || !n) {
     tinynv_exec_graph_free(ex, r);
     return failed ? -1 : tinynv_fail("the recording holds no launches");
   }
+  if (r->r65_edges)
+    fprintf(stderr, "libtinynv: R65 side branches: %u edges in %u launches, %d chains, %u dependencies dropped at chain starts\n",
+            r->r65_edges, r->n, r->nchains, r->r65_dropped);
   { tinynv_graph_chain_t *ch = &r->chains[r->nchains - 1];   // the last chain ends at the last descriptor
     ch->tail_va = (uint64_t)(r->prev_host - (uint8_t *)r->mirror.dma.va) + r->mem.va;
     ch->tail_qmd = r->prev_qmd; }
@@ -2339,6 +2343,14 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
     r->failed = 1;
     return tinynv_fail("R53 stamp: the descriptor's last release slot is taken");
   }
+  // R65 side branches: this launch's edge, consumed here whichever chain the launch lands in
+  const int r65 = r->r65_pending, r65_early = r->r65_early;
+  const uint32_t r65_wait = r->r65_wait, r65_arrive = r->r65_arrive;
+  r->r65_pending = 0;
+  if (r65 && r65_wait && !r->r65_latch_chain[r65_wait]) {
+    r->failed = 1;
+    return tinynv_fail("R65: launch %u waits on latch %u, which no earlier launch arrives at", r->n, r65_wait);
+  }
   tinynv_graph_chain_t *ch = r->nchains ? &r->chains[r->nchains - 1] : NULL;
   if (ch && ch->n >= (uint32_t)ex->chain_max) {
     // this chain is full: it ends at the previous descriptor and the next one starts here
@@ -2347,6 +2359,13 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
     ch = NULL;
   }
   if (ch) {
+    // R65: a wait on a latch arrived at in an earlier chain is dropped (that chain has completed before this one starts)
+    if (r65) {
+      const uint32_t w = (r65_wait && r->r65_latch_chain[r65_wait] == (uint8_t)r->nchains) ? r65_wait : 0;
+      if (r65_wait && !w) r->r65_dropped++;
+      if (tinynv_qmd_r65_fields(&r->prev_qmd, &q, r65_early, w, r65_arrive)) { r->failed = 1; return -1; }
+      r->r65_edges++;
+    }
     // R38 experiment: early dependent launch fields, written before the link and before either descriptor is copied
     if (ex->pdl_mode == 64) {
       // A arrives1; side has no shader wait and can run independently.
@@ -2381,7 +2400,14 @@ static int rec_launch(tinynv_exec_t *ex, tinynv_exec_module_t *m, const tinynv_k
     memset(ch, 0, sizeof(*ch));
     ch->head_va = qmd_va;
     ch->head_host = host;
+    // R65: a chain's first launch starts after the previous chain has completed: early launch and waits are moot
+    if (r65) {
+      if (r65_early || r65_wait) r->r65_dropped++;
+      if (tinynv_qmd_r65_fields(NULL, &q, 0, 0, r65_arrive)) { r->failed = 1; return -1; }
+      r->r65_edges++;
+    }
   }
+  if (r65 && r65_arrive) r->r65_latch_chain[r65_arrive] = (uint8_t)r->nchains;
   ch->n++;
   memcpy(host, q.b, TINYNV_QMD_BYTES);
   memset(host + TINYNV_QMD_BYTES, 0, slot - TINYNV_QMD_BYTES);

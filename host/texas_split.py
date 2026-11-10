@@ -560,7 +560,11 @@ class Host:
                    # Its 0.71 GB fits beside the 262K-row state only with 1536-row prefill pieces (2048 leaves
                    # too little for the first decode); time to first token is unchanged. QD_STAGE_HEAD='0'
                    # (with SUSHI_R64_STAGE_HEAD='0') disables it.
-                   QD_STAGE_HEAD='1', QD_STAGE_PREFILL_ROWS='1536')
+                   QD_STAGE_HEAD='1', QD_STAGE_PREFILL_ROWS='1536',
+                   # each MoE block's shared expert runs as a side branch beside the router chain and the routed
+                   # experts (driver launch latches, stage/README.md); bit-identical, 1-7 row forwards 0.24-0.36 ms
+                   # faster, prefill unchanged. '0' disables it.
+                   QD_STAGE_SIDE='1')
         self.hold_display()
         slog = open(self.run_dir / 'stage.log', 'ab', buffering=0)
         self.stage = subprocess.Popen(['sh', str(MACUDA / 'tools/nv_shim_step.sh'), 'local', 'probe', str(STAGE_BIN),
@@ -642,6 +646,15 @@ class Host:
         # - prefill keeps each 8-bit weight's dequantized bf16 copy (~4.1 GB; bit-identical), and plans the
         #   last two chunk widths of a split prefill as one covered tail (chunk placement only; section 7).
         env.update(SUSHI_R64_DQ_CACHE_MB='6144', SUSHI_R64_SPLIT_PLAN='1')
+        # - keep the Mac GPU's clocks up while a decode forward waits for the 5090: a tiny kernel on a Metal queue
+        #   of its own every 0.5 ms (touches only its own buffer; outputs unchanged; sushi/FORK.md section 8).
+        env.update(SUSHI_R65_GPU_WARM='1')
+        if stage_env:
+            # On the split, the windowed MTP depth controller (depth 3, stepped down only on a cold window) instead of
+            # the adaptive planner: the planner's measured round-cost table cannot resolve the split's costs, and it
+            # answered cheaper rounds with shallower drafts. Depth policy only (speculative sampling keeps the
+            # target distribution at any depth); the text also stops depending on timing. Mac-only keeps the planner.
+            env.update(SUSHI_MTP_ADAPTIVE='0', SUSHI_MTP_COST_TABLE='0', SUSHI_MTP_ADAPTIVE_SERIAL='0')
         # qualification only: extra Sushi variables as a JSON object (e.g. a fixed MTP width)
         extra = json.loads(CFG.get('TEXAS_SPLIT_SUSHI_ENV') or '{}')
         env.update({k: str(v) for k, v in extra.items() if k.startswith('SUSHI_')})

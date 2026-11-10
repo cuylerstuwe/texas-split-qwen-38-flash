@@ -2,7 +2,7 @@
  {
   "case": "decode-greedy-lease",
   "exact": true,
-  "switch_s": 0.10073729100258788,
+  "switch_s": 0.11094016699644271,
   "in_prefill": false,
   "lease": true,
   "paused_tokens": 69,
@@ -53,7 +53,7 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "d9a2ac3f2a6f4feb96349b3130a90100",
+     "id": "b476e53d8f9145c5811e9dd8674f2467",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 69,
@@ -79,7 +79,7 @@
     "park_error": 0,
     "restore_wait": 0,
     "freed": 113246208,
-    "available": 38009913344
+    "available": 35487875072
    },
    "split": {
     "mode": "split",
@@ -97,7 +97,7 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "d9a2ac3f2a6f4feb96349b3130a90100",
+     "id": "b476e53d8f9145c5811e9dd8674f2467",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 69,
@@ -123,7 +123,7 @@
     "park_error": 0,
     "restore_wait": 0,
     "freed": 113246208,
-    "available": 38187302912
+    "available": 36126162944
    },
    "split": {
     "mode": "split",
@@ -186,7 +186,7 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "1212876f418a4ad98cb8d5161dfafe37",
+     "id": "53ff29f406be47a7a945f9b69a69dc0e",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 82,
@@ -199,7 +199,7 @@
      "restore_waiting_for_memory": false
     },
     {
-     "id": "bc3f04a2713040b19933db499578751e",
+     "id": "db8dddcd745a40e982fbb63ac455f3c1",
      "mode": "foreground",
      "phase": "foreground"
     }
@@ -217,7 +217,7 @@
     "park_error": 0,
     "restore_wait": 0,
     "freed": 311427072,
-    "available": 39369965568
+    "available": 37314461696
    },
    "split": {
     "mode": "split",
@@ -235,7 +235,7 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "1212876f418a4ad98cb8d5161dfafe37",
+     "id": "53ff29f406be47a7a945f9b69a69dc0e",
      "mode": "background",
      "phase": "restoring",
      "output_tokens": 82,
@@ -261,7 +261,7 @@
     "park_error": 0,
     "restore_wait": 0,
     "freed": 311427072,
-    "available": 39859175424
+    "available": 37994676224
    },
    "split": {
     "mode": "split",
@@ -299,12 +299,12 @@
  {
   "case": "prefill-greedy-lease",
   "exact": true,
-  "switch_s": 2.191404999997758,
+  "switch_s": 1.157318416997441,
   "in_prefill": true,
   "lease": true,
   "paused_tokens": 0,
   "paused_phase": 1,
-  "checkpoint_bytes": 968998912,
+  "checkpoint_bytes": 893698048,
   "pauses": 3,
   "frozen": true,
   "usage": {
@@ -350,15 +350,15 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "092d6c433af94e81a36d6a2dd326e972",
+     "id": "0e34be14237649c8a8f828c30f9dbc51",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 0,
      "prompt_tokens": 63596,
      "paused": true,
      "pauses": 3,
-     "checkpoint_bytes": 968998912,
-     "checkpoint_freed_bytes": 968998912,
+     "checkpoint_bytes": 893698048,
+     "checkpoint_freed_bytes": 893698048,
      "checkpoint_error": false,
      "restore_waiting_for_memory": false
     }
@@ -368,15 +368,15 @@
     "hold": 1,
     "state": 3,
     "ack": 18,
-    "bytes": 968998912,
+    "bytes": 893698048,
     "pauses": 3,
     "tokens": 0,
     "prompt": 63596,
     "phase": 1,
     "park_error": 0,
     "restore_wait": 0,
-    "freed": 968998912,
-    "available": 32522698752
+    "freed": 893698048,
+    "available": 30840717312
    },
    "split": {
     "mode": "split",
@@ -394,15 +394,15 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "092d6c433af94e81a36d6a2dd326e972",
+     "id": "0e34be14237649c8a8f828c30f9dbc51",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 0,
      "prompt_tokens": 63596,
      "paused": true,
      "pauses": 3,
-     "checkpoint_bytes": 968998912,
-     "checkpoint_freed_bytes": 968998912,
+     "checkpoint_bytes": 893698048,
+     "checkpoint_freed_bytes": 893698048,
      "checkpoint_error": false,
      "restore_waiting_for_memory": false
     }
@@ -412,15 +412,15 @@
     "hold": 1,
     "state": 3,
     "ack": 19,
-    "bytes": 968998912,
+    "bytes": 893698048,
     "pauses": 3,
     "tokens": 0,
     "prompt": 63596,
     "phase": 1,
     "park_error": 0,
     "restore_wait": 0,
-    "freed": 968998912,
-    "available": 34421604352
+    "freed": 893698048,
+    "available": 31417368576
    },
    "split": {
     "mode": "split",
@@ -484,7 +484,7 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "ca43f50b672a4c08af158d61f1675603",
+     "id": "7bc7a291b0bc4af0a52657884bcf5b77",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 50,
@@ -497,12 +497,12 @@
      "restore_waiting_for_memory": false
     },
     {
-     "id": "3b04cff8e2aa42cf9ba6ceb8d4ee8d06",
+     "id": "8d0bba5a41284d1fbbbb4cbbabbf7118",
      "mode": "foreground",
      "phase": "foreground"
     },
     {
-     "id": "f3cf95032a3c49af94ce0d46e22226ce",
+     "id": "a5f0f0cc45804c758a671bd6bd397712",
      "mode": "foreground",
      "phase": "foreground"
     }
@@ -520,7 +520,7 @@
     "park_error": 0,
     "restore_wait": 0,
     "freed": 113246208,
-    "available": 36313841664
+    "available": 33141686272
    },
    "split": {
     "mode": "split",
@@ -538,7 +538,7 @@
    "background_system_reserve_bytes": 12884901888,
    "requests": [
     {
-     "id": "ca43f50b672a4c08af158d61f1675603",
+     "id": "7bc7a291b0bc4af0a52657884bcf5b77",
      "mode": "background",
      "phase": "paused",
      "output_tokens": 50,
@@ -564,7 +564,7 @@
     "park_error": 0,
     "restore_wait": 0,
     "freed": 113246208,
-    "available": 35981393920
+    "available": 32912932864
    },
    "split": {
     "mode": "split",

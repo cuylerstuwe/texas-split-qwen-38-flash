@@ -134,6 +134,10 @@ int tinynv_qmd_r38_pdl(tinynv_qmd_t *prev, tinynv_qmd_t *next, uint32_t latch, i
 // side node and a later mandatory drain; not enabled in ordinary graphs.
 int tinynv_qmd_r44_edge(tinynv_qmd_t *prev, tinynv_qmd_t *next,
                        uint32_t arrive, uint32_t wait, int early);
+// R65 side branches (the R44 fields, one launch at a time): with early, prev pre-exits at its last CTA launch; next
+// waits for latch `wait` (0: none) with the latch-acquire L1/texture invalidates and arrives at `arrive` (0: none).
+// prev may be NULL when early is 0.
+int tinynv_qmd_r65_fields(tinynv_qmd_t *prev, tinynv_qmd_t *next, int early, uint32_t wait, uint32_t arrive);
 
 // Constant buffer 0's driver parameters, which are where a kernel finds the windows its shared and local memory live in.
 // Returns how many dwords were written, or 0 if the buffer is too short for them.

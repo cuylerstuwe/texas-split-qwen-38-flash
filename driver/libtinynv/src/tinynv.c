@@ -837,6 +837,25 @@ tinynv_status_t tinynv_r53_stamp(tinynv_stream_t s, uint64_t va, uint32_t slots)
   return WITH_LOCK(ex->rec ? TINYNV_ERR_INVALID : (ex->r53_va = va, ex->r53_slots = va ? slots : 0, TINYNV_OK));
 }
 
+// R65 project-local side branches, inside a capture only: the next recorded launch's edge (see tinynv.h). Refused
+// while an R38/R45 early-launch mode is on (one owner of the dependency fields) or with an edge already pending.
+static int r65_set(tinynv_exec_t *ex, uint32_t arrive, uint32_t wait, int early) {
+  tinynv_graph_rec_t *r = ex->rec;
+  if (!r || r->r65_pending || ex->pdl_mode) return 1;
+  r->r65_arrive = arrive;
+  r->r65_wait = wait;
+  r->r65_early = early ? 1 : 0;
+  r->r65_pending = 1;
+  return 0;
+}
+tinynv_status_t tinynv_r65_edge(tinynv_stream_t s, uint32_t arrive, uint32_t wait, int early) {
+  if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
+  NEED_GPU(s);
+  if (arrive >= TINYNV_R65_LATCHES || wait >= TINYNV_R65_LATCHES || (arrive && arrive == wait)) return TINYNV_ERR_INVALID;
+  tinynv_exec_t *ex = &s->dev->exec;
+  return WITH_LOCK(r65_set(ex, arrive, wait, early)) ? TINYNV_ERR_INVALID : TINYNV_OK;
+}
+
 tinynv_status_t tinynv_graph_begin(tinynv_stream_t s) {
   if (!ON_GPU(s)) return TINYNV_ERR_UNSUPPORTED;
   NEED_GPU(s);

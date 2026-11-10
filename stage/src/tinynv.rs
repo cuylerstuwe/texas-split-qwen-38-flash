@@ -91,6 +91,8 @@ unsafe extern "C" {
     #[cfg(feature = "r53-driver")]
     pub fn tinynv_r54_graph_patch(stream: Handle, graph: Handle, launch: c_uint, offset: c_uint,
         data: *const std::ffi::c_void, len: c_uint) -> c_int;
+    #[cfg(feature = "r65-driver")]
+    pub fn tinynv_r65_edge(stream: Handle, arrive: c_uint, wait: c_uint, early: c_int) -> c_int;
     pub fn tinynv_graph_end(stream: Handle, out: *mut Handle) -> c_int;
     pub fn tinynv_graph_launch(stream: Handle, graph: Handle) -> c_int;
     pub fn tinynv_graph_free(stream: Handle, graph: Handle);

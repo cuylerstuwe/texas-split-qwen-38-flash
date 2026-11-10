@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-11-10, latest: faster decode (shared expert beside the routed experts, warm Mac GPU, windowed draft depth)
+
+Existing installs: `git pull`, `./install.sh driver stage sushi pins`, `bin/texas-split restart` (the driver, the
+stage server and Sushi all changed).
+
+Agentic replay (two recorded sessions, the thinking sampler, 1,024 tokens per turn, three seeds): total task
+1.466× → **1.507×** faster than stock Sushi (pooled; 267.8 → 260.6 s), decode 114.7 → **119.5 tok/s**, time to
+first token unchanged. Details and the qualification in [docs/VALIDATION.md](docs/VALIDATION.md).
+
+### The shared expert beside the routed experts (stage, driver)
+
+Each MoE layer's shared expert reads only the layer's input, yet ran after the router and the routed experts.
+With `QD_STAGE_SIDE=1` (set by the host) the stage records it as a side branch: the driver's QMD launch latches
+order the launches (`driver/R65-SIDE-EDGES.patch`, `tinynv_r65_edge`), a launch starts early only when everything
+it reads finished before its predecessor started, and the three joins are copies of existing kernels with
+`griddepcontrol.wait` at entry (`stage/kernels/r65_wait.cu`), because a latch only holds a kernel that executes
+it. Bit-identical outputs; decode forwards (1–7 rows) 0.24–0.36 ms faster on the 5090. Forwards of 8+ rows and
+prefill are unchanged. The stage now builds with the `r65-driver` feature.
+
+### The Mac GPU stays warm while the 5090 runs (Sushi)
+
+An idle Apple GPU clocks down within a few milliseconds, and the Mac idles ~6.5 ms per decode round while the
+5090 runs layers 28–47, so the Mac's work after each reply started on a slow GPU. With `SUSHI_R65_GPU_WARM=1` (set
+by the host) the stage client commits a 256-thread kernel on a Metal queue of its own every 0.5 ms while it waits
+(`sushi/lib/gpu_warm.m`). It touches only its own buffer, so outputs are unchanged; the post-reply work fell from
+0.57 to 0.31 ms per round. See [sushi/FORK.md](sushi/FORK.md) §8.
+
+### Windowed draft depth on the split (host)
+
+Sushi's adaptive planner picks each round's draft depth from measured round costs. On the split it handed the two
+speedups above back: it drafted 5.5% shallower once rounds got cheaper, and the replay tied. The host now sets
+`SUSHI_MTP_ADAPTIVE=0`, `SUSHI_MTP_COST_TABLE=0` and `SUSHI_MTP_ADAPTIVE_SERIAL=0` in split mode: Sushi's windowed
+controller, 3 drafts per round, fewer only on a cold stretch. On the same sessions it beats the planner by itself
+(1.500× vs 1.466× stock) and keeps the speedups (1.507×). It changes only how many tokens are drafted
+(speculative sampling keeps the target distribution at any depth), and the generated text no longer depends on
+timing: a seed reproduces its text. The Mac-only fallback keeps the planner. To go back, set
+`TEXAS_SPLIT_SUSHI_ENV={"SUSHI_MTP_ADAPTIVE": "1", "SUSHI_MTP_COST_TABLE": "1", "SUSHI_MTP_ADAPTIVE_SERIAL": "1"}`
+in your config and restart.
+
 ## 2026-11-10, later: memory guard fix
 
 Existing installs already on the 2026-11-10 release below: `git pull`, `bin/texas-split restart` (host only;

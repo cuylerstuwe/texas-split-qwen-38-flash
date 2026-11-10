@@ -150,6 +150,10 @@ tinynv_status_t tinynv_r45_capture_mode(tinynv_stream_t, int mode);
 tinynv_status_t tinynv_r53_stamp(tinynv_stream_t, uint64_t va, uint32_t slots);
 tinynv_status_t tinynv_r54_graph_patch(tinynv_stream_t, tinynv_graph_t, uint32_t launch, uint32_t offset,
                                        const void *data, uint32_t len);
+// Isolated R65 side-branch build only, inside a capture: the next recorded launch arrives at latch `arrive` when it
+// completes, waits for latch `wait` (arrived at by an earlier launch) before it starts, and with `early` may start
+// once its chain predecessor's last CTA has launched rather than when it completes. 0 = none; ids < 4096.
+tinynv_status_t tinynv_r65_edge(tinynv_stream_t, uint32_t arrive, uint32_t wait, int early);
 tinynv_status_t tinynv_graph_end(tinynv_stream_t, tinynv_graph_t *out);
 tinynv_status_t tinynv_graph_launch(tinynv_stream_t, tinynv_graph_t);
 void tinynv_graph_free(tinynv_stream_t, tinynv_graph_t);

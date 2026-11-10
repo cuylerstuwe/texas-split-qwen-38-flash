@@ -178,7 +178,8 @@ impl Device {
         ensure!(
             option_env!("QWEN_TINYNV_ARCHIVE")
                 .unwrap_or("")
-                .ends_with("driver-r38/build/r53nv/libtinynv.a"),
+                .ends_with("driver-r38/build/r53nv/libtinynv.a")
+                || option_env!("QWEN_TINYNV_ARCHIVE").unwrap_or("").ends_with("driver-r38/build/r65nv/libtinynv.a"),
             "R53 isolated archive required"
         );
         let va = match buf {
@@ -581,6 +582,7 @@ impl<'m, 'd> Kernel<'m, 'd> {
             blob,
             grid,
             block,
+            edge: None,
         })
     }
     fn encode(&self, args: &[Arg<'_, '_>], grid: [u32; 3], block: [u32; 3]) -> Result<Vec<u8>> {
@@ -652,11 +654,43 @@ pub struct PreparedCall<'a, 'm, 'd> {
     blob: Vec<u8>,
     grid: [u32; 3],
     block: [u32; 3],
+    /// R65 side branches (r65nv archive): (arrive latch, wait latch, early) applied when this call is
+    /// recorded into a graph; None = ordinary serialized edge.
+    edge: Option<(u32, u32, bool)>,
 }
 impl<'a, 'm, 'd> PreparedCall<'a, 'm, 'd> {
     /// R53 calibration: kernel name and launch geometry of this call.
     pub fn meta(&self) -> (&str, [u32; 3], [u32; 3]) {
         (self.kernel.name(), self.grid, self.block)
+    }
+    /// R65 side branches (r65nv archive): when recorded, this call arrives at latch `arrive` on
+    /// completion, waits for latch `wait` (arrived at by an earlier call) and, with `early`, may start
+    /// once its predecessor's last CTA has launched. 0 = none. Ignored outside graph capture.
+    pub fn with_edge(mut self, arrive: u32, wait: u32, early: bool) -> Self {
+        self.edge = Some((arrive, wait, early));
+        self
+    }
+    pub fn set_edge(&mut self, arrive: u32, wait: u32, early: bool) {
+        self.edge = Some((arrive, wait, early));
+    }
+    /// R65: the same call (arguments, launch geometry, edge) on `k`, a kernel with an identical parameter layout
+    /// (a variant compiled from the same body, e.g. with a grid dependency wait at entry).
+    pub fn with_kernel(self, k: &'a Kernel<'m, 'd>) -> Result<Self> {
+        let (a, b) = (&self.kernel.info, &k.info);
+        let n = a.num_params.max(0) as usize;
+        ensure!(
+            a.num_params == b.num_params
+                && n <= 64
+                && a.params[..n].iter().zip(&b.params[..n]).all(|(x, y)| x.offset == y.offset && x.size == y.size)
+                && std::ptr::eq(k.module.device, self.kernel.module.device),
+            "R65 kernel swap {} -> {}: parameter layout differs",
+            self.kernel.name,
+            k.name
+        );
+        Ok(PreparedCall { kernel: k, ..self })
+    }
+    pub fn edge(&self) -> Option<(u32, u32, bool)> {
+        self.edge
     }
     /// R53 calibration: an identical second launch of this call (same kernel,
     /// arguments and geometry). Only meaningful for kernels that are idempotent.
@@ -667,6 +701,7 @@ impl<'a, 'm, 'd> PreparedCall<'a, 'm, 'd> {
             blob: self.blob.clone(),
             grid: self.grid,
             block: self.block,
+            edge: None,
         }
     }
     /// R53 calibration: the same geometry launched as a parameterless null kernel.
@@ -689,6 +724,7 @@ impl<'a, 'm, 'd> PreparedCall<'a, 'm, 'd> {
             blob: vec![],
             grid: self.grid,
             block: self.block,
+            edge: None,
         })
     }
     pub fn enqueue(&self) -> Result<()> {
@@ -748,7 +784,17 @@ impl Device {
         }
         // Encoding/ABI validation already completed. Always end a begun capture
         // even if the driver refuses a command; never leave capture mode active.
-        let queued = calls.iter().try_for_each(PreparedCall::enqueue);
+        let queued = calls.iter().try_for_each(|c| {
+            if let Some((arrive, wait, early)) = c.edge {
+                #[cfg(feature = "r65-driver")]
+                unsafe {
+                    check(tinynv_r65_edge(self.stream, arrive, wait, early as std::ffi::c_int))?;
+                }
+                #[cfg(not(feature = "r65-driver"))]
+                anyhow::bail!("R65 edge ({arrive}, {wait}, {early}) needs the r65nv archive");
+            }
+            c.enqueue()
+        });
         let mut handle = null_mut();
         let ended = unsafe { check(tinynv_graph_end(self.stream, &mut handle)) };
         if queued.is_err() || ended.is_err() {

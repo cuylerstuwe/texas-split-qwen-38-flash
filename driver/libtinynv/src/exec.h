@@ -80,6 +80,7 @@ typedef struct {
 // thirteen of 128 (2026-09-19 16:42, -6.5%), so a replay issues the chains as consecutive batches under one
 // announcement, each acquiring on the previous one's tail release.
 #define TINYNV_GRAPH_CHAINS 128
+#define TINYNV_R65_LATCHES 4096   // R65 side branches: latch ids per recording
 typedef struct { uint64_t head_va, tail_va; uint8_t *head_host; tinynv_qmd_t tail_qmd; uint32_t n; } tinynv_graph_chain_t;
 typedef struct tinynv_graph_rec {
   tinynv_vmap_t mem;       // video memory: what the engine reads on every replay
@@ -102,6 +103,13 @@ typedef struct tinynv_graph_rec {
   uint32_t npatch, patch_cap;
   int prev_trig;           // R53: the previous descriptor's kernel name ends in _trig (it calls
                            // griddepcontrol.launch_dependents itself; see TINYNV_R38_PDL bit 128)
+  // R65 side branches (tinynv_r65_edge): the next launch's edge, and for each latch id the chain (index + 1) whose
+  // launch arrives at it (0: none yet). A wait on a latch arrived at in an earlier chain is dropped: chains run one
+  // after another, so that launch has completed. Counters for the caller's log.
+  uint32_t r65_arrive, r65_wait;
+  int r65_early, r65_pending;
+  uint8_t r65_latch_chain[TINYNV_R65_LATCHES];
+  uint32_t r65_edges, r65_dropped;
 } tinynv_graph_rec_t;
 typedef struct {
   const void *key;    // the kernel descriptor's address: one row per instantiation

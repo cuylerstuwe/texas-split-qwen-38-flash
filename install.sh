@@ -34,7 +34,7 @@ SUSHI_BUNDLE_URL=https://github.com/beamivalice/sushi/releases/download/v1.3.0/s
 SUSHI_BUNDLE_SHA=96764e49d2d0c340a5b7f1cd70a392e75d42bb931763152365d102334ac5f5c8
 TINYGPU_URL=https://github.com/tinygrad/tinygpu_releases/raw/c0d024f9ff0e1dc8fdf217f255da7101d91e8323/TinyGPU.zip
 TINYGPU_SHA=0c47285e2232643210555cf30ce08289b9e55da261c300e0c82e8448a359a21f
-DRIVER_BUILD_ID=e797e31-r53cal
+DRIVER_BUILD_ID=e797e31-r65side
 MIN_MACOS=26.2
 
 ENV_FILE=$ROOT/texas-split.env
@@ -149,7 +149,7 @@ step_driver() {
 step_stage() {
   say "==> stage server (stage/: layers 28-47 on the RTX 5090)"
   [ -f driver/build/libtinynv.a ] || die "driver/build/libtinynv.a is missing: ./install.sh driver"
-  ( cd stage && QWEN_TINYNV_ARCHIVE="$ROOT/driver/build/libtinynv.a" cargo build --release --features cuda,metal,r53-driver --bin canon-stage-server )
+  ( cd stage && QWEN_TINYNV_ARCHIVE="$ROOT/driver/build/libtinynv.a" cargo build --release --features cuda,metal,r65-driver --bin canon-stage-server )
   ok "stage/target/release/canon-stage-server"
 }
 

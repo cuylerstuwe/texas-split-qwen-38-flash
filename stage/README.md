@@ -15,8 +15,13 @@ CUDA kernels ship as prebuilt `kernels/*.cubin` (sources `kernels/*.cu`), each p
 Build (what `install.sh stage` does; needs `../driver/build/libtinynv.a`):
 
 ```sh
-QWEN_TINYNV_ARCHIVE=$PWD/../driver/build/libtinynv.a cargo build --release --features cuda,metal,r53-driver --bin canon-stage-server
+QWEN_TINYNV_ARCHIVE=$PWD/../driver/build/libtinynv.a cargo build --release --features cuda,metal,r65-driver --bin canon-stage-server
 ```
+
+`r65-driver` needs the driver's `tinynv_r65_edge` (`../driver/R65-SIDE-EDGES.patch`): with `QD_STAGE_SIDE=1` each MoE
+block's shared expert runs as a side branch beside the router chain and the routed experts (QMD launch latches;
+the joins are `kernels/r65_wait.cu`'s copies of three kernels with `griddepcontrol.wait` at entry). Outputs are
+bit-identical; 1–7 row forwards are 0.24–0.36 ms faster. Without the switch the recording is unchanged.
 
 Run (the host does this): `canon-stage-server FIRST CAPACITY` (28, 262160) under macuda's
 `tools/nv_shim_step.sh local probe` (read-only GPU preflight, TinyGPU server, logged step), with

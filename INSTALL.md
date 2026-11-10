@@ -54,7 +54,8 @@ reports whether the extension is running. An agent cannot do this approval; ask 
 ## 4. Driver — `./install.sh driver`
 
 Builds `driver/build/libtinynv.a`: macuda's userspace NVIDIA driver (`libtinynv` at macuda `e797e31`) with
-this project's patches (graph latch launches, recorded-graph parameter patching, calibration stamps; see
+this project's patches (graph latch launches and per-launch latch edges, recorded-graph parameter patching,
+calibration stamps; see
 `driver/README.md`). It first fetches, pinned by URL and SHA-256 into `driver/libtinynv/third_party/`:
 
 - NVIDIA `open-gpu-kernel-modules` headers (used under their MIT license),
@@ -64,7 +65,7 @@ The firmware path is compiled in; `TINYNV_FW_DIR` overrides it (the host sets it
 
 ## 5. Stage server — `./install.sh stage`
 
-`cargo build --release --features cuda,metal,r53-driver --bin canon-stage-server` in `stage/`, linking the
+`cargo build --release --features cuda,metal,r65-driver --bin canon-stage-server` in `stage/`, linking the
 archive from step 4 (`QWEN_TINYNV_ARCHIVE`). The binary embeds the absolute path of `stage/kernels`: if you
 move the repository, rebuild (`./install.sh stage pins`).
 

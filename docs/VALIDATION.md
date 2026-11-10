@@ -6,16 +6,16 @@ revision `f25c0c4`. Evidence files are in [evidence/](evidence/); the tests are 
 ## Speed and quality
 
 - **Total task time** on recorded agentic coding sessions, replayed request by request (prefill + decode +
-  queueing, the thinking sampler, 1,024 tokens per turn, three seeds): 1.42×, 1.47× and 1.51× faster than
-  stock Sushi on the same pack (pooled 1.46×, 392.7 → 268.1 s) with the 2026-11-10 build; the first
-  release measured 1.28×, 1.33× and 1.34× (pooled 1.32×). Decode ~108–122 tok/s (first release ~98–111)
-  vs ~79–84 tok/s. The stock runs are the first release's (same harness and seeds; stock Sushi has not
+  queueing, the thinking sampler, 1,024 tokens per turn, three seeds): 1.51×, 1.54× and 1.47× faster than
+  stock Sushi on the same pack (pooled 1.51×, 392.7 → 260.6 s) with the later 2026-11-10 build; the earlier
+  2026-11-10 build measured 1.42×, 1.47× and 1.51× (pooled 1.46×), the first release 1.28×, 1.33× and
+  1.34× (pooled 1.32×). Decode ~119–120 tok/s (earlier builds ~108–122 and ~98–111) vs ~79–84 tok/s. The stock runs are the first release's (same harness and seeds; stock Sushi has not
   changed).
 - **Prefill** (cold prompts, nothing cached):
 
   | Prompt | Stock Sushi, Mac only | texas-split |
   |---|---|---|
-  | 54K tokens, first turn of a recorded agent session (time to first token, same prompt) | 27.5 s (~2.0K tok/s) | 16.8–17.2 s (~3.2K tok/s): 1.6× (first release 18.2 s, 1.52×) |
+  | 54K tokens, first turn of a recorded agent session (time to first token, same prompt) | 27.5 s (~2.0K tok/s) | 16.8–17.4 s (~3.2K tok/s): 1.6× (first release 18.2 s, 1.52×) |
   | 63,596 tokens (two runs) | not run | 3,443 and 3,101 tok/s |
   | 192,008 tokens (two runs) | not run | 2,814 and 3,289 tok/s |
   | 8K / 32K tokens, separate runs with prefix caching off | 2,048–2,714 / 2,105–2,539 tok/s | — |
@@ -42,7 +42,8 @@ Exactness can only be judged with deterministic decoding. Sushi chooses its MTP 
 round timings, so the verify row counts, and with them the stage's floating-point results, vary from run to
 run: three uninterrupted greedy runs all differed from about the 50th token. With the timing-adaptive width
 off (`SUSHI_MTP_ADAPTIVE=0 SUSHI_MTP_COST_TABLE=0 SUSHI_MTP_ADAPTIVE_SERIAL=0`), four runs were
-bit-identical, cold and warm. In that mode, `host/tests/priority.py` holds a background request mid-flight,
+bit-identical, cold and warm. (Since the later 2026-11-10 update the split runs in that mode in production
+too.) In that mode, `host/tests/priority.py` holds a background request mid-flight,
 runs a foreground request, releases it, and compares the background's final output with an uninterrupted
 reference ([evidence/priority-suite.json](evidence/priority-suite.json),
 [evidence/priority-192k.json](evidence/priority-192k.json)):
@@ -143,6 +144,38 @@ is dropped; a cancelled stream frees the engine.
   every case, 2,894 of 2,894 verify forwards used the stage head and the suite was again 8/8 exact;
   smoke.py 10/10; `fault.py term`; `FAULT_NONCE=x fault.py prefill` (the stage killed 4 s into a cold
   124K-token prefill; the Mac finished it correctly in 66.9 s).
+
+## 2026-11-10 update, later (see CHANGELOG.md)
+
+- **Shared expert as a side branch on the 5090.** A probe that alternates two inputs, so a launch that read
+  too early would see the other input's values, replayed each decode row count (1–7) and compared every
+  output bit for bit with the serialized graph: identical, 32 comparisons per row count; launch + sync 0.24–0.36
+  ms faster per forward. (A first ordering that let big kernels start early without a waiting kernel looked
+  identical on a probe that replayed one input, and was not safe: a QMD launch latch only holds a kernel
+  that executes `griddepcontrol.wait`.) In replayed sessions with fixed draft depth the texts were
+  byte-identical and the stage forward was 0.31 ms faster on every seed; prefill time on the stage unchanged.
+- **Warm Mac GPU while the 5090 runs.** Fixed-depth sessions: byte-identical text; the Mac's work after the
+  stage reply 0.57 → 0.31 ms per round. With both changes a decode round is 25.57 → 24.69 ms (verify
+  −0.61 ms, post-stage −0.27 ms). Time to first token on the long session (54K cold, then 65K and 76K
+  follow-ups), warm-up off/on interleaved three times each, identical text: follow-ups 3.66 / 3.79 s off,
+  3.65 / 3.69 s on — no effect on prefill.
+- **Windowed draft depth on the split.** The replay with Sushi's adaptive planner: the two changes above
+  tied (pooled 1.450× vs 1.466× stock), because the planner answered the cheaper rounds with 5.5% shallower
+  drafts (2.96 vs 3.14 per round; acceptance per draft unchanged). With the windowed controller, depth 3:
+
+  | build (three seeds pooled) | vs stock | decode | wall |
+  |---|---|---|---|
+  | earlier 2026-11-10 build, adaptive planner (two independent runs) | 1.466× / 1.465× | 114.7 / 113.7 tok/s | 267.8 / 268.1 s |
+  | earlier build, windowed controller | 1.500× | 117.0 tok/s | 261.8 s |
+  | this build (side branch, warm GPU), windowed controller | 1.507× | 119.5 tok/s | 260.6 s |
+
+  This build's 18 turns are byte-identical to the earlier build's under the windowed controller. Per turn
+  the two controllers trade places with the content (the planner wins a turn that copies a code block,
+  157 vs 110 tok/s), so neither dominates; on these sessions the windowed one is ahead.
+- **Qualification of this build:** priority suite 8/8 exact with SSD parking (6 pauses, no park errors;
+  [evidence/priority-suite.json](evidence/priority-suite.json)); smoke.py 10/10; `fault.py term` (the stream
+  finished on the Mac; the split came back); `FAULT_NONCE=x fault.py prefill` (the stage killed 4 s into a
+  cold 124K-token prefill; the Mac finished it correctly in 66.7 s).
 
 ## Not covered
 

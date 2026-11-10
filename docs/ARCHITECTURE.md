@@ -40,7 +40,12 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
   round's one batched eval ([sushi/FORK.md](../sushi/FORK.md) §5). The n-gram embedding a verify gathers
   late is filled before the rows go to the stage (§3). With the stage head (§6), the verify's logits are the
   5090's top-20 per row, which is exact for a sampler that reads at most 20 candidates (the thinking
-  defaults; other requests keep the Mac's head).
+  defaults; other requests keep the Mac's head). While the Mac waits for the 5090 (~6.5 ms per round) a
+  tiny kernel every 0.5 ms keeps its GPU clocked up for the work after the reply (§8). On the split the
+  draft depth comes from Sushi's windowed controller (3 drafts, fewer only on a cold stretch) rather than
+  its adaptive planner, which plans from measured round costs and drafted shallower whenever the split's
+  rounds got cheaper; at 3 drafts the conditional acceptances are ~0.85 / 0.70 / 0.59 and an extra verify
+  row costs ~2.5 ms, so a 4th draft would not pay.
 - **Prefill** — prompt chunks (4,096 rows, reshaped near checkpoint boundaries and at the end) are pipelined
   two deep: while the 5090 runs chunk *n* (in 1,536-row pieces), the Mac runs layers 0–27 of chunk *n+1*.
   With each chunk the stage returns its layer state for those rows (the "pull-back"), so Sushi's caches stay
@@ -63,7 +68,11 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
 projections with tensor cores, dequantize-once attention over 8-bit KV, QSA block selection, gated-delta-net
 recurrence with per-row states for partial accepts). It talks to the card through macuda's `libtinynv`
 (userspace driver, GSP firmware boot, hardware queues) and tinygrad's TinyGPU DriverKit extension, with a
-few driver additions (`driver/README.md`).
+few driver additions (`driver/README.md`). In decode forwards (1–7 rows) each MoE layer's shared expert,
+which reads only the layer's input, runs as a side branch beside the router and the routed experts:
+launches are ordered by the driver's QMD launch latches, a launch starts early only when everything it
+reads finished before its predecessor started, and the joins are kernels that wait in `griddepcontrol.wait`
+(`QD_STAGE_SIDE`, bit-identical).
 
 ## Background parking
 

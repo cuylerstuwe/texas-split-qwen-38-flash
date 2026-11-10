@@ -4,7 +4,7 @@
 //! runs the final mixer, lm_head and MTP head). Multi-row forwards keep per-row GDN states so a
 //! verify can commit any accepted prefix; attention layers append only the accepted rows.
 use crate::{
-    cuda::{Arg, Buffer, Device, Module, PreparedCall},
+    cuda::{Arg, Buffer, Device, Kernel, Module, PreparedCall},
     cuda_lowbit_attention_layer as al, cuda_lowbit_layer as rl, gdn, hc,
     mcg_moe::Bank,
     projection::Pack,
@@ -312,6 +312,13 @@ impl<'m, 'd> Stage<'m, 'd> {
     /// Graph-replay form, step 2: the forward's calls (the same structure for a given `rows`
     /// at every position, so a captured graph can be re-targeted with Graph::patch_diff).
     pub fn record_forward(&self, rows: usize) -> Result<Vec<PreparedCall<'_, 'm, 'd>>> {
+        self.record_forward_plain(rows)
+    }
+    /// R65: record_forward with the shared-expert side branches (`r65_side_branches`); `wait` from `r65_wait_kernels`.
+    pub fn record_forward_side<'a>(&'a self, rows: usize, wait: &'a [Kernel<'m, 'd>; 3]) -> Result<Vec<PreparedCall<'a, 'm, 'd>>> {
+        r65_side_branches(self.record_forward_plain(rows)?, wait)
+    }
+    fn record_forward_plain(&self, rows: usize) -> Result<Vec<PreparedCall<'_, 'm, 'd>>> {
         let (rp, ap) = (recurrent_policy(), attention_policy_for(rows));
         let mut calls: Vec<PreparedCall<'_, 'm, 'd>> = vec![];
         let mut input = &self.input;
@@ -689,4 +696,86 @@ impl<'m, 'd> Stage<'m, 'd> {
 /// QD_STAGE_SEED_VERIFY=1: seed through the verified imports (capacity-wide poison, full read-back).
 fn seed_verify() -> bool {
     std::env::var("QD_STAGE_SEED_VERIFY").as_deref() == Ok("1")
+}
+
+/// R65 (QD_STAGE_SIDE=1, r65nv archive only): run every MoE block's shared expert beside the router chain and the
+/// routed experts instead of after them.
+pub fn side_branches() -> bool {
+    std::env::var("QD_STAGE_SIDE").as_deref() == Ok("1")
+}
+
+/// R65: kernels/r65_wait.cu's cubin (R65-WAIT-CUDA-BUILD.json).
+pub const R65_WAIT_SHA: &str = "f34a786c7af862fff08afb62c0074a3f849b061b1b73a107817227d77a261932";
+pub fn r65_wait_module(d: &Device) -> Result<Module<'_>> {
+    d.module(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kernels/r65_wait.sm120.cubin"), R65_WAIT_SHA)
+}
+/// R65: the wait variants of shared_activate, shared_finish and moe_add_bf16 from `r65_wait_module`.
+pub fn r65_wait_kernels<'m, 'd>(m: &'m Module<'d>) -> Result<[Kernel<'m, 'd>; 3]> {
+    Ok([m.kernel("r65w_shared_activate")?, m.kernel("r65w_shared_finish")?, m.kernel("r65w_moe_add_bf16")?])
+}
+
+/// R65 shared-expert side branches, race-free by construction. A stage MoE block is recorded as P (the HC read
+/// that writes its input), the router chain R1 router_qmv, R2 router_select, R3 moe_prepare, the routed experts
+/// G/U (gate, up), M (mid), D (down), F (finish), then the shared expert S1 (gate/up), S2 (activate), S3 (down),
+/// S4 (finish) and A (the sum). Reordered to
+///     P S1 R1 R2 S2* R3 G S3 U M S4* D F A*
+/// with three kinds of edge (driver: tinynv_r65_edge):
+/// - serialized (the default): starts when its predecessor has completed;
+/// - early (U, R1, D): starts once its predecessor's last CTA has launched. Only where everything it reads had
+///   completed before that predecessor started: R1 reads P (S1 starts after P completes); U reads R3 (done before G
+///   started, and S3 starts after G completes); D reads M (S4* starts after M completes);
+/// - a latch wait (S2* on S1, S4* on S3, A* on S4): serialized, plus griddepcontrol.wait at the kernel's entry on
+///   the named latch (the *-kernels are kernels/r65_wait.cu's variants). The descriptor latch alone does not hold a
+///   grid (R38/R44: no-wait controls race); the in-kernel wait does.
+/// M reads G and U: G completed before S3 started and U completes before M starts. Overlap: S1 under R1+R2, S3 under
+/// U, S4* under D; S2* stays on the chain (1.7 us). Blocks that do not match (8+ rows: the grouped routed path) are
+/// left as they are. Checked bit for bit with changing inputs by canon-stage-probe QD_STAGE_SIDE_CHECK.
+fn r65_side_branches<'a, 'm, 'd>(
+    calls: Vec<PreparedCall<'a, 'm, 'd>>,
+    wait: &'a [Kernel<'m, 'd>; 3],
+) -> Result<Vec<PreparedCall<'a, 'm, 'd>>> {
+    // By role (name prefixes): the kernel variants change with the row count (e.g. affine8_mma_t1* -> t2*), the data
+    // flow does not.
+    const PAT: [&str; 13] = [
+        "router_qmv", "router_select", "moe_prepare", "mcg_project4", "mcg_project4", "mcg_moe_mid",
+        "mcg_project4", "mcg_moe_finish", "affine8_", "shared_activate", "affine8_", "shared_finish", "moe_add",
+    ];
+    let names: Vec<String> = calls.iter().map(|c| c.meta().0.to_string()).collect();
+    ensure!(calls.iter().all(|c| c.edge().is_none()), "R65: the recorded calls already carry edges");
+    let mut slots: Vec<Option<PreparedCall<'a, 'm, 'd>>> = calls.into_iter().map(Some).collect();
+    let mut out: Vec<PreparedCall<'a, 'm, 'd>> = Vec::with_capacity(slots.len());
+    let mut latch = 0u32;
+    let mut i = 0;
+    while i < slots.len() {
+        let hit = i >= 1
+            && i + PAT.len() <= names.len()
+            && names[i..i + PAT.len()].iter().zip(PAT).all(|(a, b)| a.starts_with(b))
+            && names[i - 1] == "hc8_front2";
+        if !hit {
+            out.push(slots[i].take().unwrap());
+            i += 1;
+            continue;
+        }
+        let mut take = |k: usize| slots[i + k].take().unwrap();
+        let (r1, r2, r3, g, u, m, d, f) = (take(0), take(1), take(2), take(3), take(4), take(5), take(6), take(7));
+        let (s1, s2, s3, s4, a) = (take(8), take(9), take(10), take(11), take(12));
+        let (ls1, ls3, ls4) = (latch + 1, latch + 2, latch + 3);
+        latch += 3;
+        ensure!(latch < 4096, "R65: too many latches");
+        out.push(s1.with_edge(ls1, 0, false));
+        out.push(r1.with_edge(0, 0, true));
+        out.push(r2);
+        out.push(s2.with_kernel(&wait[0])?.with_edge(0, ls1, false));
+        out.push(r3);
+        out.push(g);
+        out.push(s3.with_edge(ls3, 0, false));
+        out.push(u.with_edge(0, 0, true));
+        out.push(m);
+        out.push(s4.with_kernel(&wait[1])?.with_edge(ls4, ls3, false));
+        out.push(d.with_edge(0, 0, true));
+        out.push(f);
+        out.push(a.with_kernel(&wait[2])?.with_edge(0, ls4, false));
+        i += PAT.len();
+    }
+    Ok(out)
 }

@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -27,6 +28,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+extern "C" int gpu_warm_init(void);   // lib/gpu_warm.m (R65)
+extern "C" void gpu_warm_tick(void);
 
 namespace {
 // 2 GiB: the largest state seed (262160 rows: 5 attention layers x 1152 B/row + 15 recurrent states,
@@ -140,6 +144,24 @@ void mark_dead(const char* why) {
     }
   }
 }
+// R65 (SUSHI_R65_GPU_WARM=1; 2 = alternate per 32-round trace window, starting off): while a decode forward's
+// reply is awaited (the Mac GPU idles ~6.5 ms per round), a 256-thread kernel is committed on a queue of its own
+// every 0.5 ms (lib/gpu_warm.m), so the GPU does not clock down before the post-stage work.
+int g_warm_mode = -1, g_warm_on = 0;
+bool g_warm_read = false;
+uint64_t g_warm_ticks = 0;
+int warm_mode() {
+  if (g_warm_mode < 0) {
+    const char* e = getenv("SUSHI_R65_GPU_WARM");
+    g_warm_mode = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0;
+    if (g_warm_mode && gpu_warm_init() != 0) {
+      fprintf(stderr, "[stage] GPU warm-up unavailable (Metal setup failed); off\n");
+      g_warm_mode = 0;
+    }
+    g_warm_on = g_warm_mode == 1;
+  }
+  return g_warm_mode;
+}
 bool io(void* p, size_t n, bool wr, int limit_ms = -1) {
   if (g_fd < 0) return false;
   auto* b = static_cast<uint8_t*>(p);
@@ -147,6 +169,30 @@ bool io(void* p, size_t n, bool wr, int limit_ms = -1) {
   while (n) {
     const int left = int((deadline - now_us()) / 1000.0);
     if (left <= 0) return false;
+    // R65: wait in 0.5 ms slices, ticking the GPU between them (select() needs fd < FD_SETSIZE; above that the
+    // plain poll() wait below runs instead, without the warm-up)
+    if (!wr && g_warm_read && g_fd < FD_SETSIZE) {
+      bool ready = false;
+      while (!ready) {
+        const double rem = deadline - now_us();
+        if (rem <= 0) return false;
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(g_fd, &rf);
+        timeval tv{0, int(rem < 500 ? rem : 500)};
+        const int r = select(g_fd + 1, &rf, nullptr, nullptr, &tv);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) return false;
+        if (r > 0) ready = true;
+        else { gpu_warm_tick(); g_warm_ticks++; }
+      }
+      ssize_t k = read(g_fd, b, n);
+      if (k < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+      if (k <= 0) return false;
+      b += k;
+      n -= size_t(k);
+      continue;
+    }
     pollfd pfd{g_fd, short(wr ? POLLOUT : POLLIN), 0};
     const int r = poll(&pfd, 1, left);
     if (r < 0 && errno == EINTR) continue;
@@ -241,6 +287,12 @@ int put_token_major(mlx_array a, uint64_t len, mlx_stream s) {
 }  // namespace
 
 extern "C" {
+// R65 GPU warm-up switch, for the trace windows: mode (0 off, 1 on, 2 alternating), the current arm, its setter
+// and the ticks committed so far.
+int stage_split_warm_mode(void) { return warm_mode(); }
+int stage_split_warm_get(void) { return g_warm_on; }
+void stage_split_warm_set(int on) { g_warm_on = on ? 1 : 0; }
+unsigned long long stage_split_warm_ticks(void) { return (unsigned long long)g_warm_ticks; }
 // Layer index where the stage begins, or -1 when the split is disabled (lazy open).
 int stage_split_first(void) {
   if (g_dead) return -1;
@@ -455,7 +507,10 @@ int stage_split_forward(mlx_array h, mlx_array* out, uint64_t position, int32_t 
   if (rope_delta < -(1 << 23) || rope_delta >= (1 << 23)) { fprintf(stderr, "[stage] rope delta %d out of range\n", rope_delta); return -1; }
   const int want_head = g_want_head;
   g_head_rows = 0;
-  if (rpc(1, rows, position, 0, ((uint32_t(rope_delta) & 0xFFFFFFu) << 8) | (want_head ? 4u : 0u))) return -1;
+  g_warm_read = warm_mode() && g_warm_on;  // R65: tick the Mac GPU while this forward's reply is awaited
+  const int fr = rpc(1, rows, position, 0, ((uint32_t(rope_delta) & 0xFFFFFFu) << 8) | (want_head ? 4u : 0u));
+  g_warm_read = false;
+  if (fr) return -1;
   const double t2 = now_us();
   g_base = position;
   g_rows = rows;

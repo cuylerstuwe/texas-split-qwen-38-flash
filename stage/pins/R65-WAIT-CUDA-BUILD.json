@@ -1,0 +1,16 @@
+{
+  "cubin": "kernels/r65_wait.sm120.cubin",
+  "cubin_bytes": 25544,
+  "cubin_sha256": "f34a786c7af862fff08afb62c0074a3f849b061b1b73a107817227d77a261932",
+  "source": "kernels/r65_wait.cu",
+  "nvrtc_version": [
+    13,
+    0
+  ],
+  "options": [
+    "--gpu-architecture=sm_120",
+    "--std=c++17",
+    "--fmad=false"
+  ],
+  "image_id": "sha256:b7ae301dea2c162444795462ce17a05f6a516e5a75944b57af5b88540a1a2266"
+}
