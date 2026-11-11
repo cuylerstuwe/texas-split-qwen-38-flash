@@ -118,8 +118,8 @@ variables override the file):
 | `TEXAS_SPLIT_DISPLAY_HOLD` | `boot` | hold the display awake around the GPU's cold boot (`always`: whole life) |
 | `TEXAS_SPLIT_VERIFY_PARKS` | 1 | re-read and byte-compare the stage state after every restore |
 | `TEXAS_SPLIT_SUSHI_ENV` | — | extra `SUSHI_*` variables for the engine (JSON object), for experiments |
-| `TEXAS_SPLIT_MAX_CONCURRENT` | 1 | requests generating at once, 1–16 (`bin/texas-split concurrency N` writes it); above 1, up to four decode through the 5090 on conversation slots and the rest run on the Mac |
-| `TEXAS_SPLIT_SLOTS` / `TEXAS_SPLIT_SLOT_ROWS` | 4 / an equal share | conversation slots on the 5090 (at most 4, and at most the concurrency) and rows per extra slot |
+| `TEXAS_SPLIT_MAX_CONCURRENT` | 1 | requests generating at once, 1–16 (`bin/texas-split concurrency N` writes it); above 1, up to four run through the 5090 on conversation slots (prefill and decode) and the rest run on the Mac |
+| `TEXAS_SPLIT_SLOTS` / `TEXAS_SPLIT_SLOT_ROWS` | 4 / an equal share | conversation slots on the 5090 (at most 4, and at most the concurrency) and the rows each extra slot starts with (Sushi then sizes a slot's rows for each request; `SUSHI_STAGE_SLOT_DYNAMIC=0` in `TEXAS_SPLIT_SUSHI_ENV` keeps the starting share) |
 | `TEXAS_SPLIT_STAGE_ENV` | — | extra `QD_*` / `QWEN_*` variables for the stage server (JSON object), for experiments |
 | `TEXAS_SPLIT_STAGE_BIN` / `TEXAS_SPLIT_SUSHI_BIN` | — | other stage / Sushi builds, for experiments (not pinned) |
 

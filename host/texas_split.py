@@ -131,8 +131,10 @@ MAX_SLOTS = max(MAX_SLOTS, MAX_CONCURRENT + 8)
 # verify rows each and 1536-row prefill pieces 0.40 GiB; 3 slots (9, 9, 4 rows) with 1024-row pieces 0.47 GiB;
 # 4 slots (9, 9, 4, 4) with 768-row pieces 0.39 GiB. One slot: 16 rows, 1536-row pieces, 0.58 GiB, as always.
 STAGE_SLOTS = 1 if MAX_CONCURRENT == 1 else max(1, min(4, MAX_CONCURRENT, cfg_int('TEXAS_SPLIT_SLOTS', 4)))
-# Rows per extra slot: an equal share of the stage's rows by default (2 slots: 131,080; 3: 87,384; 4: 65,536), so
-# two long agent conversations both fit. TEXAS_SPLIT_SLOT_ROWS overrides.
+# Rows per extra slot: the stage starts with an equal share of its rows per slot (2 slots: 131,080; 3: 87,384;
+# 4: 65,536; TEXAS_SPLIT_SLOT_ROWS overrides). Sushi then re-points a slot to rows sized for the request that claims
+# it (stage op 12), so the share is only the starting layout; SUSHI_STAGE_SLOT_DYNAMIC=0 in TEXAS_SPLIT_SUSHI_ENV
+# keeps the fixed shares.
 STAGE_SLOT_ROWS = max(4096, min(STAGE_CAPACITY // 2, cfg_int('TEXAS_SPLIT_SLOT_ROWS', STAGE_CAPACITY // max(2, STAGE_SLOTS)))) // 8 * 8
 STAGE_SLOT_LAYOUT = {1: (None, '1536'), 2: ('9', '1536'), 3: ('9,4', '1024'), 4: ('9,4,4', '768')}[STAGE_SLOTS]
 BACKGROUND_MEDIA = {'image', 'image_url', 'input_image', 'video_url', 'input_audio', 'audio_url', 'video', 'audio'}
@@ -505,7 +507,8 @@ class Host:
                                stage_pid=self.stage.pid if self.stage else None,
                                stage=self.stage_info or None, restarts=len(self.restarts),
                                model=MODEL_ID, context=CONTEXT, endpoint=f'http://127.0.0.1:{PORT}/v1',
-                               concurrency=dict(max=MAX_CONCURRENT, stage_slots=STAGE_SLOTS, slot_rows=STAGE_SLOT_ROWS))
+                               concurrency=dict(max=MAX_CONCURRENT, stage_slots=STAGE_SLOTS, slot_rows=STAGE_SLOT_ROWS,
+                                                slot_regions='dynamic' if STAGE_SLOTS > 1 else None))
 
     # ---- locks ----
     def clean_old_runs(self):
@@ -572,12 +575,20 @@ class Host:
         for port in FOREIGN_PORTS + (ENGINE_PORT,):
             if port_open(port):
                 raise RuntimeError(f'port {port} already has a listener (an experiment?); refusing contention')
-        reading = _read_kernel()
-        if reading is None:
-            raise RuntimeError('memory probe unavailable')
-        if reading.available_bytes < 82 * GIB:
-            raise RuntimeError(f'reclaimable memory {reading.available_bytes / GIB:.1f} GiB < 82 GiB')
-        return reading
+        # The restore path stops the engine and launches again within seconds, and the kernel may not have reclaimed
+        # the engine's ~70 GiB yet (anything else busy on the Mac stretches that). Wait up to 45 s for the reading
+        # instead of faulting on the first one: on 2026-11-11 a reading of 23.8 GiB two seconds after the stop left
+        # the service in a fault until it was restarted by hand. The bar itself is unchanged.
+        deadline = time.monotonic() + 45
+        while True:
+            reading = _read_kernel()
+            if reading is None:
+                raise RuntimeError('memory probe unavailable')
+            if reading.available_bytes >= 82 * GIB:
+                return reading
+            if time.monotonic() >= deadline or self.stopping.is_set():
+                raise RuntimeError(f'reclaimable memory {reading.available_bytes / GIB:.1f} GiB < 82 GiB')
+            time.sleep(1)
 
     def launch_stage(self):
         # a Unix socket path must fit sun_path (104 bytes on macOS): a short private directory, not the run dir
@@ -1376,7 +1387,8 @@ def main():
         else:
             # what the configuration says now; a running service keeps what it started with (see /health)
             print(json.dumps(dict(configured=dict(max_concurrent=MAX_CONCURRENT, stage_slots=STAGE_SLOTS,
-                                                  slot_rows=STAGE_SLOT_ROWS)), indent=1))
+                                                  slot_rows=STAGE_SLOT_ROWS,
+                                                  slot_regions='dynamic' if STAGE_SLOTS > 1 else None)), indent=1))
         return 0
     if a.action == 'write-pins':
         print(json.dumps(write_pins(), indent=1))

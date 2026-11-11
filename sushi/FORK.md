@@ -232,3 +232,38 @@ requests out, and `stageRecoverMarked` re-runs them one after another. A stage e
 another request's prefill marks them for the next pass instead of failing every stream of that tick. Requests
 decoding on the Mac keep their state and carry on. The reset before a re-run clears the MTP head's live state only
 when it is the request's own (`headStateIsSlots`).
+
+## 14. Several requests at once on long prompts: prefill on every slot, rounds per tick, slot rows per request
+
+Active only with `--max-concurrent` above 1. Section 12 was measured on decode with short prompts; with long
+prompts side by side it lost time to running the same requests one after another (docs/VALIDATION.md).
+
+- **Split prefill on every slot** (`native/stage_split.cpp`, `src/generate.zig`): the prefill pipeline works on
+  the request's own stage slot (op 6 carries the slot; the chunks in flight remember theirs), where a request on an
+  extra slot used to prefill every layer on the Mac and seed the slot afterwards. `SUSHI_STAGE_SLOT_PREFILL=0`
+  restores that. In `runDecodeTick` every slot holder now sits a tick out while any request's prefill has chunks
+  on the stage (one stream of replies on the socket).
+- **Several rounds per tick** (`src/scheduler.zig`, `runSplitGroup`): after the first halves, each holder's second
+  half is followed at once by its next first half, so only the tick's last second half waits for the 5090.
+  `SUSHI_STAGE_GROUP_ROUNDS` (default 4, at most 6 so a slot cannot grow past the guard's margin between two
+  checks; 1 = one round per tick). A tick hosted inside a prefill runs one round; so does a tick with a foreground
+  request waiting for admission; a tick ends early once a holder has ended. `=alt` alternates 1 and 4 every 128
+  rounds and `SUSHI_STAGE_MS_TRACE=1` then prints each arm's time per round.
+- **Slot rows per request** (`stageExtraClaim`, `stageRegionPick` / `stageRegionFind` / `stageRegionSet`; stage op
+  12 through `stage_split_slot_view`): an extra slot's rows are set when a request claims it: its tokens, a reply
+  reserve that halves from `SUSHI_STAGE_SLOT_RESERVE` until the request fits, and the guard margin, on a 4,096-row
+  grid, placed at the highest free rows above slot 0's request. `stageMoveOrEvictExtra`: a request that outgrows
+  its rows gets more at the same base when the rows above are free, else moves to other free rows (its state is
+  pulled back and its next forward seeds the new rows), else continues on the Mac. Slots and rows freed inside a
+  stage wait pass to Mac-side requests at the next tick's start (`stagePromoteFree`), since setting rows is a
+  stage call. Rows a finished conversation left on slot 0 are forgotten by the stage when they would block a
+  slot's rows. `SUSHI_STAGE_SLOT_DYNAMIC=0` keeps the equal shares of section 12.
+- **Ended slots are freed before the next claim** (`stageDropPending`): a slot freed inside a stage wait is only
+  marked, and the stage call that frees its rows ran at the next tick's start. When the last request of a burst
+  ended on an extra slot there was no next tick: the stage kept counting its rows, and a later request on slot 0
+  whose prompt reached them was refused mid-prefill, which gave the stage up. The pending frees now also run before
+  every slot claim.
+- Also: a request whose extra slot was taken back during a prefill on the Mac no longer keeps the stage without a
+  slot; a move to slot 0 needs 256 tokens left to generate; the stage client reads the server's own time per op
+  from a reply's bytes 8-12 (the shipped server leaves them zero; a measurement build filled them: transport =
+  send-to-reply minus that, 16-27 us per forward, so polling the socket instead of sleeping has nothing to win).

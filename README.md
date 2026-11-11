@@ -16,7 +16,8 @@ driver (`libtinynv`, a C port of tinygrad's NVIDIA driver) through tinygrad's si
 | Decode, agentic coding sessions | ~79–84 tok/s | **~118–124 tok/s** |
 | Total task time, same sessions | 1.00× | **1.52–1.59× faster** (pooled 1.57×) |
 | Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **14.6–16.6 s (~3.3–3.7K tok/s), 1.7–1.9× faster** |
-| Several requests at once (opt-in), total | not measured | 120 tok/s with two, 132 with three or four |
+| Several agent sessions at once (opt-in), against the same sessions one after another | not measured | 1.07× with two, 1.16× with four |
+| Several requests at once, decode only with short prompts, total | not measured | 120 tok/s with two, 132 with three or four |
 | Prefill, cold 64K / 192K-token prompts | not measured at these lengths | 3.1–3.4K / 2.8–3.3K tok/s (earlier build) |
 | Quality vs. a teacher model (KL, short panel) | .00458 | .00446 (same level) |
 
@@ -29,10 +30,18 @@ its 20 at ~5.6–6.3K tok/s). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTUR
 [docs/VALIDATION.md](docs/VALIDATION.md).
 
 **Updates 2026-11-11:** a fix for replies that failed after a 5090 failure in a long conversation; opt-in
-serving of several requests at once (up to four on the 5090 together: 120 tok/s total with two, 132 with three or
-four, against ~100 for one); follow-up turns keep their place on the 5090 instead of re-sending or re-prefilling
-state; warm turns of image sessions prefill through the 5090. See [CHANGELOG.md](CHANGELOG.md); existing
-installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart`.
+serving of several requests at once (up to four on the 5090 together); follow-up turns keep their place on the
+5090 instead of re-sending or re-prefilling state; warm turns of image sessions prefill through the 5090.
+
+**Later on 2026-11-11, a correction and its fix:** the first multi-request numbers (120 and 132 tok/s) were decode
+with short prompts. On agent-shaped sessions (20-77K-token contexts, about 40% of the time in prefill) that build
+was *slower* than running the same sessions one after another (0.93× with two, about 0.88× with four). Three
+exact changes fix it: every request now prefills through the 5090 (only the first one did), requests on the 5090
+alternate their rounds so none waits on it at the end of a tick, and a request's rows on the 5090 are sized for
+its conversation instead of a fixed share. Side by side is now 1.07× the serial run with two sessions and 1.16×
+with four. One request at a time is unchanged (identical replies, equal timing). See
+[CHANGELOG.md](CHANGELOG.md); existing installs: `git pull`, `./install.sh stage sushi pins`,
+`bin/texas-split restart`.
 
 **Updates 2026-11-10:** the verify rounds' LM head moved to the 5090, two prefill speedups (a bf16 weight
 cache and better pipelining of the last chunks), and later the same day ~4% more decode speed: the 5090 runs
@@ -83,10 +92,12 @@ curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/
   its state on both the Mac and the 5090 is parked to SSD; it resumes exactly where it stopped when the
   last foreground request finishes. One background request at a time; background requests are text-only.
 - **Several requests at once** (off by default): `bin/texas-split concurrency N` (1–16), then
-  `bin/texas-split restart`. Up to four requests then decode through the 5090 together and further ones run
-  on the Mac beside them. Total throughput rises (about 120 tok/s with two requests, 132 with three or
-  four, against ~100 for one) while each request gets its share of it. With 1, the default, requests run one
-  at a time exactly as before. Limits are in [CHANGELOG.md](CHANGELOG.md).
+  `bin/texas-split restart`. Up to four requests then run through the 5090 together, prefill and decode, and
+  further ones run on the Mac beside them. Two agent sessions side by side finish about 7% sooner than one after
+  the other, four about 14% sooner; each request gets its share of the throughput, and while one request prefills
+  a long prompt the others pause. The conversations on the 5090 share its 262,144 rows (tokens); one that does
+  not fit runs on the Mac. With 1, the default, requests run one at a time exactly as before. Limits are in
+  [CHANGELOG.md](CHANGELOG.md).
 - `bin/texas-split status | health | logs [--follow] | stop | restart | concurrency [N]`.
 - If the 5090 fails (unplugged, crashed, hung), the requests in flight continue on the Mac alone after a
   pause (the Mac re-runs their context at ~2.3K tokens/s: about 7 s for a 16K-token conversation), and the

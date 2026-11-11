@@ -1343,6 +1343,17 @@ pub const Scheduler = struct {
     stage_extra: [STAGE_EXTRA_MAX]?*Slot = @splat(null),
     /// R69: extra slot k ended with nobody to pass it to: free it on the stage at the next tick (not inside a stage wait).
     stage_slot_drop: [STAGE_EXTRA_MAX]bool = @splat(false),
+    /// R71: the decode tick in progress is hosted inside a prefill (between its chunks): a holder group runs one round.
+    tick_hosted: bool = false,
+    /// R71: extra slot k views rows [stage_extra_base[k], + stage_extra_rows[k]) of the stage's attention buffers. The
+    /// stage starts with equal shares from the top (`stageRegionsInit`); with dynamic regions a claim re-points the
+    /// slot to rows sized for its request (`stageExtraClaim`).
+    stage_extra_base: [STAGE_EXTRA_MAX]usize = @splat(0),
+    stage_extra_rows: [STAGE_EXTRA_MAX]usize = @splat(0),
+    stage_regions_ready: bool = false,
+    /// R71 (dynamic regions): a slot or rows were freed; at the next tick's start (no stage wait open) the free extra
+    /// slots pass to requests decoding on the Mac that now fit (`stagePromoteFree`).
+    stage_promote_pending: bool = false,
     queue_mu: std.Io.Mutex,
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
@@ -7247,6 +7258,8 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
         }
     }
     var sw = io_util.Stopwatch.init(sch.io);
+    sch.tick_hosted = true; // R71: one round per hosted tick (the prefill around it keeps its cadence)
+    defer sch.tick_hosted = false;
     runDecodeTick(sch, buf[0..n]) catch |err| {
         if (isStageSplitError(err)) {
             // texas-split: the stage failed under a tick hosted inside a prefill. Its requests re-run on the Mac at the
@@ -7850,7 +7863,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
-    slot.legacy_gen.?.stage_allowed = stage_ok;
+    // R71: an extra slot claimed before a prefill on the Mac can be taken back while it runs (slot 0's request grew
+    // into its rows, `stageSlotGuard`): the request then decodes on the Mac. Before this check it kept `stage_allowed`
+    // without a slot and its first split forward would have re-seeded slot 0 under that slot's request.
+    slot.legacy_gen.?.stage_allowed = stage_ok and (!stageMultiStream(sch) or stageOnStage(sch, slot));
     publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
@@ -7927,10 +7943,22 @@ fn stageHolderWanted() bool {
     stage_ms_holder_env = v;
     return v;
 }
+/// R69: free on the stage the extra slots whose request ended with nobody to pass them to. Outside every stage wait and
+/// split prefill: at a tick's start, and (R71) before a request claims a slot. The last request of a burst can end on
+/// an extra slot with no tick after it: until its rows were freed the stage still counted them, a later long request
+/// on slot 0 ran into them (its prefill was refused and the stage given up), and rows chosen for another slot could
+/// overlap them.
+fn stageDropPending(sch: *Scheduler) void {
+    for (&sch.stage_slot_drop, 0..) |*d, k| if (d.* and sch.stage_extra[k] == null) {
+        d.* = false;
+        if (!qwen4_forward.stageDropSlot(k + 1)) log.warn("[stage] slot {d}: drop failed\n", .{k + 1});
+    };
+}
 fn stageHolderClaim(sch: *Scheduler, slot: *Slot) bool {
     if (!stageMultiStream(sch)) return true;
     if (!stageHolderWanted()) return false;
     stageReapEnded(sch, slot);
+    if (qwen4_forward.stagePrefillInflight() == 0) stageDropPending(sch);
     if (slot.background) {
         // A background request runs with no foreground beside it (native priority parks it, and its stage half, for
         // them): alone it takes slot 0, exactly as when one request runs at a time. It gives the slot up while parked
@@ -7944,15 +7972,122 @@ fn stageHolderClaim(sch: *Scheduler, slot: *Slot) bool {
         stageMakeRoomForSlot0(sch, stageSlotNeed(slot), "a longer request takes slot 0");
     }
     if (stageHolderIs(sch, slot)) return true;
-    // R69: an extra slot (the highest rows first), when this request fits its rows and slot 0's request stays below them
-    if (!stageSlotFits(slot.full_prompt.len, slot.max_tokens)) return false;
-    for (0..stageExtraCount()) |k| {
-        if (sch.stage_extra[k] != null) continue;
-        if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > stageSlotBase(k)) break;
-        sch.stage_extra[k] = slot;
-        return true;
+    return stageExtraClaim(sch, slot, slot.full_prompt.len, slot.max_tokens);
+}
+/// R71: dynamic regions (default with several stage slots; SUSHI_STAGE_SLOT_DYNAMIC=0 keeps R69's fixed equal shares):
+/// an extra slot's rows are set when a request claims it, sized for that request, from whatever rows are free.
+var stage_dynamic_env: ?bool = null;
+fn stageDynamic() bool {
+    if (stage_dynamic_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_SLOT_DYNAMIC");
+    const v = qwen4_forward.stageSlots() > 1 and (if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true);
+    stage_dynamic_env = v;
+    return v;
+}
+fn stageRegionsInit(sch: *Scheduler) void {
+    if (sch.stage_regions_ready) return;
+    sch.stage_regions_ready = true;
+    // fixed regions: the stage's own layout (equal shares from the top). Dynamic regions: nothing is assumed about a
+    // slot's rows until its first claim sets them (rows 0 never equals a request's).
+    if (stageDynamic()) return;
+    for (0..STAGE_EXTRA_MAX) |k| {
+        sch.stage_extra_rows[k] = stageSlotRows();
+        sch.stage_extra_base[k] = stageCapacity() -| (k + 1) * stageSlotRows();
     }
-    return false;
+}
+/// R71: rows of a region for a request of `len` tokens so far with up to `max_tokens` more: its tokens, room for the
+/// reply (capped by `reserve`) and the guard margin, on a 4096-row grid.
+fn stageRegionRows(len: usize, max_tokens: u32, reserve: usize) usize {
+    return std.mem.alignForward(usize, len + @min(@as(usize, max_tokens), reserve) + STAGE_SLOT_MARGIN, 4096);
+}
+const StageRegion = struct { base: usize, rows: usize };
+/// R71: rows for a request of `len` tokens with up to `max_tokens` more: the reply's reserve is the configured one
+/// when the free rows allow and halves until the request fits (a reply that outgrows its rows moves or grows,
+/// `stageMoveOrEvictExtra`). Slot 0's request keeps the same reserve above it. Null: no free rows hold the request.
+fn stageRegionPick(sch: *Scheduler, len: usize, max_tokens: u32, skip: ?usize, min_reserve: usize) ?StageRegion {
+    var reserve = stageSlotReserve();
+    while (true) : (reserve /= 2) {
+        const rows = stageRegionRows(len, max_tokens, reserve);
+        if (stageRegionFind(sch, rows, skip, reserve)) |base| return .{ .base = base, .rows = rows };
+        if (reserve / 2 < min_reserve) return null;
+    }
+}
+/// R71: are rows [from, to) free of every occupied extra slot but `skip`, and inside the stage?
+fn stageRowsFree(sch: *Scheduler, from: usize, to: usize, skip: usize) bool {
+    if (to > stageCapacity() / 4 * 4) return false;
+    for (sch.stage_extra, 0..) |h, j| {
+        if (h == null or j == skip) continue;
+        if (from < sch.stage_extra_base[j] + sch.stage_extra_rows[j] and sch.stage_extra_base[j] < to) return false;
+    }
+    return true;
+}
+/// R71: the base of free rows for a region of `rows` rows, the highest that fits: above slot 0's request (with
+/// `reserve0` rows for its reply) and clear of the occupied extra slots (`skip`: an occupied slot to ignore, the one
+/// being moved).
+fn stageRegionFind(sch: *Scheduler, rows: usize, skip: ?usize, reserve0: usize) ?usize {
+    stageRegionsInit(sch);
+    var occ: [STAGE_EXTRA_MAX][2]usize = undefined;
+    var n: usize = 0;
+    for (sch.stage_extra, 0..) |h, k| {
+        if (h == null or (skip != null and skip.? == k)) continue;
+        // highest base first
+        var at = n;
+        while (at > 0 and occ[at - 1][0] < sch.stage_extra_base[k]) : (at -= 1) occ[at] = occ[at - 1];
+        occ[at] = .{ sch.stage_extra_base[k], sch.stage_extra_rows[k] };
+        n += 1;
+    }
+    var top = stageCapacity() / 4 * 4;
+    for (occ[0..n]) |o| {
+        if (top >= o[0] + o[1] + rows) return top - rows;
+        top = @min(top, o[0]);
+    }
+    const floor: usize = if (sch.stage_holder) |h0| blk: {
+        const made: usize = if (h0.legacy_gen) |*g| g.generated_ids.items.len else 0;
+        const left: usize = if (h0.max_tokens > made) h0.max_tokens - made else 0;
+        break :blk std.mem.alignForward(usize, stageSlotNeed(h0) + @min(left, reserve0), 4);
+    } else 0;
+    if (top >= floor + rows) return top - rows;
+    return null;
+}
+/// R71: extra slot k views rows [base, base + rows) from now on (a stage call: between ticks only). A slot whose view
+/// does not change keeps it without a call (its next holder's first forward seeds over it, as before).
+fn stageRegionSet(sch: *Scheduler, k: usize, base: usize, rows: usize) bool {
+    stageRegionsInit(sch);
+    if (sch.stage_extra_base[k] == base and sch.stage_extra_rows[k] == rows) return true;
+    // slot 0's request holds at most `floor0` rows: more on the stage's slot 0 are a finished conversation's
+    const floor0: usize = if (sch.stage_holder) |h0| stageSlotNeed(h0) else 0;
+    if (!qwen4_forward.stageSlotView(k + 1, base, rows, false, floor0)) {
+        log.warn("[stage] slot {d}: could not take rows [{d}, +{d})\n", .{ k + 1, base, rows });
+        return false;
+    }
+    sch.stage_slot_drop[k] = false; // the call dropped it
+    sch.stage_extra_base[k] = base;
+    sch.stage_extra_rows[k] = rows;
+    return true;
+}
+/// R71: `slot` takes a free extra stage slot with rows for `len` tokens and its reply. False: no slot is free, or no
+/// rows are. Between ticks only (dynamic regions set the slot's rows on the stage).
+fn stageExtraClaim(sch: *Scheduler, slot: *Slot, len: usize, max_tokens: u32) bool {
+    stageRegionsInit(sch);
+    if (!stageDynamic()) {
+        // R69: fixed rows (the highest first), when this request fits them and slot 0's request stays below them
+        if (!stageSlotFits(len, max_tokens)) return false;
+        for (0..stageExtraCount()) |k| {
+            if (sch.stage_extra[k] != null) continue;
+            if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > sch.stage_extra_base[k]) break;
+            sch.stage_extra[k] = slot;
+            return true;
+        }
+        return false;
+    }
+    const k = for (0..stageExtraCount()) |i| {
+        if (sch.stage_extra[i] == null) break i;
+    } else return false;
+    const r = stageRegionPick(sch, len, max_tokens, null, 1024) orelse return false;
+    if (!stageRegionSet(sch, k, r.base, r.rows)) return false;
+    sch.stage_extra[k] = slot;
+    if (r69Debug()) log.info("[r71] slot {d}: rows [{d}, +{d}) for a request of {d} tokens\n", .{ k + 1, r.base, r.rows, len });
+    return true;
 }
 /// R69: a request that ended or was cancelled keeps its stage slot until its slot is cleaned up, a tick or more later.
 /// Release it now, so a request starting or resuming (a background after a foreground's client went away) finds the
@@ -8016,14 +8151,12 @@ fn stageCapacity() usize {
     stage_capacity_env = v;
     return v;
 }
-fn stageSlotBase(k: usize) usize {
-    return stageCapacity() -| (k + 1) * stageSlotRows();
-}
 /// Rows slot 0 may hold: below the lowest occupied extra slot.
-fn stageSlot0Limit(sch: *const Scheduler) usize {
+fn stageSlot0Limit(sch: *Scheduler) usize {
+    stageRegionsInit(sch);
     var limit = stageCapacity();
     for (sch.stage_extra, 0..) |h, k| if (h != null) {
-        limit = @min(limit, stageSlotBase(k));
+        limit = @min(limit, sch.stage_extra_base[k]);
     };
     return limit;
 }
@@ -8076,11 +8209,51 @@ fn stageEvictExtra(sch: *Scheduler, k: usize, why: []const u8) void {
 }
 /// R69: slot 0 needs `need` rows: the occupied extra slots in its way leave, lowest rows first.
 fn stageMakeRoomForSlot0(sch: *Scheduler, need: usize, why: []const u8) void {
+    stageRegionsInit(sch);
     var k: usize = STAGE_EXTRA_MAX;
     while (k > 0) {
         k -= 1;
-        if (sch.stage_extra[k] != null and need > stageSlotBase(k)) stageEvictExtra(sch, k, why);
+        if (sch.stage_extra[k] != null and need > sch.stage_extra_base[k]) stageMoveOrEvictExtra(sch, k, false, why);
     }
+}
+/// R71: extra slot k needs other rows: its request outgrew them (`grow`), or slot 0's request needs them. With dynamic
+/// regions it gets more rows at the same base when the rows above are free (`grow` only; nothing moves), else it
+/// moves to other free rows with room for at least 4096 more tokens (its state comes back to Sushi's caches and its
+/// next forward seeds the new rows); with no such rows, and with fixed regions, its request continues on the Mac
+/// (`stageEvictExtra`). Between ticks only.
+fn stageMoveOrEvictExtra(sch: *Scheduler, k: usize, grow: bool, why: []const u8) void {
+    const h = sch.stage_extra[k] orelse return;
+    if (!stageDynamic() or h.legacy_gen == null) return stageEvictExtra(sch, k, why);
+    stageRegionsInit(sch);
+    const g = &h.legacy_gen.?;
+    const made: usize = g.generated_ids.items.len;
+    const left: u32 = @intCast(@min(if (h.max_tokens > made) h.max_tokens - made else 0, std.math.maxInt(u32)));
+    const len = h.full_prompt.len + made;
+    const old_base = sch.stage_extra_base[k];
+    const old_rows = sch.stage_extra_rows[k];
+    if (grow) {
+        const want = stageRegionRows(len, left, @min(stageSlotReserve(), 4096));
+        if (want > old_rows and stageRowsFree(sch, old_base + old_rows, old_base + want, k)) {
+            if (qwen4_forward.stageSlotView(k + 1, old_base, want, true, null)) {
+                sch.stage_extra_rows[k] = want;
+                log.info("[stage] slot {d}: grows to {d} rows ({s})\n", .{ k + 1, want, why });
+            }
+            return; // a failed call has given the stage up
+        }
+    }
+    const picked = stageRegionPick(sch, len, left, k, 4096) orelse return stageEvictExtra(sch, k, why);
+    if (!stageExtraPullOut(sch, k)) {
+        log.warn("[stage] slot {d}: move ({s}) without its state; giving the stage up\n", .{ k + 1, why });
+        stage_split_give_up("extra slot move: its state did not come back");
+        return;
+    }
+    if (!stageRegionSet(sch, k, picked.base, picked.rows)) {
+        g.stage_allowed = false;
+        return;
+    }
+    sch.stage_extra[k] = h;
+    qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&h.ctx), @intCast(k + 1));
+    log.info("[stage] slot {d}: its request moves to rows [{d}, +{d}) ({s})\n", .{ k + 1, picked.base, picked.rows, why });
 }
 /// R69: slot 0 is free while a request decodes on an extra slot with fewer verify rows than slot 0: it moves to slot 0
 /// (pull-back, then its next forward seeds slot 0), so a request left alone runs exactly as a single stream does.
@@ -8097,11 +8270,13 @@ fn stageMoveToSlot0(sch: *Scheduler) void {
         // it must fit below the other occupied extra slots
         var limit = stageCapacity();
         for (sch.stage_extra, 0..) |o, ko| if (o != null and ko != k) {
-            limit = @min(limit, stageSlotBase(ko));
+            limit = @min(limit, sch.stage_extra_base[ko]);
         };
         if (stageSlotNeed(h) > limit) continue;
         const made: u64 = g.generated_ids.items.len;
         const left: u64 = if (h.max_tokens > made) h.max_tokens - made else 0;
+        // R71: not for a reply about to end (the move is a pull-back and a full seed)
+        if (left < 256) continue;
         if (best == null or left > best_left) {
             best = k;
             best_left = left;
@@ -8120,10 +8295,11 @@ fn stageMoveToSlot0(sch: *Scheduler) void {
 /// R69: before a tick, extra slots leave if a request is about to cross the line between slots; a request left on a
 /// narrower extra slot with slot 0 free moves there.
 fn stageSlotGuard(sch: *Scheduler) void {
+    stageRegionsInit(sch);
     for (sch.stage_extra, 0..) |maybe, k| {
         const h = maybe orelse continue;
         if (h.finished or h.error_code != null) continue;
-        if (stageSlotNeed(h) > stageSlotRows()) stageEvictExtra(sch, k, "its request outgrew the slot");
+        if (stageSlotNeed(h) > sch.stage_extra_rows[k]) stageMoveOrEvictExtra(sch, k, true, "its request outgrew the slot");
     }
     if (sch.stage_holder) |h0| stageMakeRoomForSlot0(sch, stageSlotNeed(h0), "slot 0 needs its rows");
     stageMoveToSlot0(sch);
@@ -8139,11 +8315,13 @@ fn stageHolderRelease(sch: *Scheduler, slot: *Slot) void {
         // inside another holder's stage wait, where no stage call may go out)
         stagePromoteExtra(sch, k, slot);
         sch.stage_slot_drop[k] = sch.stage_extra[k] == null;
+        sch.stage_promote_pending = true;
         return;
     }
     if (!stageHolderIs(sch, slot)) return;
     sch.stage_holder = null;
     if (!stageMultiStream(sch)) return;
+    sch.stage_promote_pending = true;
     var best: ?*Slot = null;
     var best_left: u64 = 0;
     const limit0 = stageSlot0Limit(sch);
@@ -8171,7 +8349,11 @@ fn stageHolderRelease(sch: *Scheduler, slot: *Slot) void {
 /// its next forward seeds the slot from Sushi's caches (a Mac-only request's are whole).
 fn stagePromoteExtra(sch: *Scheduler, k: usize, except: *const Slot) void {
     if (k >= stageExtraCount() or !stageMultiStream(sch)) return;
-    if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > stageSlotBase(k)) return;
+    // R71: with dynamic regions the next holder's rows are set by a stage call, which cannot go out here (a release
+    // can run inside a stage wait): `stagePromoteFree` at the next tick's start
+    if (stageDynamic()) return;
+    stageRegionsInit(sch);
+    if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > sch.stage_extra_base[k]) return;
     var best: ?*Slot = null;
     var best_left: u64 = 0;
     for (sch.decoding.items) |s| {
@@ -8192,6 +8374,42 @@ fn stagePromoteExtra(sch: *Scheduler, k: usize, except: *const Slot) void {
         b.legacy_gen.?.stage_allowed = true;
         qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&b.ctx), @intCast(k + 1));
         log.info("[stage] slot {d}: passes to another in-flight request ({d} tokens left)\n", .{ k + 1, best_left });
+    }
+}
+
+/// R71 (dynamic regions): the free extra slots pass to the requests decoding on the Mac with the most tokens left that
+/// fit the free rows; their rows are set here and their next forward seeds them from Sushi's caches (a Mac-only
+/// request's are whole). At a tick's start: no stage wait open, no prefill chunk on the stage.
+fn stagePromoteFree(sch: *Scheduler) void {
+    if (!stageDynamic() or !stageMultiStream(sch)) return;
+    while (true) {
+        const k = for (0..stageExtraCount()) |i| {
+            if (sch.stage_extra[i] == null) break i;
+        } else return;
+        var best: ?*Slot = null;
+        var best_left: u64 = 0;
+        var best_base: usize = 0;
+        var best_rows: usize = 0;
+        for (sch.decoding.items) |s| {
+            if (s.background or stageOnStage(sch, s)) continue;
+            if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
+            const g = if (s.legacy_gen) |*gg| gg else continue;
+            if (g.done) continue;
+            const made: u64 = g.generated_ids.items.len;
+            const left: u64 = if (s.max_tokens > made) s.max_tokens - made else 0;
+            if (best != null and left <= best_left) continue;
+            const r = stageRegionPick(sch, s.full_prompt.len + @as(usize, @intCast(made)), @intCast(@min(left, std.math.maxInt(u32))), null, 1024) orelse continue;
+            best = s;
+            best_left = left;
+            best_base = r.base;
+            best_rows = r.rows;
+        }
+        const b = best orelse return;
+        if (!stageRegionSet(sch, k, best_base, best_rows)) return;
+        sch.stage_extra[k] = b;
+        b.legacy_gen.?.stage_allowed = true;
+        qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&b.ctx), @intCast(k + 1));
+        log.info("[stage] slot {d}: passes to another in-flight request ({d} tokens left; rows [{d}, +{d}))\n", .{ k + 1, best_left, best_base, best_rows });
     }
 }
 
@@ -8216,25 +8434,27 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // every stage wait and split prefill
     if (ms_trace.depth == 1 and qwen4_forward.stagePrefillInflight() == 0 and stageMultiStream(sch)) {
         if (stageAnyExtra(sch)) stageSlotGuard(sch);
-        for (&sch.stage_slot_drop, 0..) |*d, k| if (d.* and sch.stage_extra[k] == null) {
-            d.* = false;
-            if (!qwen4_forward.stageDropSlot(k + 1)) log.warn("[stage] slot {d}: drop failed\n", .{k + 1});
-        };
+        stageDropPending(sch);
+        // R71: slots or rows freed since the last tick go to requests on the Mac that now fit
+        if (sch.stage_promote_pending) {
+            sch.stage_promote_pending = false;
+            stagePromoteFree(sch);
+        }
     }
     if (active.len <= MAX_BATCH_GROUP and (sch.stage_holder != null or stageAnyExtra(sch)) and stageMultiStream(sch)) {
         var rest: [MAX_BATCH_GROUP]*Slot = undefined;
         var n: usize = 0;
         var holders: [1 + STAGE_EXTRA_MAX]*Slot = undefined;
         var hn: usize = 0;
-        // R69: an extra slot's holder sits a tick out while a split prefill (slot 0's request) has chunks on the stage:
-        // the socket carries one stream of replies, and its layers [first, 48) live on the stage, so it cannot decode
-        // on the Mac either. It is in no list this tick.
+        // R69: a holder sits a tick out while a split prefill (another slot's request; since R71 any slot's) has chunks
+        // on the stage: the socket carries one stream of replies, and its layers [first, 48) live on the stage, so it
+        // cannot decode on the Mac either. It is in no list this tick.
         const prefill_busy = qwen4_forward.stagePrefillInflight() > 0;
         var sat_out = false;
         for (active) |s| {
             const extra = stageExtraOf(sch, s) != null;
             if ((extra or stageHolderIs(sch, s)) and stageHolderSolo(s) and hn < holders.len) {
-                if (extra and prefill_busy) {
+                if (prefill_busy) {
                     sat_out = true;
                 } else {
                     holders[hn] = s;
@@ -8254,11 +8474,24 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
             for (holders[0..hn]) |h| holderPrep(h, false);
             const th0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
-            try runSplitGroup(sch, holders[0..hn], rest[0..n]);
+            const rounds_before = ms_trace.pair_rounds;
+            const arm = stage_group_alt_arm;
+            try runSplitGroup(sch, holders[0..hn], rest[0..n], if (sch.tick_hosted) 1 else stageGroupRounds());
             if (tracing) {
-                ms_trace.pair_ns += @import("qwen4_exp.zig").nowBootNs() - th0;
+                const dt = @import("qwen4_exp.zig").nowBootNs() - th0;
+                ms_trace.pair_ns += dt;
                 ms_trace.pair_n += 1;
                 ms_trace.pair_holders += hn;
+                if (stage_group_alt and !sch.tick_hosted and hn == 2) {
+                    const did = ms_trace.pair_rounds - rounds_before;
+                    ms_trace.alt_ns[arm] += dt;
+                    ms_trace.alt_rounds[arm] += did;
+                    stage_group_alt_rounds += did;
+                    if (stage_group_alt_rounds >= 128) {
+                        stage_group_alt_rounds = 0;
+                        stage_group_alt_arm ^= 1;
+                    }
+                }
             }
             return;
         }
@@ -8336,9 +8569,14 @@ const MsTrace = struct {
     pair_ns: u64 = 0,
     pair_n: u64 = 0,
     /// R69 group tick parts: every holder's begin (draft, layers [0, first), send), the early finishes, the Mac-only
-    /// requests, the last finish
-    pair_parts: [4]u64 = @splat(0),
+    /// requests, the last finish; R71 [4]: the rounds between the first begins and the last finishes
+    pair_parts: [5]u64 = @splat(0),
     pair_holders: u64 = 0,
+    /// R71: MTP rounds the group ticks ran (per holder)
+    pair_rounds: u64 = 0,
+    /// R71 measurement (SUSHI_STAGE_GROUP_ROUNDS=alt): two-holder ticks with 1 round per tick [0] and 4 [1]
+    alt_ns: [2]u64 = @splat(0),
+    alt_rounds: [2]u64 = @splat(0),
     last_end: u64 = 0,
 };
 fn msLap(acc: *u64, t0: u64) u64 {
@@ -8372,9 +8610,13 @@ fn msTraceTickEnd(t_enter: u64) void {
         ms(t.holder_ns, t.holder_n), t.holder_n, ms(t.hook_ns, t.hook_n), t.hook_n, ms(t.rest_ns, t.rest_n), t.rest_n,
         ms(t.pair_ns, t.pair_n), t.pair_n,
     });
-    if (t.pair_n > 0) log.info("[ms-trace] group parts (ms), {d:.1} holders: begins {d:.2}, early finishes {d:.2}, Mac-only {d:.2}, last finish {d:.2}\n", .{
+    if (t.pair_n > 0) log.info("[ms-trace] group parts (ms), {d:.1} holders: begins {d:.2}, early finishes {d:.2}, Mac-only {d:.2}, last finish {d:.2}; rounds between {d:.2}; {d:.2} rounds per tick, {d:.2} ms per round\n", .{
         @as(f64, @floatFromInt(t.pair_holders)) / @as(f64, @floatFromInt(t.pair_n)),
         ms(t.pair_parts[0], t.pair_n), ms(t.pair_parts[1], t.pair_n), ms(t.pair_parts[2], t.pair_n), ms(t.pair_parts[3], t.pair_n),
+        ms(t.pair_parts[4], t.pair_n), @as(f64, @floatFromInt(t.pair_rounds)) / @as(f64, @floatFromInt(t.pair_n)), ms(t.pair_ns, t.pair_rounds),
+    });
+    if (t.alt_rounds[0] + t.alt_rounds[1] > 0) log.info("[ms-trace] two holders, time per round: 1 round per tick {d:.2} ms ({d} rounds), 4 rounds per tick {d:.2} ms ({d} rounds)\n", .{
+        ms(t.alt_ns[0], t.alt_rounds[0]), t.alt_rounds[0], ms(t.alt_ns[1], t.alt_rounds[1]), t.alt_rounds[1],
     });
     const keep_last = t.last_end;
     t.* = .{};
@@ -8408,18 +8650,84 @@ fn holderPrep(h: *Slot, solo: bool) void {
     h.planner_force_plain = false;
 }
 
+/// R71: MTP rounds a group of stage holders may run in one tick (SUSHI_STAGE_GROUP_ROUNDS, default 4, at most 6;
+/// 1 = one round per tick, as R69). Past the first round each holder's tail is followed at once by its next first
+/// half, so only the tick's last tail waits for the 5090 (R69: every tick's; 5-8 ms of a ~40 ms two-holder tick at a
+/// long context). The guard between ticks leaves room for it: a round adds at most 9 rows to a slot, six rounds 54,
+/// under STAGE_SLOT_MARGIN.
+var stage_group_rounds_env: ?u32 = null;
+/// Measurement: SUSHI_STAGE_GROUP_ROUNDS=alt switches between 1 and 4 rounds per tick every 128 rounds and
+/// SUSHI_STAGE_MS_TRACE=1 reports each arm's time per round (one process, interleaved arms).
+var stage_group_alt: bool = false;
+var stage_group_alt_rounds: u64 = 0;
+var stage_group_alt_arm: u1 = 0;
+fn stageGroupRounds() u32 {
+    if (stage_group_rounds_env == null) {
+        const raw = std.c.getenv("SUSHI_STAGE_GROUP_ROUNDS");
+        if (raw) |r| stage_group_alt = std.mem.eql(u8, std.mem.sliceTo(r, 0), "alt");
+        stage_group_rounds_env = if (raw) |r| std.math.clamp(std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 4, 1, 6) else 4;
+    }
+    if (stage_group_alt) return if (stage_group_alt_arm == 0) 1 else 4;
+    return stage_group_rounds_env.?;
+}
+fn slotLive(s: *const Slot) bool {
+    return !(s.finished or s.error_code != null or s.cancelled.load(.acquire));
+}
+/// R71: may the group start another round in this tick? Not once a holder has ended (its slot passes on, and the
+/// next pass forms the group anew), and not while a foreground request waits to be admitted (it starts at the next
+/// pass, one round away at most).
+fn splitGroupContinues(sch: *Scheduler, hs: []const *Slot) bool {
+    for (hs) |h| if (!slotLive(h)) return false;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    for (sch.pending.items) |p| if (!p.background and !p.cancelled.load(.acquire)) return false;
+    return true;
+}
+
 /// R69: one tick of the stage holders on their slots: each holder's draft and layers [0, first) and send in turn (the
 /// one before it computes on the 5090 meanwhile), then each one's tail; the Mac-only requests run before the last tail
 /// (that holder's 5090 half runs meanwhile). A holder whose tick is not an MTP round runs whole at its turn.
-fn runSplitGroup(sch: *Scheduler, hs: []*Slot, rest: []*Slot) !void {
+/// R71: up to `max_rounds` rounds per tick: between the first halves and the last tails, each holder's tail and its
+/// next first half alternate (the Mac-only requests take one tick per round).
+fn runSplitGroup(sch: *Scheduler, hs: []*Slot, rest_all: []*Slot, max_rounds: u32) !void {
     const tr = msTraceOn();
     var t = if (tr) @import("qwen4_exp.zig").nowBootNs() else 0;
     var rounds: [1 + STAGE_EXTRA_MAX]?SplitRound = @splat(null);
     errdefer for (hs, 0..) |h, i| if (rounds[i]) |*r| r.st.deinit(h.allocator);
+    var rest = rest_all;
     for (hs, 0..) |h, i| {
         rounds[i] = if (h.error_code == null) try splitRoundBegin(sch, h) else null;
     }
     if (tr) t = msLap(&ms_trace.pair_parts[0], t);
+    var left = max_rounds -| 1;
+    while (left > 0 and splitGroupContinues(sch, hs)) : (left -= 1) {
+        // the Mac-only requests still running take their tick first (every holder's 5090 half is out or done)
+        var n: usize = 0;
+        for (rest) |s| if (slotLive(s)) {
+            rest[n] = s;
+            n += 1;
+        };
+        rest = rest[0..n];
+        if (rest.len > 0) try runDecodeTickShared(sch, rest);
+        for (hs, 0..) |h, i| {
+            if (rounds[i]) |r0| {
+                var r = r0;
+                rounds[i] = null;
+                try splitRoundFinish(sch, h, &r);
+            }
+            if (slotLive(h)) rounds[i] = try splitRoundBegin(sch, h);
+        }
+        if (tr) ms_trace.pair_rounds += 1;
+    }
+    if (tr) t = msLap(&ms_trace.pair_parts[4], t);
+    {
+        var n: usize = 0;
+        for (rest) |s| if (slotLive(s)) {
+            rest[n] = s;
+            n += 1;
+        };
+        rest = rest[0..n];
+    }
     for (hs, 0..) |h, i| {
         if (i + 1 == hs.len) {
             if (tr) t = msLap(&ms_trace.pair_parts[1], t);
@@ -8433,6 +8741,7 @@ fn runSplitGroup(sch: *Scheduler, hs: []*Slot, rest: []*Slot) !void {
         }
     }
     if (tr) t = msLap(&ms_trace.pair_parts[3], t);
+    if (tr) ms_trace.pair_rounds += 1;
     mlx.checkErrorDecode() catch |mlx_err| {
         log.err("[scheduler] split group aborted: MLX failure mid-generation ({s})\n", .{@errorName(mlx_err)});
         for (hs) |h| h.markError(@errorName(mlx_err));

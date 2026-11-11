@@ -185,8 +185,8 @@ impl Device {
         let va = match buf {
             Some(b) => {
                 ensure!(std::ptr::eq(b.device, self), "foreign stamp buffer");
-                ensure!(b.bytes >= 16 * (slots as usize + 128), "stamp region too small");
-                b.ptr
+                ensure!(b.bytes.get() >= 16 * (slots as usize + 128), "stamp region too small");
+                b.ptr.get()
             }
             None => 0,
         };
@@ -271,19 +271,21 @@ impl Device {
             "bounded CUDA allocation"
         );
         if let Some(ptr) = self.arena_take(bytes)? {
-            return Ok(Buffer { device: self, ptr, bytes, owned: false });
+            return Ok(Buffer { device: self, ptr: std::cell::Cell::new(ptr), bytes: std::cell::Cell::new(bytes), owned: false });
         }
-        let mut buffer = Buffer {
+        let buffer = Buffer {
             device: self,
-            ptr: 0,
-            bytes,
+            ptr: std::cell::Cell::new(0),
+            bytes: std::cell::Cell::new(bytes),
             owned: true,
         };
+        let mut raw: DevPtr = 0;
         unsafe {
-            check(tinynv_malloc(self.handle, bytes, &mut buffer.ptr))?;
+            check(tinynv_malloc(self.handle, bytes, &mut raw))?;
         }
+        buffer.ptr.set(raw);
         ensure!(
-            buffer.ptr != 0 && buffer.ptr % 256 == 0,
+            raw != 0 && raw % 256 == 0,
             "device allocation alignment"
         );
         Ok(buffer)
@@ -380,14 +382,24 @@ impl<'d> Buffer<'d> {
     /// R60 S4 (prefill v2): a non-owning view of bytes [offset, offset + bytes) of this buffer (for
     /// row sub-batches of chunk scratch). The view must not outlive this buffer.
     pub(crate) fn view(&self, offset: usize, bytes: usize) -> Result<Buffer<'d>> {
-        ensure!(bytes > 0 && offset + bytes <= self.bytes, "buffer view bounds");
-        Ok(Buffer { device: self.device, ptr: self.ptr + offset as DevPtr, bytes, owned: false })
+        ensure!(bytes > 0 && offset + bytes <= self.bytes.get(), "buffer view bounds");
+        Ok(Buffer { device: self.device, ptr: std::cell::Cell::new(self.ptr.get() + offset as DevPtr), bytes: std::cell::Cell::new(bytes), owned: false })
+    }
+    /// R71: re-point this non-owning view to bytes [offset, offset + bytes) of `parent` (a conversation slot's rows
+    /// move). Calls recorded or graphs captured before this keep the old address: the caller drops them.
+    pub(crate) fn retarget(&self, parent: &Buffer<'d>, offset: usize, bytes: usize) -> Result<()> {
+        ensure!(!self.owned && std::ptr::eq(self.device, parent.device), "retarget needs a view of the same device");
+        ensure!(bytes > 0 && offset + bytes <= parent.bytes.get(), "buffer retarget bounds");
+        self.ptr.set(parent.ptr.get() + offset as DevPtr);
+        self.bytes.set(bytes);
+        Ok(())
     }
 }
 pub struct Buffer<'d> {
     device: &'d Device,
-    ptr: DevPtr,
-    bytes: usize,
+    /// R71: in cells so a non-owning view can be re-pointed in place (`retarget`); fixed for every other buffer.
+    ptr: std::cell::Cell<DevPtr>,
+    bytes: std::cell::Cell<usize>,
     /// R58: false for arena sub-buffers (their chunk is freed with the device).
     owned: bool,
 }
@@ -402,25 +414,25 @@ fn arena_pad() -> u64 {
 impl Buffer<'_> {
     /// R56: the raw device address (copy-table entries).
     pub(crate) fn device_ptr(&self) -> u64 {
-        self.ptr
+        self.ptr.get()
     }
     pub(crate) fn byte_len(&self) -> usize {
-        self.bytes
+        self.bytes.get()
     }
     /// R52: the buffer's device virtual address (for pump descriptors passed as U64).
     pub(crate) fn device_addr(&self) -> u64 {
-        self.ptr
+        self.ptr.get()
     }
     pub(crate) fn aliases(&self, other: &Buffer<'_>) -> bool {
-        std::ptr::eq(self.device, other.device) && self.ptr == other.ptr
+        std::ptr::eq(self.device, other.device) && self.ptr.get() == other.ptr.get()
     }
     pub fn upload(&self, data: &[u8]) -> Result<()> {
-        ensure!(data.len() <= self.bytes, "upload bounds");
+        ensure!(data.len() <= self.bytes.get(), "upload bounds");
         // Pinned forced-copy path copies caller bytes to staging before return.
         unsafe {
             check(tinynv_memcpy_htod(
                 self.device.stream,
-                self.ptr,
+                self.ptr.get(),
                 data.as_ptr().cast(),
                 data.len(),
             ))?;
@@ -429,14 +441,14 @@ impl Buffer<'_> {
     }
     /// R59: upload `data` at byte `offset` into this buffer (incremental state refresh).
     pub fn upload_at(&self, offset: usize, data: &[u8]) -> Result<()> {
-        ensure!(offset.checked_add(data.len()).is_some_and(|e| e <= self.bytes), "upload_at bounds");
+        ensure!(offset.checked_add(data.len()).is_some_and(|e| e <= self.bytes.get()), "upload_at bounds");
         if data.is_empty() {
             return Ok(());
         }
         unsafe {
             check(tinynv_memcpy_htod(
                 self.device.stream,
-                self.ptr + offset as u64,
+                self.ptr.get() + offset as u64,
                 data.as_ptr().cast(),
                 data.len(),
             ))?;
@@ -444,13 +456,13 @@ impl Buffer<'_> {
         self.device.sync()
     }
     pub fn download(&self, out: &mut [u8]) -> Result<()> {
-        ensure!(out.len() <= self.bytes, "download bounds");
+        ensure!(out.len() <= self.bytes.get(), "download bounds");
         // Pinned compute download waits and copies to caller storage before return.
         unsafe {
             check(tinynv_memcpy_dtoh(
                 self.device.stream,
                 out.as_mut_ptr().cast(),
-                self.ptr,
+                self.ptr.get(),
                 out.len(),
             ))?;
         }
@@ -460,13 +472,13 @@ impl Buffer<'_> {
         self.release()
     }
     fn release(&mut self) -> Result<()> {
-        if self.ptr != 0 && self.owned {
+        if self.ptr.get() != 0 && self.owned {
             self.device.sync()?;
             unsafe {
-                check(tinynv_free(self.device.handle, self.ptr))?;
+                check(tinynv_free(self.device.handle, self.ptr.get()))?;
             }
         }
-        self.ptr = 0;
+        self.ptr.set(0);
         Ok(())
     }
 }
@@ -606,7 +618,7 @@ impl<'m, 'd> Kernel<'m, 'd> {
                         std::ptr::eq(b.device, self.module.device),
                         "foreign device buffer"
                     );
-                    b.ptr.to_ne_bytes().to_vec()
+                    b.ptr.get().to_ne_bytes().to_vec()
                 }
                 Arg::U32(n) => n.to_ne_bytes().to_vec(),
                 Arg::U64(n) => n.to_ne_bytes().to_vec(),
@@ -872,7 +884,7 @@ impl<'a, 'm, 'd> Graph<'a, 'm, 'd> {
             }
             for (x, y) in a._args.iter().zip(&b._args) {
                 let same_kind = match (x, y) {
-                    (Arg::Buffer(p), Arg::Buffer(q)) => p.ptr == q.ptr,
+                    (Arg::Buffer(p), Arg::Buffer(q)) => p.ptr.get() == q.ptr.get(),
                     (Arg::U32(_), Arg::U32(_)) | (Arg::U64(_), Arg::U64(_)) | (Arg::F32(_), Arg::F32(_)) => true,
                     _ => false,
                 };

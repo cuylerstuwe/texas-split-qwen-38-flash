@@ -2,8 +2,9 @@
 """texas-split end-to-end smoke test against a running host (default http://127.0.0.1:$TEXAS_SPLIT_PORT, 8003).
 Exercises what a coding agent uses: model listing, streaming chat with reasoning, tool calls
 (streaming and not, then a tool-result turn), an image turn, a long prompt through the split
-prefill, and one-generation-at-a-time (a concurrent stream waits; a queued client that leaves is
-dropped; a stream cancelled mid-flight frees the engine for the next).
+prefill, and the queue: one generation at a time by default (a concurrent stream waits), several at
+once with `texas-split concurrency N` (a second stream starts while the first runs); a client that
+leaves is dropped; a stream cancelled mid-flight frees the engine for the next.
   smoke.py [BASE] [--only NAME,..]"""
 import base64, http.client, json, os, socket, struct, sys, threading, time, zlib
 from urllib.parse import urlparse
@@ -157,17 +158,30 @@ def main():
     if want('tools_stream'):
         messages = [{'role': 'system', 'content': 'You are a coding agent. Use tools to inspect the workspace before answering.'},
                     {'role': 'user', 'content': 'What does README.md in the workspace say? Read it with the tool.'}]
-        st, evs, first, total = stream('/v1/chat/completions', {'model': MODEL, 'max_tokens': 2000, 'tools': TOOLS,
-                                                                'messages': messages, 'stream_options': {'include_usage': True}})
-        reasoning, content, tools, finish, usage = assemble(evs)
-        args_ok = False
-        try:
-            # parallel calls are legitimate (e.g. run_shell then read_file): every call must parse
-            args_ok = bool(tools) and all(isinstance(json.loads(t['arguments']), dict) for t in tools)
-        except ValueError:
-            pass
-        check('tools_stream', st == 200 and finish == 'tool_calls' and any(t['name'] == 'read_file' for t in tools) and args_ok,
-              {'status': st, 'finish': finish, 'tools': tools, 'content': content[:120], 'total_s': round(total, 2)})
+        # The check is the plumbing: a streamed tool call that names one of the offered tools with arguments that
+        # parse. Which tool comes first is the model's choice under the thinking sampler: over 300 requests each
+        # with plain decode, adaptive MTP and fixed-depth MTP, 5.0-5.7% listed the workspace with run_shell before
+        # reading and 1.0% made no call at all (the reply reasons about constraints that are not in the prompt),
+        # the same in all three; 30 seeded requests were identical on two builds. So: any offered tool counts, and
+        # a reply without a call is asked again, twice at most (2026-11-11).
+        attempts = []
+        for attempt in range(3):
+            st, evs, first, total = stream('/v1/chat/completions', {'model': MODEL, 'max_tokens': 2000, 'tools': TOOLS,
+                                                                    'messages': messages, 'stream_options': {'include_usage': True}})
+            reasoning, content, tools, finish, usage = assemble(evs)
+            args_ok = False
+            try:
+                # parallel calls are legitimate (e.g. run_shell then read_file): every call must parse
+                args_ok = bool(tools) and all(isinstance(json.loads(t['arguments']), dict) for t in tools)
+            except ValueError:
+                pass
+            offered = {t['function']['name'] for t in TOOLS}
+            ok = st == 200 and finish == 'tool_calls' and args_ok and all(t['name'] in offered for t in tools)
+            attempts.append({'finish': finish, 'tools': [t['name'] for t in tools]})
+            if ok or st != 200 or tools:
+                break
+        check('tools_stream', ok,
+              {'status': st, 'finish': finish, 'tools': tools, 'content': content[:120], 'total_s': round(total, 2), 'attempts': attempts})
         if want('tools_result') and tools:
             call = next((t for t in tools if t['name'] == 'read_file'), tools[0])
             followup = messages + [
@@ -211,12 +225,19 @@ def main():
     if want('queue'):
         order, lock = [], threading.Lock()
 
-        def worker(tag, prompt):
-            st, evs, first, total = stream('/v1/chat/completions', {'model': MODEL, 'max_tokens': 200, 'reasoning_effort': 'none',
+        # one generation at a time (the default), or several at once (`texas-split concurrency N`, /health concurrency)
+        c0 = conn(10)
+        c0.request('GET', '/health')
+        multi = ((json.loads(c0.getresponse().read()).get('concurrency') or {}).get('max') or 1) > 1
+        c0.close()
+
+        def worker(tag, prompt, max_tokens=200):
+            st, evs, first, total = stream('/v1/chat/completions', {'model': MODEL, 'max_tokens': max_tokens, 'reasoning_effort': 'none',
                                                                     'messages': [{'role': 'user', 'content': prompt}]})
             with lock:
                 order.append((tag, st, round(first or -1, 2), round(total, 2)))
-        a = threading.Thread(target=worker, args=('A', 'Count from 1 to 40, comma separated.'))
+        a = threading.Thread(target=worker, args=(('A', 'Count from 1 to 150, comma separated.', 500) if multi else
+                                                   ('A', 'Count from 1 to 40, comma separated.')))
         b = threading.Thread(target=worker, args=('B', 'Say hello in French, one word.'))
         a.start()
         time.sleep(1.0)
@@ -225,8 +246,12 @@ def main():
         b.join()
         a_rec = next(o for o in order if o[0] == 'A')
         b_rec = next(o for o in order if o[0] == 'B')
-        check('queue_concurrent', a_rec[1] == 200 and b_rec[1] == 200 and b_rec[2] >= a_rec[3] - 1.5,
-              {'A': a_rec, 'B': b_rec, 'note': 'B first event should come after A finished'})
+        if multi:   # B started 1.0 s after A: its first event must come while A still runs
+            check('queue_concurrent', a_rec[1] == 200 and b_rec[1] == 200 and 0 <= b_rec[2] and 1.0 + b_rec[2] < a_rec[3],
+                  {'A': a_rec, 'B': b_rec, 'note': 'multi-stream: B first event should come while A still runs'})
+        else:
+            check('queue_concurrent', a_rec[1] == 200 and b_rec[1] == 200 and b_rec[2] >= a_rec[3] - 1.5,
+                  {'A': a_rec, 'B': b_rec, 'note': 'B first event should come after A finished'})
 
         # a queued client that leaves is dropped; a stream cancelled mid-flight frees the engine
         hold = threading.Thread(target=worker, args=('C', 'Count from 1 to 60, comma separated.'))

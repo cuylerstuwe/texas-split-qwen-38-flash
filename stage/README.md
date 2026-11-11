@@ -8,15 +8,20 @@ COMMIT), SEED (load a sequence's state), incremental SEED (op 10: only the rows 
 holds, which it hashes against the client's first), PREFILL (pipelined chunks, optional state pull-back), EXPORT
 (op 9: a finished turn's decode-time rows and recurrent states, back to the client), PARK / RESTORE (a parked
 background request's whole stage state to and from an SSD file, verified byte for byte when
-`QD_STAGE_RESTORE_VERIFY=1`), DROP SLOT (op 11), INFO, QUIT.
+`QD_STAGE_RESTORE_VERIFY=1`), DROP SLOT (op 11), SLOT VIEW (op 12), INFO, QUIT.
 
 Conversation slots (`QD_STAGE_SLOTS=2..4`, set by the host when `TEXAS_SPLIT_MAX_CONCURRENT` is above 1): bits 3-5
-of a message's aux word name the slot. Slot 0 is the whole state as with one slot. Extra slot k holds
-`QD_STAGE_SLOT_ROWS` rows as views into the top of slot 0's K/V and pooled-key buffers (stacking downward; slot 0
-stops below the occupied ones), with its own recurrent state, per-row verify state and projection outputs, and
-`QD_STAGE_SLOT_VERIFY_ROWS` verify rows (a value or a comma list; default 9 for slot 1, 4 after). Captured graphs
-are keyed by (slot, rows) and stay resident (~16.5 MB each); their number is budgeted from the card's free memory
-(`QD_STAGE_MAX_GRAPHS` overrides) and forwards past the budget run uncaptured. Prefill is slot 0's.
+of a message's aux word name the slot. Slot 0 is the whole state as with one slot. Extra slot k views rows of
+slot 0's K/V and pooled-key buffers (slot 0 stops below the occupied ones), with its own recurrent state, per-row
+verify state and projection outputs, and `QD_STAGE_SLOT_VERIFY_ROWS` verify rows (a value or a comma list;
+default 9 for slot 1, 4 after). It starts with `QD_STAGE_SLOT_ROWS` rows at the top, stacking downward; SLOT VIEW
+re-points it to rows [position, position + arg): dropped first, or kept with another row count at the same base
+(aux bit 0). The op and every seed refuse rows that overlap slot 0's live rows or another occupied slot's; with
+aux bit 1 the message's row field is the most rows slot 0's request holds, and more than that on slot 0 (a
+finished conversation's) is forgotten first. Buffer views are re-targeted in place and the slot's captured graphs
+dropped. Captured graphs are keyed by (slot, rows) and stay resident (~16.5 MB each); their number is budgeted
+from the card's free memory (`QD_STAGE_MAX_GRAPHS` overrides) and forwards past the budget run uncaptured.
+PREFILL runs on any slot.
 
 This crate is the stage's part of a larger research codebase; only the stage server binary is built.
 CUDA kernels ship as prebuilt `kernels/*.cubin` (sources `kernels/*.cu`), each pinned by SHA-256

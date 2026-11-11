@@ -1,6 +1,99 @@
 # Changelog
 
-## 2026-11-11, latest: several requests at once (opt-in), the cache across turns, a failure-recovery fix
+## 2026-11-11, second update: several requests at once now pays off on long prompts (a correction)
+
+Existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart` (the stage server and
+Sushi changed; the driver did not).
+
+Everything here is active only above `concurrency 1`. One request at a time is unchanged: against the previous
+build, a greedy four-turn conversation and 30 seeded sampled replies (thinking sampler) are identical, and cold and
+warm timings are equal in an interleaved run.
+
+### The correction
+
+The multi-request figures in the first update below (120 tok/s with two requests, 132 with three or four) were
+measured on decode with ~500-token prompts. Agent sessions are different: long prompts, and about 40% of the time
+in prefill. Replaying two recorded agent sessions side by side (A: three turns adding 20K, 8K and 5K prompt tokens;
+B: 54K, 10K, 10K; 1,024 tokens generated per turn, thinking sampler) against the same sessions one after another
+on the same host, that build was slower:
+
+| | first update | this update |
+|---|---|---|
+| two sessions side by side, against one after the other | 0.93× (96.1 s against 89.3 s) | **1.07×** (87.8 s against 94.0 s) |
+| four sessions (A, A, B, B), against two serial pairs | about 0.88× (200.5 s against ~175 s) | **1.16×** (162.5 s against ~188 s) |
+
+Single runs with one seed; the columns were measured at different times of one day on a Mac that was also in
+interactive use (the serial pair itself took 86-94 s), so compare within a column.
+
+### What was wrong, and the three changes (all exact)
+
+- **A request on an extra slot prefilled on the Mac alone**: all 48 layers at ~2.3K tok/s instead of the split's
+  ~3.6K, while the requests already decoding got one decode round per 4,096-token chunk. The stage's prefill now
+  runs on any slot (its layers already worked on the selected slot; the server only refused the op off slot 0)
+  and Sushi's prefill pipeline works on the request's own slot. While any request's prefill has chunks on the
+  5090, the requests decoding there pause (one stream of replies on the socket; the Mac is the shared resource
+  either way). `SUSHI_STAGE_SLOT_PREFILL=0` in `TEXAS_SPLIT_SUSHI_ENV` restores the old path.
+- **Every tick ended with the last request waiting for the 5090**: 5-8 ms of a ~40 ms tick with two requests at
+  20-54K contexts. A tick now runs several rounds (`SUSHI_STAGE_GROUP_ROUNDS`, default 4): each request's second
+  half is followed at once by its next first half, so only the tick's last second half waits. Measured with both
+  arms alternating inside one process: 39.8 -> 34.4 ms per round with two requests, +15.8% rounds per second.
+- **Extra slots were fixed equal shares of the stage's rows** (65,536 each with four slots), so a conversation
+  past its share ran on the Mac. A slot's rows are now set when a request claims it (stage op 12, SLOT VIEW): its
+  tokens, a reply reserve that shrinks from 16,384 rows until the request fits, and a margin, taken from whatever
+  rows are free. A request that outgrows its rows gets more in place when the rows above are free, else moves to
+  other free rows (its state is pulled back and seeded again), else continues on the Mac. The stage refuses rows
+  that overlap another conversation's, at the op and at every seed. `SUSHI_STAGE_SLOT_DYNAMIC=0` keeps the fixed
+  shares. The conversations on the 5090 together still share its 262,144 rows.
+
+With four requests on the 5090 at 20-77K contexts a round takes ~69 ms: 15 ms per request for the drafts, the
+Mac's layers 0-27 and the send, ~2.4 ms per request for the rest. That is the same Mac time per round as a request
+running alone, so what is left is the Mac's verify forward itself; the 5090 is busy about 35% of the time.
+
+### Fixed: a long request after a burst could lose the 5090
+
+A slot freed while another request waited on the 5090 was only marked, and its rows were freed on the stage at
+the next decode tick. When the last request of a burst ended on an extra slot there was no next tick: the stage
+went on counting its rows, and a later request on slot 0 whose prompt reached them was refused mid-prefill, which
+made Sushi give the 5090 up and re-run the request on the Mac (it needed a prompt longer than roughly 262K tokens
+minus the leftover conversation). Present since the first update. The pending frees now also run before every
+slot claim. Reproduced with a small row limit (two requests, then a 51.6K-token one: 40.5 s to first token on the
+Mac) and fixed (the same sequence prefills through the 5090 in 14-16 s).
+
+Also fixed: a request whose extra slot was taken back during a prefill on the Mac kept permission to use the 5090
+without a slot.
+
+### Host and tests
+
+- The launch memory check (82 GiB reclaimable) re-reads for up to 45 s before it fails. The host's own restart
+  after a 5090 failure stops the engine and launches again at once; a reading taken two seconds after the stop,
+  before the kernel had reclaimed the engine's memory, left the service in `fault` until restarted by hand.
+- `/health` and `bin/texas-split concurrency` report `slot_regions: "dynamic"` above concurrency 1.
+- `smoke.py`: `queue_concurrent` checks that a second request starts while the first runs when several requests
+  are allowed (it expected one at a time and failed by design). `tools_stream` accepts either offered tool and asks
+  again, twice at most, when a reply makes no tool call. That is the model under the thinking sampler, not the
+  engine: over 300 requests each with plain decode, adaptive MTP and fixed-depth MTP, 5.0-5.7% of replies called
+  `run_shell` before `read_file` and 1.0% made no call at all (they reason about a constraint that is not in the
+  prompt), the same in all three.
+
+### Tried and dropped
+
+Polling the stage socket instead of sleeping on it. The round trip adds only 16-27 us to the stage's own time per
+forward (measured with a server build that reports that time in its reply; the stage client reads the field, which the
+shipped server leaves at zero), so there was nothing
+to win.
+
+### Validation
+
+With one request at a time and with four at once: the parking suite 8/8 exact, smoke 10/10. Prefill through slots
+1-3: four staggered greedy requests, cold, byte-identical to their solo runs; a four-turn conversation forced onto
+slot 1 identical to the reference. Slot rows under pressure (a small row limit): one slot grew in place and one
+moved mid-reply, every reply (up to 8,000 tokens) identical to its solo run. 5090 failures with several requests:
+four killed mid-reply, a hang with three, and the 5090 dying while a second request prefilled a 56K-token prompt
+on an extra slot: every stream paused and continued exactly. After the install: `fault.py term`, `prefill` and
+`long` clean, the host restoring the split by itself each time. Details in
+[docs/VALIDATION.md](docs/VALIDATION.md).
+
+## 2026-11-11, first update: several requests at once (opt-in), the cache across turns, a failure-recovery fix
 
 Existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart` (the stage server and
 Sushi changed; the driver did not).
@@ -49,6 +142,9 @@ reply is byte-identical to the same request run alone (greedy, same prefill path
 prefix-cache entry: two 65K-token conversations at concurrency 2 reach the first token of warm turns in 0.7-1.2 s
 with the whole prompt restored. Background requests behave as before: one at a time, alone on slot 0, parked
 exactly while any foreground request runs.
+
+These totals are decode with short prompts; on agent-shaped sessions this build lost time to running the sessions
+one after another (see the second update above, which also removes the first three limits below).
 
 Limits: a request on an extra slot prefills on the Mac, and extra-slot holders pause while slot 0's request
 prefills through the 5090; extra slots have a fixed share of the stage's rows (131,080 each with two slots, 87,384

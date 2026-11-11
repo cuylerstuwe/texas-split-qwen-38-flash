@@ -19,6 +19,7 @@
 //!   for positions [position, position+rows) (position == the committed length, nothing pending);
 //!   every row runs and commits through the chunk-sized prefill path and the stream after layer 47
 //!   replaces the input in place. Sushi double-buffers two chunk slots and pipelines them.
+//!   R71: on the conversation slot named in aux bits 3-5, as every op (slot 0 only before).
 //!   aux bit 0: also write the pull-back blob (Stage::prefill_export, "QDX1") at arg + 128 MiB;
 //!   the reply's arg holds its length.
 //! op 7 PARK (texas-split background parking): shm[0..] holds a NUL-ended absolute file path.
@@ -28,6 +29,11 @@
 //! op 8 RESTORE: shm[0..] holds the path of a PARK file; reloads it like SEED (`position` must be
 //!   the parked position). The caller removes the file. QD_STAGE_RESTORE_VERIFY=1 re-reads the live
 //!   state after the restore and fails the op unless it equals the file byte for byte.
+//! op 12 SLOT VIEW (R71): slot >= 1 (aux bits 3-5) views rows [position, position + arg) of slot 0's attention
+//!   buffers from now on. aux bit 0: the slot keeps its conversation (same base; only the row count changes);
+//!   otherwise it is dropped first. Refused when the rows overlap slot 0's live rows or another occupied slot's.
+//!   aux bit 1: `rows` holds the rows slot 0's request has at most; if slot 0 holds more (a finished conversation's)
+//!   they are forgotten first and the reply's arg is 1.
 //! Reply: same layout, status 0 = ok, 1 = error (the error text follows in shm[0..], NUL-ended).
 //!   canon-stage-server [FIRST] [CAPACITY]
 use anyhow::{Context, Result, bail, ensure};
@@ -580,8 +586,31 @@ fn main() -> Result<()> {
                     println!("{}", json!({"kind":"drop-slot","slot":slot}));
                     Ok((0, 0))
                 }
+                12 => {
+                    // R71: re-point the slot's attention rows to [position, position + arg) of slot 0's buffers (aux
+                    // bit 0: it keeps its conversation, same base). Its captured graphs hold the old addresses.
+                    ensure!(slot > 0, "slot 0's rows are fixed");
+                    let keep = aux & 1 != 0;
+                    // aux bit 1: `rows` = the rows slot 0's request holds at most; more live rows on slot 0 are a
+                    // finished conversation's and would block the view: forget them (reply arg 1)
+                    let mut trimmed = false;
+                    if aux & 2 != 0 && stage.trim_slot0(rows)? {
+                        pending_commit[0] = None;
+                        trimmed = true;
+                        stage.select(slot)?;
+                    }
+                    if !keep {
+                        pending_commit[slot] = None;
+                    }
+                    graphs.retain(|k, _| k.0 != slot);
+                    stage.set_slot_view(position as usize, arg as usize, keep)?;
+                    println!("{}", json!({"kind":"slot-view","slot":slot,"base":position,"rows":arg,"keep":keep,"slot0_trimmed":trimmed}));
+                    reply_arg = u64::from(trimmed);
+                    Ok((0, 0))
+                }
                 6 => {
-                    ensure!(slot == 0, "prefill runs on slot 0 only");
+                    // R71: any conversation slot (the layers read the active slot's state; scratch is shared and one
+                    // prefill runs at a time)
                     let pf = pf.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch disabled"))?;
                     ensure!(stage.pending() == 0 && pending_commit[slot].is_none(), "prefill with an uncommitted forward");
                     ensure!(position == stage.position(), "prefill at {position}, stage at {}", stage.position());

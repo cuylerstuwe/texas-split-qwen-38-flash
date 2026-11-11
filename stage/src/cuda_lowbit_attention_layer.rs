@@ -111,6 +111,18 @@ impl<'m, 'd> Layer<'m, 'd> {
         self.active.set(slot);
         Ok(())
     }
+    /// R71: re-point slot `slot` (1..) to rows [base, base + rows) of slot 0's buffers (see Attention::set_slot_view).
+    pub(crate) fn set_slot_view(&self, slot: usize, base: usize, rows: usize, keep: bool) -> Result<()> {
+        self.attention.set_slot_view(slot, base, rows, keep)
+    }
+    /// R71: rows slot `slot` holds.
+    pub(crate) fn live_rows(&self, slot: usize) -> usize {
+        self.attention.live_rows(slot)
+    }
+    /// R71: (base, rows) of slot `slot`'s view.
+    pub(crate) fn slot_view(&self, slot: usize) -> (usize, usize) {
+        self.attention.slot_view(slot)
+    }
     /// R69: the active slot holds nothing.
     pub(crate) fn drop_slot_state(&self) {
         self.attention.drop_slot_state();

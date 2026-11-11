@@ -77,6 +77,11 @@ int slot_of(uint64_t owner) {
 size_t g_at = 0;        // seed blob cursor
 uint64_t g_forwards = 0, g_seeds = 0, g_partials = 0;
 double g_rpc_us = 0, g_copy_us = 0;
+// R72: the server's own time for the last op (reply bytes 8..12, us; 0 from a server that does not report it) and its
+// sum over forwards: send-to-reply minus this is the transport (measured 2026-11-11: 16-27 us per forward, so a
+// spin handoff on either side of the socket has nothing to win).
+uint32_t g_reply_us = 0;
+double g_stage_us = 0;
 // R64 stage head: request the final mixer + lm_head + top-20 with the next forward (op 1 aux bit 2); the reply's
 // per-row (20 BF16-valued f32 bit patterns, 20 token ids) are copied out of the shared file at receive time.
 int g_want_head = 0;
@@ -95,6 +100,7 @@ uint64_t g_pf_export_len = 0;
 int g_pf_export_slot = -1;
 int g_pullback = -1;
 int g_inflight = 0, g_pf_head = 0;
+int g_pf_cur = 0;  // R71: the conversation slot the chunks in flight belong to
 uint32_t g_pf_rows[2] = {0, 0};
 uint64_t g_pf_pos[2] = {0, 0};
 uint64_t g_pf_next = 0, g_pf_chunks = 0;
@@ -337,6 +343,7 @@ bool read_reply(uint32_t op) {
   }
   uint32_t status;
   memcpy(&status, m + 4, 4);
+  memcpy(&g_reply_us, m + 8, 4);
   memcpy(&g_reply_arg, m + 24, 8);
   if (status) {
     char why[480];
@@ -835,9 +842,10 @@ int stage_split_forward(mlx_array h, mlx_array* out, uint64_t position, int32_t 
   g_forwards++;
   g_copy_us += (t1 - t0) + (now_us() - t2);
   g_rpc_us += t2 - t1 - g_last_hook_us;
+  g_stage_us += double(g_reply_us);
   if (g_forwards % 1000 == 0)
-    fprintf(stderr, "[stage] %llu forwards: rpc %.0f us, copies %.0f us avg; %llu partial commits, %llu seeds; %llu overlapped (%.1f ms Mac work each)\n",
-            (unsigned long long)g_forwards, g_rpc_us / g_forwards, g_copy_us / g_forwards,
+    fprintf(stderr, "[stage] %llu forwards: rpc %.0f us (the stage's own time %.0f us), copies %.0f us avg; %llu partial commits, %llu seeds; %llu overlapped (%.1f ms Mac work each)\n",
+            (unsigned long long)g_forwards, g_rpc_us / g_forwards, g_stage_us / g_forwards, g_copy_us / g_forwards,
             (unsigned long long)g_partials, (unsigned long long)g_seeds, (unsigned long long)g_hooks,
             g_hooks ? g_hook_us / g_hooks / 1e3 : 0.0);
   return 0;
@@ -956,6 +964,37 @@ int stage_split_drop_slot(int slot) {
   g_cur = prev;
   return rc ? -1 : 0;
 }
+// R71: the server's slot k >= 1 views rows [base, base + rows) of slot 0's attention buffers from now on (op 12).
+// keep = 0: the slot is dropped first (its owner, if any, re-seeds at its next forward); keep = 1: it keeps its
+// conversation and only its row count changes (same base). floor0 >= 0: the rows slot 0's request holds at most; if
+// the server's slot 0 holds more (a finished conversation's, which would block the view) they are forgotten first.
+// 0 done, -1 the stage failed (given up).
+int stage_split_slot_view(int slot, uint64_t base, uint64_t rows, int keep, int64_t floor0) {
+  if (g_dead) return -1;
+  if (slot < 1 || slot >= kSlots) return -1;
+  const int prev = g_cur;
+  g_cur = slot;
+  const uint32_t aux = (keep ? 1u : 0u) | (floor0 >= 0 ? 2u : 0u);
+  const int rc = rpc(12, floor0 >= 0 ? uint32_t(floor0) : 0u, base, rows, aux);
+  if (!keep) {
+    g_seq[slot].valid = false;
+    g_seq[slot].rows = 0;
+    g_seq[slot].mirror = 0;
+    g_seq[slot].tok_n = 0;
+    g_pend[slot].outstanding = false;
+    g_pend[slot].stashed = false;
+  }
+  if (!rc && (g_reply_arg & 1)) {
+    // slot 0's leftover rows are gone: its next owner seeds in full
+    g_seq[0].valid = false;
+    g_seq[0].rows = 0;
+    g_seq[0].mirror = 0;
+    g_seq[0].tok_n = 0;
+    fprintf(stderr, "[stage] slot 0: a finished conversation's rows forgotten (slot %d takes rows from %llu)\n", slot, (unsigned long long)base);
+  }
+  g_cur = prev;
+  return rc ? -1 : 0;
+}
 void stage_split_set_wait_hook(stage_wait_hook_fn f) { g_wait_hook = f; }
 // The last forward's head rows (per row 20 BF16-valued f32 bit patterns then 20 token ids); -1 unless it
 // carried them for exactly `rows` rows.
@@ -1001,8 +1040,8 @@ void stage_split_prefill_begin(uint64_t owner) {
 }
 // Whether a prefill chunk at `position` can go to the stage without a seed first.
 int stage_split_prefill_ready(uint64_t position) {
-  if (g_cur != 0) return 0;  // R69: split prefill runs on slot 0 only
-  if (g_inflight) return position == g_pf_next;
+  // R71: on the current slot, whichever it is (slot 0 only before); chunks in flight belong to one slot
+  if (g_inflight) return g_cur == g_pf_cur && position == g_pf_next;
   return g_valid && g_rows == 0 && position == g_base;
 }
 int stage_split_prefill_inflight(void) { return g_inflight; }
@@ -1027,7 +1066,7 @@ int stage_split_prefill_send(mlx_array h, uint64_t position, int32_t rope_delta,
     const char* v = getenv("SUSHI_STAGE_PULLBACK");
     g_pullback = !(v && strcmp(v, "0") == 0);
   }
-  const uint32_t aux = uint32_t(g_pullback) | ((uint32_t(rope_delta) & 0xFFFFFFu) << 8);
+  const uint32_t aux = uint32_t(g_pullback) | (uint32_t(g_cur) << 3) | ((uint32_t(rope_delta) & 0xFFFFFFu) << 8);
   memcpy(g_shm + off, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
   mlx_array_free(c);
   uint8_t m[32] = {};
@@ -1040,6 +1079,7 @@ int stage_split_prefill_send(mlx_array h, uint64_t position, int32_t rope_delta,
   if (!io(m, 32, true)) { mark_dead("socket failure or timeout on prefill send"); return -1; }
   g_pf_rows[slot] = r;
   g_pf_pos[slot] = position;
+  g_pf_cur = g_cur;
   g_inflight++;
   g_pf_next = position + rows;
   g_pf_send_us += now_us() - t0;
@@ -1048,6 +1088,7 @@ int stage_split_prefill_send(mlx_array h, uint64_t position, int32_t rope_delta,
 // The oldest in-flight chunk's stream after layer 47: [1, rows, 10240] in dtype `dt`.
 int stage_split_prefill_recv(mlx_array* out, mlx_dtype dt, mlx_stream s) {
   if (g_dead || !g_inflight) return -1;
+  g_cur = g_pf_cur;  // R71: the reply is for the slot that sent the chunk
   const double t0 = now_us();
   uint8_t m[32];
   if (!io(m, 32, false, 2 * timeout_ms())) { mark_dead("socket failure or timeout on prefill reply"); return -1; }

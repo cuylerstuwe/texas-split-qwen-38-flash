@@ -125,6 +125,16 @@ pub fn stagePrefillEnabled() bool {
     const v = std.c.getenv("SUSHI_STAGE_PREFILL") orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
+/// R71: split prefill on the extra stage slots too, unless SUSHI_STAGE_SLOT_PREFILL=0 (then their requests prefill on
+/// the Mac and seed the slot afterwards, as R69 did).
+var stage_slot_prefill_env: ?bool = null;
+pub fn stageSlotPrefillEnabled() bool {
+    if (stage_slot_prefill_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_SLOT_PREFILL");
+    const v = if (raw) |r| !std.mem.eql(u8, std.mem.span(r), "0") else true;
+    stage_slot_prefill_env = v;
+    return v;
+}
 /// R60 S4: split decode is on unless SUSHI_STAGE_DECODE=0 (then decode runs every layer on the Mac,
 /// which after a split prefill needs the pull-back).
 pub fn stageDecodeEnabled() bool {
@@ -372,6 +382,14 @@ pub fn stageSlotOf(owner: u64) u32 {
 pub fn stageSelectOwner(owner: u64) void {
     if (stageSlots() < 2) return;
     stage_split_select_owner(owner);
+}
+extern "c" fn stage_split_slot_view(slot: c_int, base: u64, rows: u64, keep: c_int, floor0: i64) c_int;
+/// R71: the stage's slot `slot` >= 1 views rows [base, base + rows) of the attention buffers from now on. `keep`: it
+/// keeps its conversation (same base, another row count); otherwise it is dropped first. `floor0`: the rows slot 0's
+/// request holds at most (a finished conversation's rows above that on slot 0 are forgotten). false: the stage failed.
+pub fn stageSlotView(slot: usize, base: usize, rows: usize, keep: bool, floor0: ?usize) bool {
+    if (stageSlots() < 2 or slot == 0) return false;
+    return stage_split_slot_view(@intCast(slot), @intCast(base), @intCast(rows), @intFromBool(keep), if (floor0) |f| @intCast(f) else -1) == 0;
 }
 /// R69: free the stage's slot `slot` >= 1 (its owner re-seeds at its next forward); false: the stage failed.
 pub fn stageDropSlot(slot: usize) bool {

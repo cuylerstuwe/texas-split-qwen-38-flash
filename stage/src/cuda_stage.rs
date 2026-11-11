@@ -257,6 +257,53 @@ impl<'m, 'd> Stage<'m, 'd> {
         self.active.set(slot);
         Ok(())
     }
+    /// R71: re-point the active slot (not slot 0) to rows [base, base + rows) of slot 0's attention buffers. `keep`:
+    /// it keeps its conversation (same base, more or fewer rows); otherwise it is dropped first. The caller drops the
+    /// slot's captured graphs.
+    pub fn set_slot_view(&self, base: usize, rows: usize, keep: bool) -> Result<()> {
+        let slot = self.active.get();
+        ensure!(slot != 0, "slot 0's rows are fixed");
+        if !keep {
+            self.drop_slot()?;
+        }
+        for l in &self.layers {
+            if let StageLayer::Attention(at) = l {
+                at.set_slot_view(slot, base, rows, keep)?;
+            }
+        }
+        Ok(())
+    }
+    /// R71: slot 0's conversation holds at most `keep` rows as far as the client knows; more rows on the stage are a
+    /// finished conversation's (slot 0 is never dropped, so they stay until the next seed). Forget them: slot 0 then
+    /// holds nothing and its next seed or prefill starts it again. True when it was dropped.
+    pub fn trim_slot0(&self, keep: usize) -> Result<bool> {
+        let live = self.layers.iter().filter_map(|l| match l {
+            StageLayer::Attention(at) => Some(at.live_rows(0)),
+            _ => None,
+        }).max().unwrap_or(0);
+        if live <= keep {
+            return Ok(false);
+        }
+        let prev = self.active.get();
+        self.select(0)?;
+        for l in &self.layers {
+            match l {
+                StageLayer::Recurrent(r) => r.drop_slot_state(),
+                StageLayer::Attention(at) => at.drop_slot_state(),
+            }
+        }
+        self.slot_rows[0].set(0);
+        self.slot_position[0].set(0);
+        self.select(prev)?;
+        Ok(true)
+    }
+    /// R71: the rows of slot 0's attention buffers that `slot` (1..) views: (base, rows).
+    pub fn slot_view(&self, slot: usize) -> Option<(usize, usize)> {
+        self.layers.iter().find_map(|l| match l {
+            StageLayer::Attention(at) => Some(at.slot_view(slot)),
+            _ => None,
+        })
+    }
     /// R69: the active slot (not slot 0) holds nothing from now on (slot 0 may grow into its views again).
     pub fn drop_slot(&self) -> Result<()> {
         ensure!(self.active.get() != 0, "slot 0 is never dropped");

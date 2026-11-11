@@ -114,25 +114,39 @@ requests switch in 0.2–0.5 s.
 ## Several requests at once
 
 By default one request generates at a time. With `TEXAS_SPLIT_MAX_CONCURRENT` above 1 the stage is launched with
-up to four conversation slots and Sushi's scheduler places requests on them (`sushi/FORK.md` §12):
+up to four conversation slots and Sushi's scheduler places requests on them (`sushi/FORK.md` §12 and §14):
 
-- **Slots.** Slot 0 is the stage's whole state, as with one slot. An extra slot is a fixed number of rows viewed
-  out of the top of slot 0's K/V and pooled-key buffers, plus its own recurrent state and verify-row state
-  (~45 MiB), so extra conversations use only memory a lone one does not need. Slot 0 may grow up to the lowest
-  occupied extra slot; before a request would cross that line, the extra slot's request is moved to the Mac
-  (its rows pulled back first). Later slots verify fewer rows per round (9, 9, 4, 4) because each (slot, rows)
-  graph stays resident on the card.
+- **Slots.** Slot 0 is the stage's whole state, as with one slot. An extra slot is a range of rows viewed out of
+  slot 0's K/V and pooled-key buffers, plus its own recurrent state and verify-row state (~45 MiB), so extra
+  conversations use only memory a lone one does not need. The range is set when a request claims the slot (stage
+  op 12): the request's tokens, a reply reserve that shrinks from 16,384 rows until it fits, and a margin, taken
+  from the highest free rows above slot 0's request. All conversations on the 5090 share its 262,144 rows. A
+  request that outgrows its rows gets more in place if the rows above are free, else moves to other free rows
+  (pulled back, then seeded again), else moves to the Mac; slot 0 may grow up to the lowest occupied extra slot,
+  and an extra slot in its way moves or leaves the same way. The stage refuses rows that overlap another
+  conversation's. Later slots verify fewer rows per round (9, 9, 4, 4) because each (slot, rows) graph stays
+  resident on the card.
 - **Interleaved rounds.** A decode round has a Mac half (drafts, layers 0–27, send) and a 5090 half. With two
-  or more slot holders the scheduler runs every holder's first half in turn, then the requests that live on the
-  Mac, then the second halves (receive, accept, sample), so each holder's 5090 time passes while the Mac works
-  for the others. A round of two holders takes ~35 ms, of four ~63 ms. The Mac is the limit: its layers 0–27 run
-  once per request per round, which is why the total settles near 132 tok/s with three or four requests.
-- **Placement.** A request claims slot 0 if it is free, else the first free extra slot it fits; otherwise it
-  runs every layer on the Mac, batched with the other Mac-side requests. When a slot's request ends, the
-  Mac-side request with the most tokens left takes the slot (seeded from Sushi's caches); a request left alone
-  on a narrower extra slot moves to slot 0, so a lone request always runs the single-request path. Requests on
-  extra slots prefill on the Mac, and extra-slot holders pause while slot 0's request prefills through the 5090.
+  or more slot holders the scheduler runs every holder's first half in turn, then alternates each holder's second
+  half (receive, accept, sample, the next drafts) with its next first half for a few rounds per tick, so each
+  holder's 5090 time passes while the Mac works for the others and only the tick's last second half waits. A
+  round of two holders takes ~34 ms at 20–54K contexts, of four ~69 ms at 20–77K. The Mac is the limit: its
+  layers 0–27 run once per request per round, the same time as for that request alone, and the 5090 is busy
+  about a third of the time.
+- **Prefill.** Every request on a slot prefills through the 5090 as a lone request does, on its own slot, one
+  request at a time. While a prefill has chunks on the stage the requests decoding there pause (the socket
+  carries one stream of replies, and the Mac's layers 0–27 are the shared resource either way), so a cold
+  54K-token prompt holds the other streams for about 15 s; requests on the Mac get one decode tick per chunk.
+- **Placement.** A request claims slot 0 if it is free, else a free extra slot when rows for it are free;
+  otherwise it runs every layer on the Mac, batched with the other Mac-side requests. When a slot or rows come
+  free, the Mac-side request with the most tokens left that fits takes them (seeded from Sushi's caches) at the
+  next tick; a request left alone on a narrower extra slot moves to slot 0 if it has at least 256 tokens to go,
+  so a lone request runs the single-request path. Slots that ended are freed on the stage before the next claim.
 - **Background requests** run alone, on slot 0, and park exactly as with one request at a time.
+- **What it is worth.** On decode alone with short prompts the total rises from ~100 tok/s to ~120 with two
+  requests and ~132 with three or four. On agent-shaped sessions (long prompts, about 40% of the time in
+  prefill, which gains nothing from concurrency because the Mac is saturated either way) two sessions side by side
+  run 1.07× as fast as one after the other, four 1.16× (docs/VALIDATION.md).
 
 ## Failure handling
 

@@ -184,8 +184,9 @@ struct AttnSeq<'d> {
     pooled: Buffer<'d>,
     tail: Buffer<'d>,
     next_tail: Buffer<'d>,
-    capacity: usize,
-    slot_base: usize,
+    /// R71: in cells: an extra slot's rows can be re-pointed (`set_slot_view`)
+    capacity: Cell<usize>,
+    slot_base: Cell<usize>,
     position: Cell<Option<Position>>,
     rows: Cell<usize>,
     epoch: Cell<u64>,
@@ -351,8 +352,8 @@ impl<'m, 'd> Attention<'m, 'd> {
                 pooled,
                 tail,
                 next_tail,
-                capacity,
-                slot_base: 0,
+                capacity: Cell::new(capacity),
+                slot_base: Cell::new(0),
                 position: Cell::new(None),
                 rows: Cell::new(0),
                 epoch: Cell::new(0),
@@ -401,15 +402,15 @@ impl<'m, 'd> Attention<'m, 'd> {
     /// R69: rows the active slot may hold: slot 0 stops below the views of an occupied slot.
     fn limit(&self) -> usize {
         if self.active.get() != 0 {
-            return self.sq().capacity;
+            return self.sq().capacity.get();
         }
-        self.seqs[1..].iter().filter(|o| o.position.get().is_some()).map(|o| o.slot_base).min().unwrap_or(self.seqs[0].capacity)
+        self.seqs[1..].iter().filter(|o| o.position.get().is_some()).map(|o| o.slot_base.get()).min().unwrap_or(self.seqs[0].capacity.get())
     }
     /// R69: add a conversation slot of `rows` rows whose KV and pooled keys are views into the top `rows` rows of slot
     /// 0's buffers (no new KV memory); its QSA tails are its own.
     pub(crate) fn add_slot_view(&mut self, rows: usize) -> Result<usize> {
-        let cap = self.seqs[0].capacity;
-        let used: usize = self.seqs[1..].iter().map(|o| o.capacity).sum();
+        let cap = self.seqs[0].capacity.get();
+        let used: usize = self.seqs[1..].iter().map(|o| o.capacity.get()).sum();
         ensure!(rows >= 4 * a::MAX_ROWS && rows % 4 == 0 && rows + used + 4 * a::MAX_ROWS <= cap, "attention slot rows");
         let base = cap - used - rows;
         ensure!(base % 4 == 0, "attention slot base alignment");
@@ -429,8 +430,8 @@ impl<'m, 'd> Attention<'m, 'd> {
             pooled: s0.pooled.view(base / 4 * qsa::D * 2, rows / 4 * qsa::D * 2 + GUARD)?,
             tail: self.d.alloc(3 * qsa::D * 2 + GUARD)?,
             next_tail: self.d.alloc(3 * qsa::D * 2 + GUARD)?,
-            capacity: rows,
-            slot_base: base,
+            capacity: Cell::new(rows),
+            slot_base: Cell::new(base),
             position: Cell::new(None),
             rows: Cell::new(0),
             epoch: Cell::new(0),
@@ -453,15 +454,62 @@ impl<'m, 'd> Attention<'m, 'd> {
         sq.valid.set(None);
         sq.epoch.set(sq.epoch.get() + 1);
     }
-    /// R69: a seed into slot 1.. must not overlap slot 0's live rows.
+    /// R69: a seed into slot 1.. must not overlap slot 0's live rows; R71: nor another occupied slot's rows (slot views
+    /// move, `set_slot_view`).
     fn slot_seed_check(&self) -> Result<()> {
         if self.active.get() == 0 {
             return Ok(());
         }
-        let base = self.sq().slot_base;
+        self.slot_overlap_check(self.active.get(), self.sq().slot_base.get(), self.sq().capacity.get())
+    }
+    /// R71: rows [base, base + rows) as slot `slot`'s view: above slot 0's live rows and disjoint from every other
+    /// occupied slot's view.
+    fn slot_overlap_check(&self, slot: usize, base: usize, rows: usize) -> Result<()> {
         let s0 = &self.seqs[0];
         let live0 = s0.position.get().map_or(0, |p| p.len) + s0.rows.get();
-        ensure!(live0 <= base, "attention slot {} views overlap slot 0's rows ({live0} > {base})", self.active.get());
+        ensure!(live0 <= base, "attention slot {slot} views overlap slot 0's rows ({live0} > {base})");
+        for (j, o) in self.seqs.iter().enumerate().skip(1) {
+            if j == slot || o.position.get().is_none() {
+                continue;
+            }
+            let (b, c) = (o.slot_base.get(), o.capacity.get());
+            ensure!(base + rows <= b || b + c <= base, "attention slot {slot} rows [{base}, +{rows}) overlap slot {j}'s [{b}, +{c})");
+        }
+        Ok(())
+    }
+    /// R71: rows slot `slot` holds (committed and pending).
+    pub(crate) fn live_rows(&self, slot: usize) -> usize {
+        let q = &self.seqs[slot];
+        q.position.get().map_or(0, |p| p.len) + q.rows.get()
+    }
+    /// R71: rows of slot 0's buffers that slot `slot` (1..) views.
+    pub(crate) fn slot_view(&self, slot: usize) -> (usize, usize) {
+        (self.seqs[slot].slot_base.get(), self.seqs[slot].capacity.get())
+    }
+    /// R71: re-point slot `slot` (1..) to rows [base, base + rows) of slot 0's buffers. `keep`: the slot keeps what it
+    /// holds, so only its row count may change (same base, at least the rows it holds); otherwise it must hold nothing
+    /// (drop it first). Recorded calls and captured graphs of the slot go stale: the caller drops them.
+    pub(crate) fn set_slot_view(&self, slot: usize, base: usize, rows: usize, keep: bool) -> Result<()> {
+        ensure!(slot >= 1 && slot < self.seqs.len(), "attention slot view: slot {slot} of {}", self.seqs.len());
+        let cap = self.seqs[0].capacity.get();
+        ensure!(rows >= 4 * a::MAX_ROWS && rows % 4 == 0 && base % 4 == 0 && base + rows <= cap, "attention slot view [{base}, +{rows}) of {cap}");
+        let q = &self.seqs[slot];
+        let held = q.position.get().map_or(0, |p| p.len) + q.rows.get();
+        if keep {
+            ensure!(base == q.slot_base.get() && rows >= held + a::MAX_ROWS, "attention slot {slot} keeps {held} rows at {}: view [{base}, +{rows})", q.slot_base.get());
+        } else {
+            ensure!(q.position.get().is_none() && q.rows.get() == 0, "attention slot {slot} still holds {held} rows");
+        }
+        self.slot_overlap_check(slot, base, rows)?;
+        let s0 = &self.seqs[0];
+        for (view, root) in [(&q.k, &s0.k), (&q.v, &s0.v)] {
+            view.codes.retarget(&root.codes, base * a::KV, rows * a::KV + GUARD)?;
+            view.scales.retarget(&root.scales, base * a::META * 2, rows * a::META * 2 + GUARD)?;
+            view.biases.retarget(&root.biases, base * a::META * 2, rows * a::META * 2 + GUARD)?;
+        }
+        q.pooled.retarget(&s0.pooled, base / 4 * qsa::D * 2, rows / 4 * qsa::D * 2 + GUARD)?;
+        q.capacity.set(rows);
+        q.slot_base.set(base);
         Ok(())
     }
     /// R60 S4: rotary offset for the next appended rows (see `rope_delta`).
@@ -498,7 +546,7 @@ impl<'m, 'd> Attention<'m, 'd> {
         .chain(self.prj().iter().flat_map(|p| [&p.f, &p.b]))
         .map(|b| b.byte_len())
         .sum();
-        json!({"cubin_sha256":SHA,"capacity":self.sq().capacity,"extra_bytes":extra,"KV_cache_bytes":self.sq().k.bytes()+self.sq().v.bytes(),"projections":self.linears.iter().map(|l|l.description()).collect::<Vec<_>>(),"kernels":self.kernels.iter().map(|k|k.description()).collect::<Vec<_>>(),"host_activation_or_selection_handoffs":0,"state":"append-only candidate KV/pooled cache; metadata prefix and GPU tail gather/restore","selector":"bounded radix8 threshold plus stable ID compaction","scope":"full attention sublayer, no HC/MoE/model sampling"})
+        json!({"cubin_sha256":SHA,"capacity":self.sq().capacity.get(),"extra_bytes":extra,"KV_cache_bytes":self.sq().k.bytes()+self.sq().v.bytes(),"projections":self.linears.iter().map(|l|l.description()).collect::<Vec<_>>(),"kernels":self.kernels.iter().map(|k|k.description()).collect::<Vec<_>>(),"host_activation_or_selection_handoffs":0,"state":"append-only candidate KV/pooled cache; metadata prefix and GPU tail gather/restore","selector":"bounded radix8 threshold plus stable ID compaction","scope":"full attention sublayer, no HC/MoE/model sampling"})
     }
     fn invalidate(&self) {
         self.sq().rows.set(0);
@@ -760,7 +808,7 @@ impl<'m, 'd> Attention<'m, 'd> {
                         Arg::Buffer(&self.scores),
                         Arg::U32(nb as u32),
                     ],
-                    [if stable { (self.sq().capacity / 4).div_ceil(4) } else { nb.div_ceil(4) } as u32, rows as u32, 1],
+                    [if stable { (self.sq().capacity.get() / 4).div_ceil(4) } else { nb.div_ceil(4) } as u32, rows as u32, 1],
                     [128, 1, 1],
                 )?);
             }
@@ -1276,7 +1324,7 @@ impl<'m, 'd> Attention<'m, 'd> {
     /// tail and `finish_prefill` advances the position.
     pub(crate) fn record_prefill<'a>(&'a self, s: &'a AttnScratch<'d>, x: &'a Buffer<'d>, rows: usize) -> Result<Vec<PreparedCall<'a, 'm, 'd>>> {
         let pos = self.admit_prefill(rows)?;
-        ensure!(rows <= s.rows && s.capacity >= self.sq().capacity && x.byte_len() >= rows * a::H * 2, "attention prefill shape");
+        ensure!(rows <= s.rows && s.capacity >= self.sq().capacity.get() && x.byte_len() >= rows * a::H * 2, "attention prefill shape");
         ensure!(s.proj.iter().all(|(f, b)| !x.aliases(f) && !x.aliases(b)), "attention prefill alias");
         let m8 = self.multi8.as_ref().ok_or_else(|| anyhow::anyhow!("attention prefill needs the canonical affine8 layer"))?;
         ensure!(self.part8.is_some(), "attention prefill needs attn8_part");
@@ -1421,7 +1469,7 @@ impl<'m, 'd> Attention<'m, 'd> {
     /// key codes, key scales, key biases, value codes, value scales, value biases) and the pooled
     /// index blocks [from/4, to/4) to `out`.
     pub(crate) fn export_prefill_rows(&self, from: usize, to: usize, out: &mut Vec<u8>) -> Result<()> {
-        ensure!(from < to && to <= self.sq().capacity, "attention export rows");
+        ensure!(from < to && to <= self.sq().capacity.get(), "attention export rows");
         let n = to - from;
         for (buf, width) in [(&self.sq().k.codes, a::KV), (&self.sq().k.scales, a::META * 2), (&self.sq().k.biases, a::META * 2),
             (&self.sq().v.codes, a::KV), (&self.sq().v.scales, a::META * 2), (&self.sq().v.biases, a::META * 2)] {

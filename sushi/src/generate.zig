@@ -2891,8 +2891,9 @@ pub const Generator = struct {
             const first = options.ssm_checkpoint_pos_offset;
             break :blk qwen4_forward.mropeTextDelta(mp, ctx.mrope_total, first - first % 4, first + prompt_ids.len);
         } else null;
-        // R69: a request decoding on stage slot 1 prefills on the Mac (the stage's prefill path is slot 0's)
-        const split_prefill_env = options.stage_allowed and qwen4_forward.stagePrefillEnabled() and (!has_vision or mrope_text_delta != null) and glm_request == null and (ctx.mrope_pos == null or mrope_text_delta != null) and qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&ctx)) == 0;
+        // R71: a request on an extra stage slot prefills through the stage too (SUSHI_STAGE_SLOT_PREFILL=0: on the Mac,
+        // as R69 did)
+        const split_prefill_env = options.stage_allowed and qwen4_forward.stagePrefillEnabled() and (!has_vision or mrope_text_delta != null) and glm_request == null and (ctx.mrope_pos == null or mrope_text_delta != null) and (qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&ctx)) == 0 or qwen4_forward.stageSlotPrefillEnabled());
         const want_ssm_cp = !(split_prefill_env and !qwen4_forward.stagePullbackEnabled()) and shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,

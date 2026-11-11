@@ -244,9 +244,82 @@ is dropped; a cancelled stream frees the engine.
   finished on the Mac; the split came back), `FAULT_NONCE=x fault.py prefill` (the stage killed 4 s into a cold
   124K-token prefill; the Mac finished it correctly in 66.7 s) and `fault.py long` (above).
 
+## 2026-11-11 update, later (see CHANGELOG.md)
+
+- **Agent-shaped sessions side by side.** The two recorded agent sessions of the first table, replayed through
+  the host as an agent client drives it (each turn = everything before it plus that turn's new prompt tokens;
+  session A adds 20K, 8K and 5K tokens over three turns, session B 54K, 10K and 10K; 1,024 tokens generated per
+  turn; thinking sampler; one seed), several at once against the same sessions one after another on the same
+  host. A repeated session gets its own first tokens so nothing is shared between copies.
+
+  | arrangement | previous build | this build |
+  |---|---|---|
+  | A and B, two requests at once | 96.1 s (one after the other 89.3 s): 0.93× | 87.8 s (one after the other 94.0 s): **1.07×** |
+  | A, A, B, B, four at once | 200.5 s (two serial pairs ~175 s): ~0.88× | 162.5 s (two serial pairs ~188 s): **1.16×** |
+
+  Single runs; the previous build's were measured in the morning and this build's at noon, on a Mac that was also
+  in interactive use (its serial pair went from 86-89 s to 94 s), so the ratios are the result. With only the
+  prefill change in, on the morning's quieter machine, two at once took 79.8 s against 86.0 s serial. Where the
+  previous build lost: the sum of times to first token was 55.7 s with two at once against 32.3 s serial (the
+  second request's prompts prefilled on the Mac alone), and in the four-session run the longer session's later
+  turns (66K and 77K tokens) did not fit a 65,536-row slot and ran on the Mac.
+- **Rounds per tick.** `SUSHI_STAGE_GROUP_ROUNDS=alt` switches between one and four rounds per tick every 128
+  rounds inside one process, with two requests decoding at 20K and 54K contexts: 39.82 ms per round (504 rounds)
+  against 34.39 ms (384 rounds), +15.8% rounds per second; each of the three trace windows agrees.
+- **A request's Mac time per round is the same on a slot as alone.** Two requests on slots (1,600 rounds at
+  20-54K contexts): layers 0-27 and the send 16.2 ms, the receive and head rows 0.7 ms, accept, commit and the
+  next drafts 1.8 ms. The same request alone at 54K: verify 23.4-24.0 ms of which ~6 on the 5090, the rest 1.9 ms.
+- **One request at a time is unchanged.** Interleaved against the previous binaries (previous, new, new,
+  previous; a fresh host and cache each): the greedy four-turn conversation's replies identical in every arm;
+  cold 23K-token first token 7.5 / 7.5 s (previous) and 6.9 / 7.4 s (new); three more cold prefills per arm
+  6.8-8.3 s and 6.7-7.3 s; warm turns 0.48-0.58 s everywhere.
+- **Sampled replies are unchanged too.** 30 seeded tool-call requests at the thinking sampler (fixed-depth MTP,
+  four slots): reasoning, content, tool names and arguments, finish reason and token counts identical between
+  the previous binaries and these.
+- **Prefill through slots 1-3 is exact.** Four staggered greedy requests (8-9K-token prompts), cold, each
+  prefilling through its own slot: byte-identical to their solo runs. The greedy four-turn conversation forced
+  onto slot 1 (`SUSHI_STAGE_FORCE_SLOT1=1`: a 23K-token cold prefill and three warm turns): identical to the
+  reference, cold first token 6.55 s against 6.61 s.
+- **Slot rows under pressure** (`SUSHI_STAGE_CAPACITY=80000`, `SUSHI_STAGE_SLOT_RESERVE=512`, greedy copy tasks, a
+  request on slot 0 for the whole run): one request's slot grew in place and another's moved to other rows
+  mid-reply; all four replies (up to 8,000 tokens) byte-identical to their solo runs.
+- **Leftover rows.** A 28K-token conversation ends on slot 0; an image request then takes slot 0 without touching
+  the stage (`SUSHI_STAGE_MROPE=0`) and a text request's slot needs rows below the leftover ones: the stage
+  forgets them, the reply matches its solo run, the split stays up. And the burst case of the changelog: with
+  `SUSHI_STAGE_CAPACITY=60000`, two requests (the one on the extra slot ending last), then a 51.6K-token request
+  alone: on the previous build its prefill was refused at row 48,234 and it re-ran on the Mac (40.5 s to first
+  token, the split given up); on this build it prefills through the 5090 (14-16 s).
+- **Stage failure with several requests** (four slots, greedy copy tasks; every stream ended without an error and
+  kept copying exactly):
+
+  | scenario | result |
+  |---|---|
+  | four requests on slots, several rounds per tick, stage killed | paused 4.0 / 16.7 / 12.1 / 8.2 s, then continued |
+  | stage frozen (SIGSTOP) with three on slots | the 20 s timeout fired; paused 24.6 / 28.8 / 32.7 s, then continued |
+  | stage killed while a second request prefilled a 56K-token prompt on an extra slot | that prefill restarted on the Mac (34 s to first token); the request decoding on slot 0 re-ran after it (37.8 s pause) |
+
+- **Does drafting change what the model says?** Prompted by a `smoke.py` reply that made no tool call and
+  reasoned about an instruction that is not in the prompt. The streamed tool-call request, unseeded, 300 times
+  per arm on the same binaries:
+
+  | | called `read_file` | called `run_shell` first | no tool call |
+  |---|---|---|---|
+  | plain decode (`enable_mtp` false) | 281 | 16 (5.3%) | 3 (1.0%) |
+  | adaptive MTP (the default) | 282 | 15 (5.0%) | 3 (1.0%) |
+  | fixed-depth MTP | 280 | 17 (5.7%) | 3 (1.0%) |
+
+  The same mix with and without drafting: it is the model at temperature 1. (Arms of 120 had read 14 against 2
+  for the middle column, which is what that size gives.) `smoke.py` now accepts either tool and asks again when a
+  reply makes no call.
+- **Qualification of this build:** priority suite 8/8 exact with SSD parking (6 pauses, no park errors) with one
+  request at a time and with four; smoke.py 10/10 in both; and on the installed service with four at once:
+  smoke.py 10/10, `fault.py term`, `FAULT_NONCE=x fault.py prefill` and `fault.py long` (116 of 116 copied lines,
+  83 after the fault) clean, the host restoring the split by itself after each.
+
 ## Not covered
 
 Sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated by
 killing and freezing the stage server), recovery of parked requests after a crash or reboot, other GPUs or
-Macs. With several requests at once: more than eight together, a mix of long prefills and decoding requests
-under sustained load, and an end-to-end smoke test (`smoke.py`'s `queue_concurrent` expects one at a time).
+Macs. With several requests at once: more than eight together, sustained load, more than one seed of the
+agent-session comparison, and conversations that together need more than the stage's 262,144 rows (the overflow
+runs on the Mac; not timed).
