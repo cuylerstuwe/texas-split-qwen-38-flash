@@ -1,6 +1,7 @@
 <img width="330" alt="image" src="https://github.com/user-attachments/assets/9532d96b-f52e-4451-8ab0-751e06acb89a" />
 
-# texas-split — Qwen3.8-Flash-Next across an M5 Max and an RTX 5090
+# texas-split
+### Qwen3.8-Flash-Next across an M5 Max and an RTX 5090
 
 **texas-split runs [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) on an Apple Silicon
 Mac with an NVIDIA RTX 5090 attached over Thunderbolt, splitting the model between them.** The Mac runs
