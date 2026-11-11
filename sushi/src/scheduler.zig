@@ -525,6 +525,9 @@ pub const Slot = struct {
     /// t1 streamed at the MTP prefill handover; the first block still commits it, and its
     /// echo is not published twice (`takeHandoverEcho`).
     handover_token: ?u32 = null,
+    /// texas-split: the stage was given up while this request's layers [first, 48) lived there. It re-runs from its
+    /// tokens on the Mac before its next tick (`stageRecoverMarked`); no decode tick takes it until then.
+    stage_recover_pending: bool = false,
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
@@ -1332,7 +1335,14 @@ pub const Scheduler = struct {
     /// requests because that path is bit-identical to legacy and supports
     /// speculative decoding (which the batched kernel doesn't).
     force_batched: bool,
+    /// R67 multi-stream: the request whose forwards run layers [first, 48) on the 5090 stage (`stageHolderClaim`).
+    stage_holder: ?*Slot = null,
 
+    /// R69 (several stage slots): the requests decoding on the stage's slots 1.. (index k = slot k + 1), interleaved
+    /// with `stage_holder` (slot 0).
+    stage_extra: [STAGE_EXTRA_MAX]?*Slot = @splat(null),
+    /// R69: extra slot k ended with nobody to pass it to: free it on the stage at the next tick (not inside a stage wait).
+    stage_slot_drop: [STAGE_EXTRA_MAX]bool = @splat(false),
     queue_mu: std.Io.Mutex,
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
@@ -5271,13 +5281,20 @@ const InferenceTickState = struct {
 fn admitNativePendingLocked(sch: *Scheduler, out: []*Slot) usize {
     // Texas keeps the qualified solo foreground path while one background
     // stack may be suspended. Priority never changes a request's batch kernel.
+    // R67 multi-stream: up to --max-concurrent foregrounds live at once (one holds the 5090 stage, the others run on
+    // the Mac); a background still never runs beside live work. At 1 this is the solo path unchanged.
+    var live_fg: usize = 0;
     for ([_][]*Slot{ sch.prefilling.items, sch.decoding.items }) |slots| {
-        for (slots) |s| if (!s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) return 0;
+        for (slots) |s| if (!s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) {
+            live_fg += 1;
+        };
     }
+    if (live_fg >= @max(@as(usize, sch.max_concurrent), 1)) return 0;
     var selected: ?usize = null;
     for (sch.pending.items, 0..) |s, i| {
         if (!s.background) { selected = i; break; }
     }
+    if (live_fg > 0 and selected == null) return 0;
     if (selected == null and !texas_priority.nested and !texas_priority.held()) {
         var live = false;
         for (sch.decoding.items) |s| if (!s.finished and s.error_code == null and !s.cancelled.load(.acquire)) { live = true; };
@@ -5453,6 +5470,21 @@ fn nativeBoundary(sch: *Scheduler, slot: *Slot, forward: *ForwardCtx, mc: ?*gene
     while (true) {
         texas_priority.set(.state, 2);
         nativeStagePark(slot, forward);
+        // R69 multi-stream: while this request is parked the foregrounds take the stage (slot 0 too); it claims slot 0
+        // again when it resumes (its parked stage half restores at its next stage call).
+        const held_slot0 = stageMultiStream(sch) and stageHolderIs(sch, slot);
+        if (held_slot0) sch.stage_holder = null;
+        defer if (held_slot0) {
+            stageReapEnded(sch, slot);
+            if (sch.stage_holder == null) {
+                sch.stage_holder = slot;
+            } else if (!stageHolderIs(sch, slot)) {
+                // cannot happen while backgrounds only resume with no foreground live: its layers [first, 48) are parked
+                // for the stage, so without slot 0 the split is given up and it re-runs on the Mac
+                log.err("[stage] a resumed background found slot 0 taken; giving the stage up\n", .{});
+                stage_split_give_up("resumed background without slot 0");
+            }
+        };
         var active_before: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_before);
         var parked = texas_priority.Parked.create(&roots, &protected, slot.request_id);
@@ -5557,6 +5589,7 @@ fn inferenceTick(sch: *Scheduler, state: *InferenceTickState) bool {
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+            stageHolderRelease(sch, s); // R67: a decode-phase cancel never reaches finishSlot
             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
         }
         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
@@ -5777,22 +5810,15 @@ fn inferenceTick(sch: *Scheduler, state: *InferenceTickState) bool {
         //    throughput a user actually observes (their stream advances at
         //    the tick cadence regardless of how many peers share it).
         if (active.items.len > 0) {
+            // texas-split: requests a tick hosted inside a prefill left marked after a stage failure re-run first
+            stageRecoverMarked(sch, active.items);
             var decode_sw = io_util.Stopwatch.init(sch.io);
             runDecodeTick(sch, active.items) catch |err| {
                 if (isStageSplitError(err)) {
                     stage_split_give_up("split decode failed in the scheduler");
                     log.warn("[stage] decode tick failed ({s}); continuing the stream on the Mac\n", .{@errorName(err)});
-                    for (active.items) |s| {
-                        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
-                        stageRecoverDecodingSlot(sch, s) catch |e| {
-                            if (e == error.Cancelled) {
-                                finishSlot(sch, s, "cancelled");
-                            } else {
-                                log.err("[stage] Mac-only recovery failed: {s}\n", .{@errorName(e)});
-                                s.markError(@errorName(e));
-                            }
-                        };
-                    }
+                    stageMarkRecover(sch, active.items);
+                    stageRecoverMarked(sch, active.items);
                 } else {
                     log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
                     for (active.items) |s| s.markError(@errorName(err));
@@ -6292,21 +6318,89 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const n_gen = gen_ptr.generated_ids.items.len;
     if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
-    // Construct the full token sequence: the original prompt + everything
-    // generated this turn. The cache reflects exactly this state — Generator
-    // forwarded each emitted token into slot.cache as it was sampled.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
-    const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
-    defer sch.allocator.free(total_tokens);
-    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
-
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
-    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    // R66d: the stop token the trunk already forwarded (an accepted EOS draft, or the pipelined lookahead): it is in
+    // the KV, so the entry's tokens carry it and a checkpoint after it can restore.
+    var end_eos: ?u32 = null;
+    // R66d (SUSHI_STAGE_PULLBACK_END=1): the 5090 holds this turn's reply in layers 28-47 only, so the entry was whole
+    // only to the prompt and the next turn re-prefilled the reply. Copy it back and take a checkpoint at its end: the
+    // next turn resumes there, and the entry can persist.
+    if (qwen4_forward.stagePullbackEndEnabled()) end_cp: {
+        const ents = slot.ssm_entries orelse break :end_cp;
+        const xf = slot.model.transformer orelse break :end_cp;
+        const end_pos = qwen4_forward.stagePullbackTurnEnd(xf, &slot.cache, ents) orelse break :end_cp;
+        if (ssm_cps_slice.len > 0 and ssm_cps_slice[ssm_cps_slice.len - 1].pos >= end_pos) break :end_cp;
+        // A checkpoint restores only within the entry's tokens: one row past them is the forwarded stop token.
+        const token_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+        if (end_pos == token_len + 1 and generate_mod.isEosId(gen_ptr.next_token_id, slot.eos_token_ids)) {
+            end_eos = gen_ptr.next_token_id;
+        } else if (end_pos > token_len) break :end_cp;
+        // The MTP head's last round sits in its deferred stash (the next round would append it): apply it, or the
+        // head's committed history ends short of `end_pos` and the next turn's restore there cannot adopt it.
+        gen_ptr.mtpDetachHead(slot.allocator, true) catch |err| {
+            log.warn("[hot-cache] end-of-turn MTP stash not applied: {s}\n", .{@errorName(err)});
+        };
+        // ... and its last pair (the stop token after the trunk's last row). The checkpoint goes in only where the head's
+        // committed history reaches it: the next turn restores the head with it, or the head drafts from a short history
+        // (measured: -24% tokens per round when it restarted at every turn).
+        if (gen_ptr.mtp_cache != null) {
+            // the token at `end_pos` in the next turn's prompt: still in this entry (the trunk had not forwarded the
+            // reply's last token), else the chat template's end of the assistant message (after a stop token, or a
+            // reply cut on length, the client's history renders "<|im_end|>" there)
+            const n_prompt = slot.full_prompt.len;
+            const next_tok: ?u32 = if (end_eos != null) null else if (end_pos < token_len)
+                (if (end_pos >= n_prompt) gen_ptr.generated_ids.items[end_pos - n_prompt] else slot.full_prompt[end_pos])
+            else slot.model.tokenizer.?.specialTokenId("<|im_end|>");
+            if (next_tok) |t| gen_ptr.mtpAppendFinalPair(t) catch |err| log.warn("[hot-cache] end-of-turn MTP pair not appended: {s}\n", .{@errorName(err)});
+            // the head's QSA leftover at the checkpoint, as a prefill checkpoint marks it: without it the head restores
+            // blind to its open group there (measured: -27% tokens per round)
+            if (gen_ptr.mtp_cache) |*mc| mc.activate();
+            xf.qwen4MtpMarkQsaLeftover(end_pos -| gen_ptr.mtp_position_base) catch |err|
+                log.warn("[hot-cache] end-of-turn MTP leftover not marked: {s}\n", .{@errorName(err)});
+            const head_end = gen_ptr.mtp_position_base + gen_ptr.mtpCommittedHistoryLen();
+            if (head_end != end_pos) {
+                log.info("  [hot-cache] no end-of-turn checkpoint: the MTP head ends at {d}, the trunk at {d}\n", .{ head_end, end_pos });
+                end_eos = null;
+                break :end_cp;
+            }
+        }
+        const a = gen_ptr.ssm_checkpoint_alloc orelse hc.allocator;
+        var cp = transformer_mod.captureSsmCheckpoint(a, ents, end_pos, xf.s) catch |err| {
+            log.warn("[hot-cache] end-of-turn checkpoint at {d} not captured: {s}\n", .{ end_pos, @errorName(err) });
+            break :end_cp;
+        };
+        const grown = a.alloc(transformer_mod.SSMCheckpoint, ssm_cps_slice.len + 1) catch {
+            cp.deinit(a);
+            break :end_cp;
+        };
+        @memcpy(grown[0..ssm_cps_slice.len], ssm_cps_slice);
+        grown[ssm_cps_slice.len] = cp;
+        if (gen_ptr.ssm_checkpoint_alloc) |old| old.free(ssm_cps_slice);
+        ssm_cps_slice = grown;
+        gen_ptr.ssm_checkpoint_alloc = a;
+        log.info("  [hot-cache] end-of-turn checkpoint at {d} ({d} checkpoints)\n", .{ end_pos, ssm_cps_slice.len });
+    }
+
+    // Construct the full token sequence: the original prompt + everything
+    // generated this turn. The cache reflects exactly this state — Generator
+    // forwarded each emitted token into slot.cache as it was sampled.
+    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len + @intFromBool(end_eos != null);
+    const total_tokens = sch.allocator.alloc(u32, total_len) catch {
+        if (gen_ptr.ssm_checkpoint_alloc) |a| {
+            for (ssm_cps_slice) |*cp| cp.deinit(a);
+            a.free(ssm_cps_slice);
+        }
+        return;
+    };
+    defer sch.allocator.free(total_tokens);
+    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
+    @memcpy(total_tokens[slot.full_prompt.len..][0..gen_ptr.generated_ids.items.len], gen_ptr.generated_ids.items);
+    if (end_eos) |t| total_tokens[total_len - 1] = t;
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
@@ -6714,6 +6808,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     releaseNativeState(slot);
     qwen4_forward.stageSplitForget(&slot.cache);
+    stageHolderRelease(sch, slot);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -7005,6 +7100,9 @@ var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
 fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     if (!hc.ssd_first) return false;
+    // texas-split R66: the split's chunk records cannot carry layers 28-47 (they persist with 0 checkpoints and
+    // fail the restore's QSA history check), and the hand-off frees each checkpoint once "written": keep them.
+    if (prefix_cache_mod.hotKeepsAllCheckpoints()) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     if (d.writer == null) return false;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
@@ -7028,6 +7126,8 @@ fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
 fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
     const cfg = slot.model.config orelse return false;
     if (write_through or !cfg.isQwen4()) return false;
+    // texas-split R66: every checkpoint stays in RAM (`--ssm-checkpoint-max` still caps and thins the list).
+    if (prefix_cache_mod.hotKeepsAllCheckpoints()) return false;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     return hc.disk != null;
 }
@@ -7126,6 +7226,8 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     for (sch.decoding.items) |s| {
         if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
         if (s.background) continue;
+        // texas-split: waiting for, or in, its Mac re-run after a stage failure (no usable state until it ends)
+        if (s.stage_recover_pending) continue;
         if (n >= buf.len) break;
         buf[n] = s;
         _ = s.in_pass.fetchAdd(1, .acq_rel);
@@ -7146,8 +7248,16 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     }
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
-        log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
-        for (buf[0..n]) |s| s.markError(@errorName(err));
+        if (isStageSplitError(err)) {
+            // texas-split: the stage failed under a tick hosted inside a prefill. Its requests re-run on the Mac at the
+            // next pass, outside this prefill (`stageRecoverMarked`); the requests on the Mac carry on.
+            stage_split_give_up("split decode failed between prefill chunks");
+            log.warn("[stage] decode tick between prefill chunks failed ({s}); the stage's requests re-run on the Mac after this prefill\n", .{@errorName(err)});
+            stageMarkRecover(sch, buf[0..n]);
+        } else {
+            log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
+            for (buf[0..n]) |s| s.markError(@errorName(err));
+        }
     };
     const tick_ns = sw.read();
     for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
@@ -7200,13 +7310,25 @@ fn isStageSplitError(err: anyerror) bool {
     return err == error.StageSplitForward or err == error.StageSplitSeed or err == error.StageSplitSeedKv or
         err == error.StageSplitNoSsm or err == error.StageSplitPrefill or err == error.StageSplitPullback;
 }
+/// Is the MTP head's live state this slot's own, or nobody's?
+fn headStateIsSlots(slot: *Slot, xf: *Transformer) bool {
+    const owner = xf.qwen4_mtp_owner orelse return true;
+    const g = if (slot.legacy_gen) |*gg| gg else return false;
+    const mc = if (g.mtp_cache) |*m| m else return false;
+    return switch (mc.*) {
+        .qwen4 => |r| r.st == owner,
+        else => false,
+    };
+}
 fn resetSlotForStageRetry(slot: *Slot) void {
     qwen4_forward.stageSplitForget(&slot.cache);
     if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
     if (slot.model.transformer) |xf| {
         slot.cache.truncate(0, xf.s) catch {};
         xf.resetQsaPooledRope();
-        xf.qwen4MtpResetOwned(slot.enable_mtp);
+        // With several requests in flight the head's live state can be another request's: only this one's own (or
+        // nobody's) is reset.
+        if (headStateIsSlots(slot, xf)) xf.qwen4MtpResetOwned(slot.enable_mtp);
     }
     if (slot.legacy_gen) |*g| {
         g.deinit(slot.allocator);
@@ -7237,6 +7359,34 @@ fn stageRecoverDecodingSlot(sch: *Scheduler, slot: *Slot) !void {
     if (slot.legacy_gen) |*g| g.completion_tokens += done;
     slot.completion_tokens = done;
     slot.prompt_tokens = prompt_tokens;
+}
+/// The stage has just been given up: mark the requests that must re-run from their tokens on the Mac. With one request
+/// at a time that is every request of the tick, as before. With several (multi-stream) it is the ones whose layers
+/// [first, 48) lived on the stage; the requests decoding on the Mac hold their whole state and carry on.
+fn stageMarkRecover(sch: *Scheduler, slots: []const *Slot) void {
+    for (slots) |s| {
+        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
+        if (sch.max_concurrent <= 1 or stageOnStage(sch, s) or qwen4_forward.stageResident(&s.ctx)) s.stage_recover_pending = true;
+    }
+}
+/// Re-run the marked requests, one after another. A re-run is a prefill, and decode ticks run between its chunks: they
+/// take neither the request re-running (it has no generator until its prefill ends) nor the ones still waiting (their
+/// caches lack the stage's layers); `interleaveDecodeTick` leaves the marked out.
+fn stageRecoverMarked(sch: *Scheduler, slots: []const *Slot) void {
+    for (slots) |s| {
+        if (!s.stage_recover_pending) continue;
+        if (!(s.finished or s.error_code != null or s.cancelled.load(.acquire))) {
+            stageRecoverDecodingSlot(sch, s) catch |e| {
+                if (e == error.Cancelled) {
+                    finishSlot(sch, s, "cancelled");
+                } else {
+                    log.err("[stage] Mac-only recovery failed: {s}\n", .{@errorName(e)});
+                    s.markError(@errorName(e));
+                }
+            };
+        }
+        s.stage_recover_pending = false;
+    }
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -7604,6 +7754,17 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
     if (hot_checked_out) slot.cache.adoptRestored();
+    // R67: the stage holder (multi-stream), or the only request; R66: the stage client learns the holder's prompt (its
+    // incremental seed reuses rows the stage still holds).
+    const stage_ok = stageHolderClaim(sch, slot);
+    // R69 test hook (SUSHI_STAGE_FORCE_SLOT1=1, two-slot stage): every holder decodes on slot 1
+    if (stage_ok and qwen4_forward.stageSlots() > 1) {
+        if (stageExtraOf(sch, slot)) |k| {
+            qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&slot.ctx), @intCast(k + 1));
+        } else if (forceSlot1()) qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&slot.ctx), 1);
+    }
+    if (stage_ok) qwen4_forward.stageSelectOwner(qwen4_forward.stageOwner(&slot.ctx));
+    if (stage_ok) qwen4_forward.stageNotePrompt(slot.full_prompt, hot_matched);
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -7635,6 +7796,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // transition shim sync-forwards [t1] on the first decode call.
             // DFlash/MTP init paths already skip preforward unconditionally.
             .skip_lazy_preforward = !use_mtp and !use_dflash,
+            .stage_allowed = stage_ok,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -7688,6 +7850,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    slot.legacy_gen.?.stage_allowed = stage_ok;
     publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
@@ -7736,7 +7899,612 @@ fn sumInflightGeneratedTokens(active: anytype) u64 {
     return inflight;
 }
 
+/// R67 multi-stream: with more than one request in flight on the split, one request at a time holds the 5090 stage, from
+/// its prefill until it ends however it ends; the others run every layer on the Mac beside it (batched among
+/// themselves as usual). A background request never takes the stage. With one request in flight it is always the
+/// holder, as before.
+fn stageMultiStream(sch: *const Scheduler) bool {
+    return sch.max_concurrent > 1 and qwen4_forward.stageSplitFirst() != null;
+}
+fn stageHolderIs(sch: *const Scheduler, slot: *const Slot) bool {
+    return if (sch.stage_holder) |h| h == slot else false;
+}
+/// R69 test hook: SUSHI_STAGE_FORCE_SLOT1=1 puts every stage holder on slot 1 (a two-slot stage; checks slot 1 against 0).
+var force_slot1_env: ?bool = null;
+fn forceSlot1() bool {
+    if (force_slot1_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_FORCE_SLOT1");
+    const v = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    force_slot1_env = v;
+    return v;
+}
+/// Experiments: SUSHI_STAGE_MS_HOLDER=0 keeps every multi-stream request on the Mac (nobody holds the stage).
+var stage_ms_holder_env: ?bool = null;
+fn stageHolderWanted() bool {
+    if (stage_ms_holder_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_MS_HOLDER");
+    const v = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
+    stage_ms_holder_env = v;
+    return v;
+}
+fn stageHolderClaim(sch: *Scheduler, slot: *Slot) bool {
+    if (!stageMultiStream(sch)) return true;
+    if (!stageHolderWanted()) return false;
+    stageReapEnded(sch, slot);
+    if (slot.background) {
+        // A background request runs with no foreground beside it (native priority parks it, and its stage half, for
+        // them): alone it takes slot 0, exactly as when one request runs at a time. It gives the slot up while parked
+        // (nativeBoundary).
+        if (sch.stage_holder == null and !stageAnyExtra(sch)) sch.stage_holder = slot;
+        return stageHolderIs(sch, slot);
+    }
+    if (sch.stage_holder == null) {
+        sch.stage_holder = slot;
+        // R69: slot 0 stops below the occupied extra slots: a request too long for that takes their rows
+        stageMakeRoomForSlot0(sch, stageSlotNeed(slot), "a longer request takes slot 0");
+    }
+    if (stageHolderIs(sch, slot)) return true;
+    // R69: an extra slot (the highest rows first), when this request fits its rows and slot 0's request stays below them
+    if (!stageSlotFits(slot.full_prompt.len, slot.max_tokens)) return false;
+    for (0..stageExtraCount()) |k| {
+        if (sch.stage_extra[k] != null) continue;
+        if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > stageSlotBase(k)) break;
+        sch.stage_extra[k] = slot;
+        return true;
+    }
+    return false;
+}
+/// R69: a request that ended or was cancelled keeps its stage slot until its slot is cleaned up, a tick or more later.
+/// Release it now, so a request starting or resuming (a background after a foreground's client went away) finds the
+/// slot free. The later cleanup's release is then a no-op.
+fn stageReapEnded(sch: *Scheduler, except: *const Slot) void {
+    if (sch.stage_holder) |h| {
+        if (h != except and (h.finished or h.error_code != null or h.cancelled.load(.acquire))) stageHolderRelease(sch, h);
+    }
+    for (sch.stage_extra) |maybe| {
+        const h = maybe orelse continue;
+        if (h != except and (h.finished or h.error_code != null or h.cancelled.load(.acquire))) stageHolderRelease(sch, h);
+    }
+}
+/// R69: extra stage slots (slots 1..) this server may use.
+pub const STAGE_EXTRA_MAX = 3;
+fn stageExtraCount() usize {
+    return @min(qwen4_forward.stageSlots() -| 1, STAGE_EXTRA_MAX);
+}
+/// The extra slot index k (stage slot k + 1) `slot` decodes on, or null.
+fn stageExtraOf(sch: *const Scheduler, slot: *const Slot) ?usize {
+    for (sch.stage_extra, 0..) |h, k| if (h == slot) return k;
+    return null;
+}
+fn stageOnStage(sch: *const Scheduler, slot: *const Slot) bool {
+    return stageHolderIs(sch, slot) or stageExtraOf(sch, slot) != null;
+}
+fn stageAnyExtra(sch: *const Scheduler) bool {
+    for (sch.stage_extra) |h| if (h != null) return true;
+    return false;
+}
+/// R69: rows of each extra stage slot (SUSHI_STAGE_SLOT_ROWS, the host's QD_STAGE_SLOT_ROWS; default 65536).
+var stage_slot_rows_env: ?usize = null;
+fn stageSlotRows() usize {
+    if (stage_slot_rows_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_SLOT_ROWS");
+    const v: usize = if (raw) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 65536) else 65536;
+    stage_slot_rows_env = v;
+    return v;
+}
+/// R69: a request of `len` tokens so far fits an extra slot with room for its reply (capped at 16K tokens).
+fn stageSlotFits(len: usize, max_tokens: u32) bool {
+    return len + @min(@as(usize, max_tokens), stageSlotReserve()) + 64 <= stageSlotRows();
+}
+/// R69: reply rows an extra-slot claim reserves at most (SUSHI_STAGE_SLOT_RESERVE, default 16384; tests shrink it).
+var stage_slot_reserve_env: ?usize = null;
+fn stageSlotReserve() usize {
+    if (stage_slot_reserve_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_SLOT_RESERVE");
+    const v: usize = if (raw) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 16384) else 16384;
+    stage_slot_reserve_env = v;
+    return v;
+}
+/// R69: attention rows on the stage (the host's STAGE_CAPACITY, SUSHI_STAGE_CAPACITY; default 262160). Extra slot k's
+/// views are rows [capacity - (k + 1) * stageSlotRows(), capacity - k * stageSlotRows()); slot 0 may not reach an
+/// occupied slot's rows.
+var stage_capacity_env: ?usize = null;
+fn stageCapacity() usize {
+    if (stage_capacity_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_CAPACITY");
+    const v: usize = if (raw) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 262160) else 262160;
+    stage_capacity_env = v;
+    return v;
+}
+fn stageSlotBase(k: usize) usize {
+    return stageCapacity() -| (k + 1) * stageSlotRows();
+}
+/// Rows slot 0 may hold: below the lowest occupied extra slot.
+fn stageSlot0Limit(sch: *const Scheduler) usize {
+    var limit = stageCapacity();
+    for (sch.stage_extra, 0..) |h, k| if (h != null) {
+        limit = @min(limit, stageSlotBase(k));
+    };
+    return limit;
+}
+/// Rows a forward may add before the next guard check (verify rows, with room).
+const STAGE_SLOT_MARGIN: usize = 64;
+/// R69: rows a slot's request holds or will soon hold (its tokens so far plus a forward's worth, or its whole prompt
+/// while it prefills).
+fn stageSlotNeed(s: *const Slot) usize {
+    const made: usize = if (s.legacy_gen) |*g| g.generated_ids.items.len else 0;
+    return s.full_prompt.len + made + STAGE_SLOT_MARGIN;
+}
+/// R69: drafts a round of `slot` may carry on its stage slot (verify rows - 1); 0 = no cap (one stage slot, or a
+/// request on the Mac).
+fn stageDraftCap(sch: *const Scheduler, slot: *const Slot) u32 {
+    if (!stageMultiStream(sch) or qwen4_forward.stageSlots() < 2) return 0;
+    if (stageExtraOf(sch, slot)) |k| return qwen4_forward.stageSlotForwardRows(k + 1) - 1;
+    if (stageHolderIs(sch, slot)) return qwen4_forward.stageSlotForwardRows(0) - 1;
+    return 0;
+}
+/// R69: the request's layers [first, 48) come back from its extra slot into Sushi's caches (the R66d pull-back) and the
+/// slot is freed on the stage. True when Sushi's caches then hold the request whole. Between ticks only.
+fn stageExtraPullOut(sch: *Scheduler, k: usize) bool {
+    const h = sch.stage_extra[k] orelse return true;
+    sch.stage_extra[k] = null;
+    const owner = qwen4_forward.stageOwner(&h.ctx);
+    var whole = false;
+    if (h.model.transformer) |xf| {
+        if (h.ssm_entries) |ents| _ = qwen4_forward.stagePullbackTurnEnd(xf, &h.cache, ents);
+        whole = qwen4_forward.stageCachesWhole(xf, &h.cache);
+    }
+    qwen4_forward.stageAssignSlot(owner, 0);
+    if (!qwen4_forward.stageDropSlot(k + 1)) log.warn("[stage] slot {d}: drop failed\n", .{k + 1});
+    sch.stage_slot_drop[k] = false;
+    if (whole) qwen4_forward.stageSplitForget(&h.cache);
+    return whole;
+}
+/// R69: an extra slot ends early (slot 0 is about to need its rows, or its own request is about to outgrow it): its
+/// request decodes on the Mac from here on. Between ticks only (no stage wait open).
+fn stageEvictExtra(sch: *Scheduler, k: usize, why: []const u8) void {
+    const h = sch.stage_extra[k] orelse return;
+    if (stageExtraPullOut(sch, k)) {
+        if (h.legacy_gen) |*g| g.stage_allowed = false;
+        log.info("[stage] slot {d}: evicted ({s}); its request continues on the Mac\n", .{ k + 1, why });
+    } else {
+        // its state did not come back: give the stage up (every split request re-runs on the Mac at the next tick, the
+        // path any stage failure takes)
+        log.warn("[stage] slot {d}: evicted ({s}) without its state; giving the stage up\n", .{ k + 1, why });
+        stage_split_give_up("extra slot eviction: its state did not come back");
+    }
+}
+/// R69: slot 0 needs `need` rows: the occupied extra slots in its way leave, lowest rows first.
+fn stageMakeRoomForSlot0(sch: *Scheduler, need: usize, why: []const u8) void {
+    var k: usize = STAGE_EXTRA_MAX;
+    while (k > 0) {
+        k -= 1;
+        if (sch.stage_extra[k] != null and need > stageSlotBase(k)) stageEvictExtra(sch, k, why);
+    }
+}
+/// R69: slot 0 is free while a request decodes on an extra slot with fewer verify rows than slot 0: it moves to slot 0
+/// (pull-back, then its next forward seeds slot 0), so a request left alone runs exactly as a single stream does.
+fn stageMoveToSlot0(sch: *Scheduler) void {
+    if (sch.stage_holder != null) return;
+    var best: ?usize = null;
+    var best_left: u64 = 0;
+    for (sch.stage_extra, 0..) |maybe, k| {
+        const h = maybe orelse continue;
+        if (h.finished or h.error_code != null or h.cancelled.load(.acquire)) continue;
+        if (qwen4_forward.stageSlotForwardRows(k + 1) >= qwen4_forward.stageSlotForwardRows(0)) continue;
+        const g = if (h.legacy_gen) |*gg| gg else continue;
+        if (g.done) continue;
+        // it must fit below the other occupied extra slots
+        var limit = stageCapacity();
+        for (sch.stage_extra, 0..) |o, ko| if (o != null and ko != k) {
+            limit = @min(limit, stageSlotBase(ko));
+        };
+        if (stageSlotNeed(h) > limit) continue;
+        const made: u64 = g.generated_ids.items.len;
+        const left: u64 = if (h.max_tokens > made) h.max_tokens - made else 0;
+        if (best == null or left > best_left) {
+            best = k;
+            best_left = left;
+        }
+    }
+    const k = best orelse return;
+    const h = sch.stage_extra[k].?;
+    if (stageExtraPullOut(sch, k)) {
+        sch.stage_holder = h;
+        log.info("[stage] slot {d}: its request moves to slot 0 ({d} tokens left)\n", .{ k + 1, best_left });
+    } else {
+        log.warn("[stage] slot {d}: move to slot 0 without its state; giving the stage up\n", .{k + 1});
+        stage_split_give_up("move to slot 0: its state did not come back");
+    }
+}
+/// R69: before a tick, extra slots leave if a request is about to cross the line between slots; a request left on a
+/// narrower extra slot with slot 0 free moves there.
+fn stageSlotGuard(sch: *Scheduler) void {
+    for (sch.stage_extra, 0..) |maybe, k| {
+        const h = maybe orelse continue;
+        if (h.finished or h.error_code != null) continue;
+        if (stageSlotNeed(h) > stageSlotRows()) stageEvictExtra(sch, k, "its request outgrew the slot");
+    }
+    if (sch.stage_holder) |h0| stageMakeRoomForSlot0(sch, stageSlotNeed(h0), "slot 0 needs its rows");
+    stageMoveToSlot0(sch);
+}
+/// The holder ended: the stage passes to the decoding foreground request with the most tokens left to generate, whose
+/// next forward seeds it from Sushi's caches (a Mac-only request's are whole). None decoding: the next prefill claims it.
+fn stageHolderRelease(sch: *Scheduler, slot: *Slot) void {
+    if (stageExtraOf(sch, slot)) |k| {
+        // R69: the extra slot frees (its rows go back to slot 0's reach) and passes to another decoding request
+        sch.stage_extra[k] = null;
+        qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&slot.ctx), 0);
+        // the next holder's first forward seeds over the slot; with none, free it at the next tick (a release can run
+        // inside another holder's stage wait, where no stage call may go out)
+        stagePromoteExtra(sch, k, slot);
+        sch.stage_slot_drop[k] = sch.stage_extra[k] == null;
+        return;
+    }
+    if (!stageHolderIs(sch, slot)) return;
+    sch.stage_holder = null;
+    if (!stageMultiStream(sch)) return;
+    var best: ?*Slot = null;
+    var best_left: u64 = 0;
+    const limit0 = stageSlot0Limit(sch);
+    for (sch.decoding.items) |s| {
+        if (s == slot or s.background or stageExtraOf(sch, s) != null) continue;
+        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
+        if (stageSlotNeed(s) > limit0) continue;
+        const g = if (s.legacy_gen) |*gg| gg else continue;
+        if (g.done) continue;
+        const made: u64 = g.generated_ids.items.len;
+        const left: u64 = if (s.max_tokens > made) s.max_tokens - made else 0;
+        if (best == null or left > best_left) {
+            best = s;
+            best_left = left;
+        }
+    }
+    if (best) |b| {
+        sch.stage_holder = b;
+        b.legacy_gen.?.stage_allowed = true;
+        log.info("[stage] holder: the 5090 passes to another in-flight request ({d} tokens left)\n", .{best_left});
+    }
+}
+
+/// R69: extra slot k passes to the decoding foreground request (not on the stage) with the most tokens left that fits;
+/// its next forward seeds the slot from Sushi's caches (a Mac-only request's are whole).
+fn stagePromoteExtra(sch: *Scheduler, k: usize, except: *const Slot) void {
+    if (k >= stageExtraCount() or !stageMultiStream(sch)) return;
+    if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > stageSlotBase(k)) return;
+    var best: ?*Slot = null;
+    var best_left: u64 = 0;
+    for (sch.decoding.items) |s| {
+        if (s == except or s.background or stageOnStage(sch, s)) continue;
+        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
+        const g = if (s.legacy_gen) |*gg| gg else continue;
+        if (g.done) continue;
+        const made: u64 = g.generated_ids.items.len;
+        const left: u64 = if (s.max_tokens > made) s.max_tokens - made else 0;
+        if (!stageSlotFits(s.full_prompt.len + @as(usize, @intCast(made)), @intCast(@min(left, std.math.maxInt(u32))))) continue;
+        if (best == null or left > best_left) {
+            best = s;
+            best_left = left;
+        }
+    }
+    if (best) |b| {
+        sch.stage_extra[k] = b;
+        b.legacy_gen.?.stage_allowed = true;
+        qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&b.ctx), @intCast(k + 1));
+        log.info("[stage] slot {d}: passes to another in-flight request ({d} tokens left)\n", .{ k + 1, best_left });
+    }
+}
+
+/// R67 multi-stream: the stage holder decodes alone, through the 5090, before and apart from the MTP group planner and
+/// the groups, which see only the requests running on the Mac. A holder the planner still owns (promoted from the Mac
+/// side) stays with the planner until its head's hidden is fresh, then leaves it for good.
 fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    if (active.len == 0) return;
+    // SUSHI_STAGE_MS_TRACE=1: where a multi-stream tick's time goes (every 200 ticks of two or more requests)
+    const tracing = active.len > 1 and msTraceOn() and ms_trace.depth == 0;
+    const t_enter = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
+    if (tracing) {
+        if (ms_trace.last_end != 0) ms_trace.gap_ns += t_enter - ms_trace.last_end;
+        ms_trace.rows += active.len;
+    }
+    ms_trace.depth += 1;
+    defer {
+        ms_trace.depth -= 1;
+        if (tracing) msTraceTickEnd(t_enter);
+    }
+    // R69: extra slots leave before a request crosses the line between slots; a slot left empty is freed here, outside
+    // every stage wait and split prefill
+    if (ms_trace.depth == 1 and qwen4_forward.stagePrefillInflight() == 0 and stageMultiStream(sch)) {
+        if (stageAnyExtra(sch)) stageSlotGuard(sch);
+        for (&sch.stage_slot_drop, 0..) |*d, k| if (d.* and sch.stage_extra[k] == null) {
+            d.* = false;
+            if (!qwen4_forward.stageDropSlot(k + 1)) log.warn("[stage] slot {d}: drop failed\n", .{k + 1});
+        };
+    }
+    if (active.len <= MAX_BATCH_GROUP and (sch.stage_holder != null or stageAnyExtra(sch)) and stageMultiStream(sch)) {
+        var rest: [MAX_BATCH_GROUP]*Slot = undefined;
+        var n: usize = 0;
+        var holders: [1 + STAGE_EXTRA_MAX]*Slot = undefined;
+        var hn: usize = 0;
+        // R69: an extra slot's holder sits a tick out while a split prefill (slot 0's request) has chunks on the stage:
+        // the socket carries one stream of replies, and its layers [first, 48) live on the stage, so it cannot decode
+        // on the Mac either. It is in no list this tick.
+        const prefill_busy = qwen4_forward.stagePrefillInflight() > 0;
+        var sat_out = false;
+        for (active) |s| {
+            const extra = stageExtraOf(sch, s) != null;
+            if ((extra or stageHolderIs(sch, s)) and stageHolderSolo(s) and hn < holders.len) {
+                if (extra and prefill_busy) {
+                    sat_out = true;
+                } else {
+                    holders[hn] = s;
+                    hn += 1;
+                }
+            } else {
+                rest[n] = s;
+                n += 1;
+            }
+        }
+        if (hn == 0 and sat_out) {
+            if (n > 0) try runDecodeTickShared(sch, rest[0..n]);
+            return;
+        }
+        if (hn >= 2) {
+            // R69: several stage slots, interleaved: each holder's 5090 half hides behind the others' Mac halves
+            defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+            for (holders[0..hn]) |h| holderPrep(h, false);
+            const th0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
+            try runSplitGroup(sch, holders[0..hn], rest[0..n]);
+            if (tracing) {
+                ms_trace.pair_ns += @import("qwen4_exp.zig").nowBootNs() - th0;
+                ms_trace.pair_n += 1;
+                ms_trace.pair_holders += hn;
+            }
+            return;
+        }
+        if (hn == 1) {
+            const h = holders[0];
+            defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+            holderPrep(h, active.len == 1);
+            // The Mac-only requests decode inside the holder's stage wait when its round reaches one (overlap);
+            // otherwise after it, as before.
+            const overlap = n > 0 and stageOverlapWanted();
+            if (overlap) {
+                ms_hook = .{ .sch = sch, .rest = rest[0..n] };
+                qwen4_forward.stageSetWaitHook(&msWaitHook);
+            }
+            defer if (overlap) {
+                qwen4_forward.stageSetWaitHook(null);
+                ms_hook = .{};
+            };
+            const th0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
+            if (h.error_code == null) try runSingleDecodeTick(sch, h);
+            if (tracing) {
+                ms_trace.holder_ns += @import("qwen4_exp.zig").nowBootNs() - th0;
+                ms_trace.holder_n += 1;
+            }
+            if (overlap) {
+                qwen4_forward.stageSetWaitHook(null);
+                if (ms_hook.err) |e| return e;
+                if (ms_hook.ran) return;
+            }
+            const tr0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
+            if (n > 0) try runDecodeTickShared(sch, rest[0..n]);
+            if (tracing and n > 0) {
+                ms_trace.rest_ns += @import("qwen4_exp.zig").nowBootNs() - tr0;
+                ms_trace.rest_n += 1;
+            }
+            return;
+        }
+    }
+    return runDecodeTickShared(sch, active);
+}
+
+/// R67 overlap: what the stage wait hook decodes (set for one holder tick).
+const MsHook = struct {
+    sch: ?*Scheduler = null,
+    rest: []*Slot = &.{},
+    ran: bool = false,
+    err: ?anyerror = null,
+};
+var ms_hook: MsHook = .{};
+fn msWaitHook() callconv(.c) void {
+    if (ms_hook.ran) return;
+    const sch = ms_hook.sch orelse return;
+    ms_hook.ran = true;
+    const t0 = if (msTraceOn()) @import("qwen4_exp.zig").nowBootNs() else 0;
+    runDecodeTickShared(sch, ms_hook.rest) catch |e| {
+        ms_hook.err = e;
+    };
+    if (msTraceOn()) {
+        ms_trace.hook_ns += @import("qwen4_exp.zig").nowBootNs() - t0;
+        ms_trace.hook_n += 1;
+    }
+}
+const MsTrace = struct {
+    depth: u32 = 0,
+    n: u64 = 0,
+    rows: u64 = 0,
+    total_ns: u64 = 0,
+    gap_ns: u64 = 0,
+    holder_ns: u64 = 0,
+    holder_n: u64 = 0,
+    hook_ns: u64 = 0,
+    hook_n: u64 = 0,
+    rest_ns: u64 = 0,
+    rest_n: u64 = 0,
+    pair_ns: u64 = 0,
+    pair_n: u64 = 0,
+    /// R69 group tick parts: every holder's begin (draft, layers [0, first), send), the early finishes, the Mac-only
+    /// requests, the last finish
+    pair_parts: [4]u64 = @splat(0),
+    pair_holders: u64 = 0,
+    last_end: u64 = 0,
+};
+fn msLap(acc: *u64, t0: u64) u64 {
+    const t1 = @import("qwen4_exp.zig").nowBootNs();
+    acc.* += t1 - t0;
+    return t1;
+}
+var ms_trace: MsTrace = .{};
+var ms_trace_env: ?bool = null;
+fn msTraceOn() bool {
+    if (ms_trace_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_MS_TRACE");
+    const v = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    ms_trace_env = v;
+    return v;
+}
+fn msTraceTickEnd(t_enter: u64) void {
+    const now = @import("qwen4_exp.zig").nowBootNs();
+    ms_trace.total_ns += now - t_enter;
+    ms_trace.last_end = now;
+    ms_trace.n += 1;
+    if (ms_trace.n < 200) return;
+    const t = &ms_trace;
+    const ms = struct {
+        fn f(ns: u64, n: u64) f64 {
+            return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+        }
+    }.f;
+    log.info("[ms-trace] {d} ticks, {d:.1} rows: tick {d:.2} ms + gap {d:.2} ms; holder round {d:.2} ms x{d} (inside it, Mac-only tick {d:.2} ms x{d}); Mac-only tick after {d:.2} ms x{d}; slot pair {d:.2} ms x{d}\n", .{
+        t.n, @as(f64, @floatFromInt(t.rows)) / @as(f64, @floatFromInt(t.n)), ms(t.total_ns, t.n), ms(t.gap_ns, t.n),
+        ms(t.holder_ns, t.holder_n), t.holder_n, ms(t.hook_ns, t.hook_n), t.hook_n, ms(t.rest_ns, t.rest_n), t.rest_n,
+        ms(t.pair_ns, t.pair_n), t.pair_n,
+    });
+    if (t.pair_n > 0) log.info("[ms-trace] group parts (ms), {d:.1} holders: begins {d:.2}, early finishes {d:.2}, Mac-only {d:.2}, last finish {d:.2}\n", .{
+        @as(f64, @floatFromInt(t.pair_holders)) / @as(f64, @floatFromInt(t.pair_n)),
+        ms(t.pair_parts[0], t.pair_n), ms(t.pair_parts[1], t.pair_n), ms(t.pair_parts[2], t.pair_n), ms(t.pair_parts[3], t.pair_n),
+    });
+    const keep_last = t.last_end;
+    t.* = .{};
+    t.last_end = keep_last;
+}
+/// SUSHI_STAGE_MS_OVERLAP=0 decodes the Mac-only requests after the holder's round instead of inside its stage wait.
+var stage_ms_overlap_env: ?bool = null;
+fn stageOverlapWanted() bool {
+    if (stage_ms_overlap_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_MS_OVERLAP");
+    const v = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
+    stage_ms_overlap_env = v;
+    return v;
+}
+
+/// A stage holder about to decode outside the planner (R67/R69): its planner state cleared, its head detached once.
+fn holderPrep(h: *Slot, solo: bool) void {
+    if (h.legacy_gen) |*g| {
+        g.spec_cost_solo = solo;
+        g.mtp_planner_width = null;
+        g.mtp_planner_probe = false;
+        g.mtp_planner_recovering = false;
+        g.mtp_planner_pending = false;
+        if (g.mtp_planner_owned) {
+            g.mtpDetachHead(h.allocator, true) catch |e| h.markError(@errorName(e));
+            g.mtp_planner_owned = false;
+            log.info("[stage] holder: leaves the MTP group planner\n", .{});
+        }
+    }
+    h.planner_plain_transition = false;
+    h.planner_force_plain = false;
+}
+
+/// R69: one tick of the stage holders on their slots: each holder's draft and layers [0, first) and send in turn (the
+/// one before it computes on the 5090 meanwhile), then each one's tail; the Mac-only requests run before the last tail
+/// (that holder's 5090 half runs meanwhile). A holder whose tick is not an MTP round runs whole at its turn.
+fn runSplitGroup(sch: *Scheduler, hs: []*Slot, rest: []*Slot) !void {
+    const tr = msTraceOn();
+    var t = if (tr) @import("qwen4_exp.zig").nowBootNs() else 0;
+    var rounds: [1 + STAGE_EXTRA_MAX]?SplitRound = @splat(null);
+    errdefer for (hs, 0..) |h, i| if (rounds[i]) |*r| r.st.deinit(h.allocator);
+    for (hs, 0..) |h, i| {
+        rounds[i] = if (h.error_code == null) try splitRoundBegin(sch, h) else null;
+    }
+    if (tr) t = msLap(&ms_trace.pair_parts[0], t);
+    for (hs, 0..) |h, i| {
+        if (i + 1 == hs.len) {
+            if (tr) t = msLap(&ms_trace.pair_parts[1], t);
+            if (rest.len > 0) try runDecodeTickShared(sch, rest);
+            if (tr) t = msLap(&ms_trace.pair_parts[2], t);
+        }
+        if (rounds[i]) |r0| {
+            var r = r0;
+            rounds[i] = null;
+            try splitRoundFinish(sch, h, &r);
+        }
+    }
+    if (tr) t = msLap(&ms_trace.pair_parts[3], t);
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] split group aborted: MLX failure mid-generation ({s})\n", .{@errorName(mlx_err)});
+        for (hs) |h| h.markError(@errorName(mlx_err));
+    };
+}
+
+var r69_debug_env: ?bool = null;
+fn r69Debug() bool {
+    if (r69_debug_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_R69_DEBUG");
+    const v = if (raw) |x| std.mem.eql(u8, std.mem.sliceTo(x, 0), "1") else false;
+    r69_debug_env = v;
+    return v;
+}
+const SplitRound = struct {
+    st: Generator.MtpRoundState,
+    sent: bool,
+    prev_split: bool,
+};
+
+/// R69: the first half of a stage holder's MTP round. null: the slot's tick is already complete (it finished, the loop
+/// guard stopped it, or it was not an MTP round and ran whole).
+fn splitRoundBegin(sch: *Scheduler, slot: *Slot) !?SplitRound {
+    const gen = if (slot.legacy_gen) |*g| g else {
+        slot.markError("no_generator");
+        return null;
+    };
+    const mtp_mode = !thinkBoundFired(gen) and specTickMode(slot.enable_mtp, gen.mtp != null, slot.enable_drafter, gen.dflash != null) == .mtp;
+    if (!mtp_mode) {
+        try runSingleDecodeTick(sch, slot);
+        return null;
+    }
+    if (try loopGuardTick(sch, slot, gen)) return null;
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
+    gen.mtp_group_cap = stageDraftCap(sch, slot);
+    const prev_split = gen.ctx.stage_split;
+    gen.ctx.stage_split = gen.stage_allowed and qwen4_forward.stageDecodeEnabled() and (gen.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
+    errdefer gen.ctx.stage_split = prev_split;
+    var st = switch (try gen.mtpRoundBegin(slot.allocator)) {
+        .done => |r| {
+            gen.ctx.stage_split = prev_split;
+            publishMtpResult(sch, slot, gen, r);
+            return null;
+        },
+        .verify => |v| v,
+        .open => |o| try gen.mtpRoundContinue(slot.allocator, o),
+    };
+    errdefer st.deinit(slot.allocator);
+    const sent = try gen.mtpRoundVerifyPre(&st);
+    if (r69Debug()) log.info("[r69] begin slot={d} sent={} head_ids={}\n", .{ qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&gen.ctx)), sent, gen.ctx.stage_head_ids.ctx != null });
+    return .{ .st = st, .sent = sent, .prev_split = prev_split };
+}
+
+/// R69: the second half: receive (when the first half sent), accept, publish.
+fn splitRoundFinish(sch: *Scheduler, slot: *Slot, r: *SplitRound) !void {
+    const gen = &slot.legacy_gen.?;
+    defer gen.ctx.stage_split = r.prev_split;
+    defer r.st.deinit(slot.allocator);
+    if (r.sent) try gen.mtpRoundVerifyPost(&r.st);
+    if (r69Debug()) log.info("[r69] finish slot={d} sent={} head_ids={} head_flag={} rows={d}\n", .{ qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&gen.ctx)), r.sent, gen.ctx.stage_head_ids.ctx != null, gen.ctx.stage_verify_head, gen.ctx.stage_verify_rows });
+    const result = try gen.mtpRoundFinish(slot.allocator, &r.st);
+    publishMtpResult(sch, slot, gen, result);
+}
+
+/// May the holder decode alone this tick? Not while the planner owns it with a stale head hidden: only the planner's
+/// next prime or round refreshes it.
+fn stageHolderSolo(s: *const Slot) bool {
+    const g = if (s.legacy_gen) |*gg| gg else return true;
+    return !(Planner.enabled() and g.mtp_planner_owned and g.mtp_hidden_stale);
+}
+
+fn runDecodeTickShared(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
 
     // Publish the in-flight generated-token aggregate for the gauge sampler.
@@ -7797,6 +8565,11 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var glm_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var glm_n: usize = 0;
     for (active) |s| {
+        // R67: the stage holder decodes alone (through the 5090); the others group as usual, on the Mac
+        if (stageHolderIs(sch, s) and stageMultiStream(sch)) {
+            try runSingleDecodeTick(sch, s);
+            continue;
+        }
         const why = sch.batchVerdict(s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
@@ -7878,11 +8651,28 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var group = batchable_buf[start..end];
         const row_cap = if (group[0].model.config) |c| batchGroupCap(c) else MAX_BATCH_GROUP;
         if (group.len > row_cap) {
-            for (group[row_cap..]) |s| {
-                noteSerial(sch, s, .row_cap);
-                try runSingleDecodeTick(sch, s);
+            const per_row = if (group[0].model.transformer) |t| t.supportsBatchedQwen4Rows() else false;
+            if (per_row) {
+                // R67 multi-stream: past the cap, further batched groups of balanced size (per-row attention pads
+                // nothing), not one solo round per slot
+                const k = (group.len + row_cap - 1) / row_cap;
+                const size = (group.len + k - 1) / k;
+                var c0: usize = size;
+                while (c0 < group.len) : (c0 += size) {
+                    const chunk = group[c0..@min(group.len, c0 + size)];
+                    if (chunk.len >= 2) {
+                        if (sch.metrics) |m| m.batched_group_size.set(chunk.len);
+                        try runBatchedDecodeTick(sch, chunk);
+                    } else try runSingleDecodeTick(sch, chunk[0]);
+                }
+                group = group[0..size];
+            } else {
+                for (group[row_cap..]) |s| {
+                    noteSerial(sch, s, .row_cap);
+                    try runSingleDecodeTick(sch, s);
+                }
+                group = group[0..row_cap];
             }
-            group = group[0..row_cap];
         }
         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
         const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
@@ -8244,7 +9034,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         gen.dflash != null,
     );
     if (tick_mode == .mtp) {
-        gen.mtp_group_cap = 0;
+        gen.mtp_group_cap = stageDraftCap(sch, slot); // R69: a stage slot's verify rows; 0 (no cap) elsewhere
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -9011,7 +9801,9 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         const gen = &slot.legacy_gen.?;
         slot.planner_plain_transition = gen.mtp_hist_stash != null or gen.mtp_pre_draft != null or prime;
         if (gen.mtp != null) try gen.mtpDetachHead(slot.allocator, true);
-        slot.mtp_plain_tick = execution.capture[row];
+        // R67/R69: a stage holder still with the planner (promoted from the Mac side) captures its head hidden on this
+        // plain tick, so it leaves for the stage at the next one (plain ticks alone never refresh it)
+        slot.mtp_plain_tick = execution.capture[row] or (stageMultiStream(sch) and stageOnStage(sch, slot));
         plains[i] = slot;
     }
     for (execution.speculative[0..pn], 0..) |row, i| {

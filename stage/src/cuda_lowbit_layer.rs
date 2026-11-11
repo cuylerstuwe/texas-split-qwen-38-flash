@@ -139,12 +139,36 @@ pub struct Layer<'m, 'd> {
     mlp: cuda_lowbit_moe::Engine<'m, 'd>,
     input: Buffer<'d>,
     output: Buffer<'d>,
+    /// R69: per conversation slot: the last forward's rows, epoch and recorded policy (`active` picks the slot)
+    fwd: Vec<Fwd>,
+    active: Cell<usize>,
+    layer: usize,
+}
+/// R69: a slot's forward bookkeeping (rows prepared, invalidation epoch, recorded policy).
+#[derive(Default)]
+struct Fwd {
     rows: Cell<usize>,
     epoch: Cell<u64>,
     valid: Cell<Option<(usize, bool)>>,
-    layer: usize,
 }
 impl<'m, 'd> Layer<'m, 'd> {
+    fn f(&self) -> &Fwd {
+        &self.fwd[self.active.get()]
+    }
+    /// R69: add a conversation slot (the GDN's recurrent state and per-row states for `prefix_capacity` rows).
+    pub(crate) fn add_slot(&mut self, prefix_capacity: usize) -> Result<usize> {
+        let slot = self.gdn.add_slot(prefix_capacity)?;
+        self.fwd.push(Fwd::default());
+        ensure!(slot + 1 == self.fwd.len(), "recurrent layer slot bookkeeping");
+        Ok(slot)
+    }
+    /// R69: the slot every following call works on.
+    pub(crate) fn select_slot(&self, slot: usize) -> Result<()> {
+        ensure!(slot < self.fwd.len(), "recurrent layer slot {slot}");
+        self.gdn.select_slot(slot)?;
+        self.active.set(slot);
+        Ok(())
+    }
     pub fn new(d: &'d Device, m: &'m Modules<'d>, w: &Weights, bank: &Bank) -> Result<Self> {
         Self::new_with_prefix_capacity(d, m, w, bank, gdn::MAX_T)
     }
@@ -187,9 +211,8 @@ impl<'m, 'd> Layer<'m, 'd> {
             mlp,
             input: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
             output: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
-            rows: Cell::new(0),
-            epoch: Cell::new(0),
-            valid: Cell::new(None),
+            fwd: vec![Fwd::default()],
+            active: Cell::new(0),
             layer: w.layer,
         })
     }
@@ -235,9 +258,8 @@ impl<'m, 'd> Layer<'m, 'd> {
             mlp,
             input: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
             output: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
-            rows: Cell::new(0),
-            epoch: Cell::new(0),
-            valid: Cell::new(None),
+            fwd: vec![Fwd::default()],
+            active: Cell::new(0),
             layer: w.layer,
         };
         // R52 pumps (candidate arm, QWEN_R52_PUMP=1 loads the pump kernel): the MLP-site
@@ -256,14 +278,19 @@ impl<'m, 'd> Layer<'m, 'd> {
         self.prepare_initial(initial)?;
         self.prepare_input(x)
     }
+    /// R69: the active slot holds nothing.
+    pub(crate) fn drop_slot_state(&self) {
+        self.invalidate();
+        self.gdn.drop_slot_state();
+    }
     fn invalidate(&self) {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get().wrapping_add(1));
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get().wrapping_add(1));
         self.gdn.invalidate_output();
     }
     pub(crate) fn invalidate_output(&self) {
-        self.valid.set(None);
+        self.f().valid.set(None);
         self.gdn.invalidate_output();
     }
     pub(crate) fn prepare_initial(&self, initial: &gdn::Initial) -> Result<()> {
@@ -277,7 +304,7 @@ impl<'m, 'd> Layer<'m, 'd> {
     pub(crate) fn prepare_resident(&self, rows: usize) -> Result<()> {
         self.invalidate();
         self.gdn.prepare_resident_input(rows)?;
-        self.rows.set(rows);
+        self.f().rows.set(rows);
         Ok(())
     }
     pub fn prepare_input(&self, x: &[u16]) -> Result<()> {
@@ -294,7 +321,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         ensure!(read(&self.input, x.len())? == x, "layer input readback");
         let rows = x.len() / hc::F;
         self.gdn.prepare_resident_input(rows)?;
-        self.rows.set(rows);
+        self.f().rows.set(rows);
         Ok(())
     }
     pub fn initial(&self) -> Result<gdn::Initial> {
@@ -332,7 +359,7 @@ impl<'m, 'd> Layer<'m, 'd> {
     }
     /// R56 lean drafting commit (see cuda_gdn::Gdn::record_commit).
     pub(crate) fn record_commit(&self, accepted: usize, p: Policy) -> Result<Vec<PreparedCall<'_, 'm, 'd>>> {
-        self.gdn.record_commit(accepted, self.rows.get(), p.all_states)
+        self.gdn.record_commit(accepted, self.f().rows.get(), p.all_states)
     }
     pub(crate) fn state_buffers(&self) -> Vec<&Buffer<'d>> {
         self.gdn.state_buffers()
@@ -342,20 +369,20 @@ impl<'m, 'd> Layer<'m, 'd> {
     }
     /// R56: after a state restore, no forward is pending.
     pub(crate) fn invalidate_pending(&self) {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get().wrapping_add(1));
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get().wrapping_add(1));
         self.gdn.finish_commit();
     }
     pub(crate) fn finish_commit(&self) {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get().wrapping_add(1));
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get().wrapping_add(1));
         self.gdn.finish_commit();
     }
     pub fn commit(&self, accepted: usize) -> Result<()> {
         let (rows, all) = self
-            .valid
+            .f().valid
             .get()
             .ok_or_else(|| anyhow::anyhow!("layer commit requires all stages checked"))?;
         ensure!(
@@ -364,9 +391,9 @@ impl<'m, 'd> Layer<'m, 'd> {
         );
         // Validation errors leave the last completed result usable. Once the
         // state mutation starts, any launch/sync failure invalidates old plans.
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get().wrapping_add(1));
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get().wrapping_add(1));
         self.gdn.commit(accepted)
     }
     fn record(&self, rows: usize, p: Policy) -> Result<Vec<Vec<PreparedCall<'_, 'm, 'd>>>> {
@@ -379,7 +406,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         p: Policy,
     ) -> Result<Vec<Vec<PreparedCall<'a, 'm, 'd>>>> {
         ensure!(
-            rows == self.rows.get() && rows > 0 && !input.aliases(&self.output),
+            rows == self.f().rows.get() && rows > 0 && !input.aliases(&self.output),
             "layer resident readiness/alias"
         );
         let pre = &self.hc[0];
@@ -428,7 +455,7 @@ impl<'m, 'd> Layer<'m, 'd> {
     }
     pub(crate) fn collect_from(&self, input: &Buffer<'d>, rows: usize, p: Policy) -> Result<Run> {
         ensure!(
-            rows == self.rows.get() && rows > 0,
+            rows == self.f().rows.get() && rows > 0,
             "layer collect readiness"
         );
         let pre = self.hc[0].collect_from(input, rows, false, p.hc())?;
@@ -444,7 +471,7 @@ impl<'m, 'd> Layer<'m, 'd> {
             output == hc::write(&post.stream, &mlp.output, &post.stages.inject)?,
             "conditional final residual"
         );
-        self.valid.set(Some((rows, p.all_states)));
+        self.f().valid.set(Some((rows, p.all_states)));
         Ok(Run {
             pre,
             attention,
@@ -458,7 +485,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         })
     }
     pub fn plan(&self, p: Policy, repetitions: usize, graph: bool) -> Result<Plan<'_, 'm, 'd>> {
-        let rows = self.rows.get();
+        let rows = self.f().rows.get();
         ensure!(
             rows > 0 && (1..=3).contains(&repetitions),
             "layer plan readiness/bounds"
@@ -477,7 +504,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         };
         Ok(Plan {
             owner: self,
-            epoch: self.epoch.get(),
+            epoch: self.f().epoch.get(),
             exec,
             rows,
             p,
@@ -515,7 +542,7 @@ impl Plan<'_, '_, '_> {
         let a = self.owner;
         let p = self.p;
         ensure!(
-            a.rows.get() == self.rows && a.epoch.get() == self.epoch,
+            a.f().rows.get() == self.rows && a.f().epoch.get() == self.epoch,
             "layer plan invalidated"
         );
         ensure!(

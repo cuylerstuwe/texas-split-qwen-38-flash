@@ -13,18 +13,26 @@ driver (`libtinynv`, a C port of tinygrad's NVIDIA driver) through tinygrad's si
 
 | | Mac only (stock Sushi) | texas-split |
 |---|---|---|
-| Decode, agentic coding sessions | ~79–84 tok/s | **~119–120 tok/s** |
-| Total task time, same sessions | 1.00× | **1.47–1.54× faster** (pooled 1.51×) |
-| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **16.8–17.4 s (~3.2K tok/s), 1.6× faster** |
+| Decode, agentic coding sessions | ~79–84 tok/s | **~118–124 tok/s** |
+| Total task time, same sessions | 1.00× | **1.52–1.59× faster** (pooled 1.57×) |
+| Prefill, cold 54K-token prompt (time to first token) | 27.5 s (~2.0K tok/s) | **14.6–16.6 s (~3.3–3.7K tok/s), 1.7–1.9× faster** |
+| Several requests at once (opt-in), total | not measured | 120 tok/s with two, 132 with three or four |
 | Prefill, cold 64K / 192K-token prompts | not measured at these lengths | 3.1–3.4K / 2.8–3.3K tok/s (earlier build) |
 | Quality vs. a teacher model (KL, short panel) | .00458 | .00446 (same level) |
 
 Measured on an M5 Max (128 GB) with an RTX 5090, macOS 27.2, replaying two recorded agentic coding
 sessions request by request with the thinking sampler (three seeds; stock Sushi measured with the same
-harness and seeds). Speedups come from the 5090 taking 20 of the 48 layers' work and the verify rounds'
+harness and seeds; the texas-split column is the 2026-11-11 build, and runs of one build on different days
+differ by a few percent). Speedups come from the 5090 taking 20 of the 48 layers' work and the verify rounds'
 LM head; prefill is pipelined between the two machines and limited by the Mac's 28 layers (the 5090 runs
 its 20 at ~5.6–6.3K tok/s). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/VALIDATION.md](docs/VALIDATION.md).
+
+**Updates 2026-11-11:** a fix for replies that failed after a 5090 failure in a long conversation; opt-in
+serving of several requests at once (up to four on the 5090 together: 120 tok/s total with two, 132 with three or
+four, against ~100 for one); follow-up turns keep their place on the 5090 instead of re-sending or re-prefilling
+state; warm turns of image sessions prefill through the 5090. See [CHANGELOG.md](CHANGELOG.md); existing
+installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart`.
 
 **Updates 2026-11-10:** the verify rounds' LM head moved to the 5090, two prefill speedups (a bf16 weight
 cache and better pipelining of the last chunks), and later the same day ~4% more decode speed: the 5090 runs
@@ -74,9 +82,15 @@ curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/
   any foreground request is queued or running, the background request is paused at a step boundary and
   its state on both the Mac and the 5090 is parked to SSD; it resumes exactly where it stopped when the
   last foreground request finishes. One background request at a time; background requests are text-only.
-- `bin/texas-split status | health | logs [--follow] | stop | restart`.
-- If the 5090 fails (unplugged, crashed, hung), the request in flight continues on the Mac alone after
-  a short pause, and the split comes back by itself when the service is idle.
+- **Several requests at once** (off by default): `bin/texas-split concurrency N` (1–16), then
+  `bin/texas-split restart`. Up to four requests then decode through the 5090 together and further ones run
+  on the Mac beside them. Total throughput rises (about 120 tok/s with two requests, 132 with three or
+  four, against ~100 for one) while each request gets its share of it. With 1, the default, requests run one
+  at a time exactly as before. Limits are in [CHANGELOG.md](CHANGELOG.md).
+- `bin/texas-split status | health | logs [--follow] | stop | restart | concurrency [N]`.
+- If the 5090 fails (unplugged, crashed, hung), the requests in flight continue on the Mac alone after a
+  pause (the Mac re-runs their context at ~2.3K tokens/s: about 7 s for a 16K-token conversation), and the
+  split comes back by itself when the service is idle.
 
 ## Repository layout
 
@@ -94,7 +108,9 @@ curl -s http://127.0.0.1:8003/v1/chat/completions -H 'Content-Type: application/
 
 This is a single-machine research deployment that has been qualified on one hardware setup. Not covered:
 sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated
-by killing or freezing the stage server), recovery of parked requests after a crash or reboot.
+by killing or freezing the stage server), recovery of parked requests after a crash or reboot. Serving several
+requests at once is newer than the rest: its exactness, caching, priority and failure handling were tested, its
+end-to-end smoke test was not adapted yet.
 
 ## Credits and licenses
 

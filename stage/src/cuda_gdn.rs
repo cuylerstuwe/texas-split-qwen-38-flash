@@ -149,8 +149,10 @@ pub struct Gdn<'m, 'd> {
     projections: Vec<Pair<'d>>,
     x: Buffer<'d>,
     weights: Vec<Buffer<'d>>,
-    initial_conv: Buffer<'d>,
-    initial_state: Buffer<'d>,
+    /// R69: one entry per conversation slot (slot 0 = the only one unless the stage runs several); `active` picks
+    /// the slot every record/prepare/commit below reads.
+    seqs: Vec<GdnSeq<'d>>,
+    active: Cell<usize>,
     next_conv: Buffer<'d>,
     next_state: Buffer<'d>,
     q: Buffer<'d>,
@@ -159,8 +161,6 @@ pub struct Gdn<'m, 'd> {
     gates: Buffer<'d>,
     y: Buffer<'d>,
     gated: Buffer<'d>,
-    states: Buffer<'d>,
-    prefix_capacity: usize,
     conv_out: Buffer<'d>,
     /// R56 zero-copy drafting (single-row steps): the core reads its initial state from snapshot
     /// slot 0 of `states` (each thread loads its state elements before storing the snapshot to
@@ -178,11 +178,66 @@ pub struct Gdn<'m, 'd> {
     multi8: Option<crate::cuda_affine4::Multi8<'m, 'd>>,
     commit: Kernel<'m, 'd>,
     restore: Kernel<'m, 'd>,
+}
+/// R69: one conversation's recurrent state: the committed convolution history and FP32 state, the per-row states of
+/// its last (uncommitted) forward, and that forward's bookkeeping.
+pub(crate) struct GdnSeq<'d> {
+    /// slot 1..: its own projection outputs (the commit reads the forward's pre-convolution rows); empty for slot 0,
+    /// which uses `Gdn::projections`
+    projections: Vec<Pair<'d>>,
+    initial_conv: Buffer<'d>,
+    initial_state: Buffer<'d>,
+    states: Buffer<'d>,
+    prefix_capacity: usize,
     rows: Cell<usize>,
     has_state: Cell<bool>,
     valid: Cell<Option<(usize, bool)>>,
 }
+impl<'d> GdnSeq<'d> {
+    fn new(d: &'d Device, prefix_capacity: usize) -> Result<Self> {
+        Ok(Self {
+            projections: [C, V, HV, HV, H].into_iter().map(|n| Pair::new(d, n)).collect::<Result<_>>()?,
+            initial_conv: d.alloc(3 * C * 2 + GUARD)?,
+            initial_state: d.alloc(STATE * 4 + GUARD)?,
+            states: d.alloc(prefix_capacity * STATE * 4 + GUARD)?,
+            prefix_capacity,
+            rows: Cell::new(0),
+            has_state: Cell::new(false),
+            valid: Cell::new(None),
+        })
+    }
+}
 impl<'m, 'd> Gdn<'m, 'd> {
+    fn s(&self) -> &GdnSeq<'d> {
+        &self.seqs[self.active.get()]
+    }
+    /// R69: the active slot's projection outputs.
+    fn proj(&self) -> &[Pair<'d>] {
+        let a = self.active.get();
+        if a == 0 { &self.projections } else { &self.seqs[a].projections }
+    }
+    /// R69: add a conversation slot (its own recurrent state and per-row verify states for `prefix_capacity` rows).
+    pub(crate) fn add_slot(&mut self, prefix_capacity: usize) -> Result<usize> {
+        ensure!((1..=MAX_T).contains(&prefix_capacity), "GDN slot prefix capacity");
+        self.seqs.push(GdnSeq::new(self.d, prefix_capacity)?);
+        Ok(self.seqs.len() - 1)
+    }
+    /// R69: the slot every following call works on.
+    pub(crate) fn select_slot(&self, slot: usize) -> Result<()> {
+        ensure!(slot < self.seqs.len(), "GDN slot {slot} of {}", self.seqs.len());
+        self.active.set(slot);
+        Ok(())
+    }
+    pub(crate) fn slots(&self) -> usize {
+        self.seqs.len()
+    }
+    /// R69: the active slot holds nothing (a later seed brings it back).
+    pub(crate) fn drop_slot_state(&self) {
+        let q = self.s();
+        q.rows.set(0);
+        q.valid.set(None);
+        q.has_state.set(false);
+    }
     pub fn new(
         d: &'d Device,
         affine: &'m Module<'d>,
@@ -261,8 +316,17 @@ impl<'m, 'd> Gdn<'m, 'd> {
                 .into_iter()
                 .map(|w| upload(w))
                 .collect::<Result<_>>()?,
-            initial_conv: d.alloc(3 * C * 2 + GUARD)?,
-            initial_state: d.alloc(STATE * 4 + GUARD)?,
+            seqs: vec![GdnSeq {
+                projections: vec![],
+                initial_conv: d.alloc(3 * C * 2 + GUARD)?,
+                initial_state: d.alloc(STATE * 4 + GUARD)?,
+                states: d.alloc(prefix_capacity * STATE * 4 + GUARD)?,
+                prefix_capacity,
+                rows: Cell::new(0),
+                has_state: Cell::new(false),
+                valid: Cell::new(None),
+            }],
+            active: Cell::new(0),
             next_conv: d.alloc(3 * C * 2 + GUARD)?,
             next_state: d.alloc(STATE * 4 + GUARD)?,
             q: d.alloc(MAX_T * HK * DK * 2 + GUARD)?,
@@ -271,8 +335,6 @@ impl<'m, 'd> Gdn<'m, 'd> {
             gates: d.alloc(MAX_T * HV * 2 * 4 + GUARD)?,
             y: d.alloc(MAX_T * V * 2 + GUARD)?,
             gated: d.alloc(MAX_T * V * 2 + GUARD)?,
-            states: d.alloc(prefix_capacity * STATE * 4 + GUARD)?,
-            prefix_capacity,
             zero_copy: std::cell::Cell::new(false),
             conv_out: d.alloc(3 * C * 2 + GUARD)?,
             prepare: ops.kernel("gdn_prepare")?,
@@ -293,16 +355,13 @@ impl<'m, 'd> Gdn<'m, 'd> {
             multi8: None,
             commit: ops.kernel("gdn_commit")?,
             restore: ops.kernel("gdn_restore")?,
-            rows: Cell::new(0),
-            has_state: Cell::new(false),
-            valid: Cell::new(None),
         })
     }
     pub fn description(&self) -> Value {
         let extra: usize = [
             &self.x,
-            &self.initial_conv,
-            &self.initial_state,
+            &self.s().initial_conv,
+            &self.s().initial_state,
             &self.next_conv,
             &self.next_state,
             &self.q,
@@ -311,15 +370,15 @@ impl<'m, 'd> Gdn<'m, 'd> {
             &self.gates,
             &self.y,
             &self.gated,
-            &self.states,
+            &self.s().states,
             &self.conv_out,
         ]
         .into_iter()
         .chain(self.weights.iter())
-        .chain(self.projections.iter().flat_map(|p| [&p.f, &p.b]))
+        .chain(self.proj().iter().flat_map(|p| [&p.f, &p.b]))
         .map(|b| b.byte_len())
         .sum();
-        json!({"backend":"native CUDA/libtinynv","cubin_sha256":SHA,"max_rows":MAX_T,"prefix_capacity":self.prefix_capacity,"state_values":STATE,"extra_bytes":extra,"linears":self.linears.iter().map(|l|l.description()).collect::<Vec<_>>(),
+        json!({"backend":"native CUDA/libtinynv","cubin_sha256":SHA,"max_rows":MAX_T,"prefix_capacity":self.s().prefix_capacity,"state_values":STATE,"extra_bytes":extra,"linears":self.linears.iter().map(|l|l.description()).collect::<Vec<_>>(),
    "kernels":[self.prepare.description(),self.recur.description(),self.fused[0].description(),self.fused[1].description(),self.fused[2].description(),self.fused[3].description(),self.norm.description(),self.commit.description(),self.restore.description()],
    "host_intermediates":0,"state_policy":"all-prefix or final-only FP32 checkpoint; explicit accepted-prefix gather+restore on device"})
     }
@@ -328,48 +387,48 @@ impl<'m, 'd> Gdn<'m, 'd> {
         self.prepare_input(x)
     }
     pub(crate) fn prepare_initial(&self, initial: &Initial) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.has_state.set(false);
+        self.s().rows.set(0);
+        self.s().valid.set(None);
+        self.s().has_state.set(false);
         initial.validate()?;
-        poison(&self.initial_conv)?;
-        poison(&self.initial_state)?;
-        self.initial_conv.upload(bytes(&initial.conv))?;
-        self.initial_state.upload(bytes(&initial.state))?;
+        poison(&self.s().initial_conv)?;
+        poison(&self.s().initial_state)?;
+        self.s().initial_conv.upload(bytes(&initial.conv))?;
+        self.s().initial_state.upload(bytes(&initial.state))?;
         ensure!(
-            bf(&self.initial_conv, 3 * C)? == initial.conv
-                && fp(&self.initial_state, STATE)? == initial.state,
+            bf(&self.s().initial_conv, 3 * C)? == initial.conv
+                && fp(&self.s().initial_state, STATE)? == initial.state,
             "GDN initial upload"
         );
         if self.zero_copy.get() {
-            self.states.upload(bytes(&initial.state))?;
+            self.s().states.upload(bytes(&initial.state))?;
         }
-        self.has_state.set(true);
+        self.s().has_state.set(true);
         Ok(())
     }
     /// R58 seeding: prepare_initial for a trusted state, with no poison or read-back canaries. In
     /// zero-copy mode the state goes only to the live snapshot slot (what execution and checkpoints
     /// read), otherwise to the initial buffer.
     pub(crate) fn prepare_initial_lean(&self, initial: &Initial) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.has_state.set(false);
+        self.s().rows.set(0);
+        self.s().valid.set(None);
+        self.s().has_state.set(false);
         ensure!(initial.conv.len() == 3 * C && initial.state.len() == STATE, "GDN initial geometry");
-        self.initial_conv.upload(bytes(&initial.conv))?;
+        self.s().initial_conv.upload(bytes(&initial.conv))?;
         if self.zero_copy.get() {
-            self.states.upload(bytes(&initial.state))?;
+            self.s().states.upload(bytes(&initial.state))?;
         } else {
-            self.initial_state.upload(bytes(&initial.state))?;
+            self.s().initial_state.upload(bytes(&initial.state))?;
         }
-        self.has_state.set(true);
+        self.s().has_state.set(true);
         Ok(())
     }
     /// Keep committed state on the card while supplying the next activation rows.
     pub fn prepare_input(&self, x: &[u16]) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
+        self.s().rows.set(0);
+        self.s().valid.set(None);
         ensure!(
-            self.has_state.get()
+            self.s().has_state.get()
                 && !x.is_empty()
                 && x.len() % H == 0
                 && x.len() / H <= MAX_T
@@ -379,54 +438,54 @@ impl<'m, 'd> Gdn<'m, 'd> {
         poison(&self.x)?;
         self.x.upload(bytes(x))?;
         ensure!(bf(&self.x, x.len())? == x, "GDN input readback");
-        self.rows.set(x.len() / H);
+        self.s().rows.set(x.len() / H);
         Ok(())
     }
     pub(crate) fn prepare_resident_input(&self, rows: usize) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
+        self.s().rows.set(0);
+        self.s().valid.set(None);
         ensure!(
-            self.has_state.get() && (1..=MAX_T).contains(&rows),
+            self.s().has_state.get() && (1..=MAX_T).contains(&rows),
             "GDN resident input/state"
         );
-        self.rows.set(rows);
+        self.s().rows.set(rows);
         Ok(())
     }
     pub(crate) fn invalidate_output(&self) {
-        self.valid.set(None);
+        self.s().valid.set(None);
     }
     pub fn initial(&self) -> Result<Initial> {
-        ensure!(self.has_state.get(), "GDN initial unavailable");
+        ensure!(self.s().has_state.get(), "GDN initial unavailable");
         Ok(Initial {
-            conv: bf(&self.initial_conv, 3 * C)?,
-            state: fp(&self.initial_state, STATE)?,
+            conv: bf(&self.s().initial_conv, 3 * C)?,
+            state: fp(&self.s().initial_state, STATE)?,
         })
     }
     /// R60 S4: the committed conv/recurrent state, read exactly (no guard-tail canary and no
     /// finite check): the stage's lean seeds do not poison the guard bytes, and the prefill
     /// pull-back reads this once per recurrent layer per chunk.
     pub fn initial_lean(&self) -> Result<Initial> {
-        ensure!(self.has_state.get(), "GDN initial unavailable");
+        ensure!(self.s().has_state.get(), "GDN initial unavailable");
         let mut conv = vec![0u8; 3 * C * 2];
         let mut state = vec![0u8; STATE * 4];
-        self.initial_conv.view(0, conv.len())?.download(&mut conv)?;
-        self.initial_state.view(0, state.len())?.download(&mut state)?;
+        self.s().initial_conv.view(0, conv.len())?.download(&mut conv)?;
+        self.s().initial_state.view(0, state.len())?.download(&mut state)?;
         Ok(Initial {
             conv: conv.chunks_exact(2).map(|v| u16::from_le_bytes(v.try_into().unwrap())).collect(),
             state: state.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect(),
         })
     }
     pub fn output(&self) -> &Buffer<'d> {
-        &self.projections[4].b
+        &self.proj()[4].b
     }
     fn args<'a>(&'a self, rows: usize, p: Policy) -> Vec<Arg<'a, 'd>> {
         vec![
-            Arg::Buffer(&self.projections[0].b),
-            Arg::Buffer(&self.projections[1].b),
-            Arg::Buffer(&self.projections[2].b),
-            Arg::Buffer(&self.projections[3].b),
-            Arg::Buffer(&self.initial_conv),
-            Arg::Buffer(if self.zero_copy.get() { &self.states } else { &self.initial_state }),
+            Arg::Buffer(&self.proj()[0].b),
+            Arg::Buffer(&self.proj()[1].b),
+            Arg::Buffer(&self.proj()[2].b),
+            Arg::Buffer(&self.proj()[3].b),
+            Arg::Buffer(&self.s().initial_conv),
+            Arg::Buffer(if self.zero_copy.get() { &self.s().states } else { &self.s().initial_state }),
             Arg::Buffer(&self.weights[0]),
             Arg::Buffer(&self.weights[1]),
             Arg::Buffer(&self.weights[2]),
@@ -437,7 +496,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
             Arg::Buffer(&self.gates),
             Arg::Buffer(&self.y),
             Arg::Buffer(&self.gated),
-            Arg::Buffer(&self.states),
+            Arg::Buffer(&self.s().states),
             Arg::Buffer(&self.conv_out),
             Arg::U32(rows as u32),
             Arg::U32(u32::from(p.all_states)),
@@ -454,7 +513,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
             "GDN record shape"
         );
         ensure!(
-            !p.all_states || rows <= self.prefix_capacity,
+            !p.all_states || rows <= self.s().prefix_capacity,
             "GDN insufficient prefix capacity"
         );
         let outputs = [
@@ -464,13 +523,13 @@ impl<'m, 'd> Gdn<'m, 'd> {
             &self.gates,
             &self.y,
             &self.gated,
-            &self.states,
+            &self.s().states,
             &self.conv_out,
         ];
         ensure!(
             outputs
                 .into_iter()
-                .chain(self.projections.iter().flat_map(|p| [&p.f, &p.b]))
+                .chain(self.proj().iter().flat_map(|p| [&p.f, &p.b]))
                 .all(|b| !x.aliases(b)),
             "GDN input/output alias"
         );
@@ -478,7 +537,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
         let mut calls = Vec::new();
         if crate::cuda_affine4::ahead_selected() && arm == 0 && !self.linears[0].is_affine8() {
             // R38: qkv/z/a/b in one launch, same blocks and outputs.
-            let o = &self.projections;
+            let o = &self.proj();
             calls.push(crate::cuda_affine4::record_multi4(
                 [&self.linears[0], &self.linears[1], &self.linears[2], &self.linears[3]],
                 x,
@@ -486,7 +545,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
                 rows,
             )?);
         } else if let (Some(m8), 0) = (&self.multi8, arm) {
-            let o = &self.projections;
+            let o = &self.proj();
             calls.push(crate::cuda_affine4::record_multi4_affine8(
                 m8,
                 [&self.linears[0], &self.linears[1], &self.linears[2], &self.linears[3]],
@@ -498,8 +557,8 @@ impl<'m, 'd> Gdn<'m, 'd> {
             for j in 0..4 {
                 calls.push(self.linears[j].record_into(
                     x,
-                    &self.projections[j].f,
-                    &self.projections[j].b,
+                    &self.proj()[j].f,
+                    &self.proj()[j].b,
                     rows,
                     arm,
                 )?);
@@ -545,16 +604,16 @@ impl<'m, 'd> Gdn<'m, 'd> {
         });
         calls.push(self.linears[4].record_into(
             &self.gated,
-            &self.projections[4].f,
-            &self.projections[4].b,
+            &self.proj()[4].f,
+            &self.proj()[4].b,
             rows,
             arm,
         )?);
         Ok(calls)
     }
     pub(crate) fn poison(&self) -> Result<()> {
-        self.valid.set(None);
-        for p in &self.projections {
+        self.s().valid.set(None);
+        for p in self.proj() {
             p.poison()?;
         }
         for b in [
@@ -564,7 +623,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
             &self.gates,
             &self.y,
             &self.gated,
-            &self.states,
+            &self.s().states,
             &self.conv_out,
         ] {
             poison(b)?;
@@ -573,21 +632,21 @@ impl<'m, 'd> Gdn<'m, 'd> {
     }
     pub(crate) fn collect(&self, t: usize, p: Policy) -> Result<Run> {
         ensure!(
-            (1..=MAX_T).contains(&t) && (!p.all_states || t <= self.prefix_capacity),
+            (1..=MAX_T).contains(&t) && (!p.all_states || t <= self.s().prefix_capacity),
             "GDN collect prefix capacity"
         );
         let mut projected = Vec::new();
         let mut projection_raw = Vec::new();
         for (j, n) in [C, V, HV, HV].into_iter().enumerate() {
-            let (f, b) = self.projections[j].read(t * n)?;
+            let (f, b) = self.proj()[j].read(t * n)?;
             projected.push(b);
             projection_raw.push(f);
         }
-        let (output_raw, output) = self.projections[4].read(t * H)?;
+        let (output_raw, output) = self.proj()[4].read(t * H)?;
         let core = Core {
             y: bf(&self.y, t * V)?,
             gated: bf(&self.gated, t * V)?,
-            states: fp(&self.states, if p.all_states { t * STATE } else { STATE })?,
+            states: fp(&self.s().states, if p.all_states { t * STATE } else { STATE })?,
             conv: bf(&self.conv_out, 3 * C)?,
         };
         if p.fused {
@@ -601,7 +660,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
             let g = fp(&self.gates, t * HV * 2)?;
             ensure!(g.iter().all(|v| (0.0..=1.0).contains(v)), "GDN gate bounds");
         }
-        self.valid.set(Some((t, p.all_states)));
+        self.s().valid.set(Some((t, p.all_states)));
         Ok(Run {
             projected,
             projection_raw,
@@ -614,9 +673,9 @@ impl<'m, 'd> Gdn<'m, 'd> {
         })
     }
     pub fn plan(&self, p: Policy, repetitions: usize, graph: bool) -> Result<Plan<'_, 'm, 'd>> {
-        let rows = self.rows.get();
+        let rows = self.s().rows.get();
         ensure!(
-            rows > 0 && self.has_state.get() && (1..=8).contains(&repetitions),
+            rows > 0 && self.s().has_state.get() && (1..=8).contains(&repetitions),
             "GDN plan bounds"
         );
         let mut c = self.record_from(&self.x, rows, p)?;
@@ -650,10 +709,10 @@ impl<'m, 'd> Gdn<'m, 'd> {
         let c = unsafe {
             self.commit.prepare(
                 vec![
-                    Arg::Buffer(&self.projections[0].b),
-                    Arg::Buffer(&self.initial_conv),
-                    Arg::Buffer(&self.initial_state),
-                    Arg::Buffer(&self.states),
+                    Arg::Buffer(&self.proj()[0].b),
+                    Arg::Buffer(&self.s().initial_conv),
+                    Arg::Buffer(&self.s().initial_state),
+                    Arg::Buffer(&self.s().states),
                     Arg::Buffer(&self.next_conv),
                     Arg::Buffer(&self.next_state),
                     Arg::U32(accepted as u32),
@@ -669,8 +728,8 @@ impl<'m, 'd> Gdn<'m, 'd> {
                 vec![
                     Arg::Buffer(&self.next_conv),
                     Arg::Buffer(&self.next_state),
-                    Arg::Buffer(&self.initial_conv),
-                    Arg::Buffer(&self.initial_state),
+                    Arg::Buffer(&self.s().initial_conv),
+                    Arg::Buffer(&self.s().initial_state),
                 ],
                 [STATE.div_ceil(256) as u32, 1, 1],
                 [256, 1, 1],
@@ -681,9 +740,9 @@ impl<'m, 'd> Gdn<'m, 'd> {
     /// R56: the committed recurrent state (convolution history, FP32 state).
     pub(crate) fn state_buffers(&self) -> Vec<&Buffer<'d>> {
         if self.zero_copy.get() {
-            return vec![&self.initial_conv, &self.states];
+            return vec![&self.s().initial_conv, &self.s().states];
         }
-        vec![&self.initial_conv, &self.initial_state]
+        vec![&self.s().initial_conv, &self.s().initial_state]
     }
     pub(crate) fn set_zero_copy(&self, on: bool) {
         self.zero_copy.set(on);
@@ -706,39 +765,39 @@ impl<'m, 'd> Gdn<'m, 'd> {
     pub(crate) fn conv_copy_rows(&self, rows: usize) -> Result<(u64, u64, u64)> {
         ensure!((3..=MAX_T).contains(&rows), "zero-copy conv rows");
         let row = (C * 2) as u64;
-        Ok((self.initial_conv.device_ptr(), self.projections[0].b.device_ptr() + (rows as u64 - 3) * row, 3 * row))
+        Ok((self.s().initial_conv.device_ptr(), self.proj()[0].b.device_ptr() + (rows as u64 - 3) * row, 3 * row))
     }
     pub(crate) fn conv_copies(&self) -> ([(u64, u64, u64); 2], (u64, u64, u64)) {
         let row = (C * 2) as u64;
-        let (next, init, qkv) = (self.next_conv.device_ptr(), self.initial_conv.device_ptr(), self.projections[0].b.device_ptr());
+        let (next, init, qkv) = (self.next_conv.device_ptr(), self.s().initial_conv.device_ptr(), self.proj()[0].b.device_ptr());
         ([(next, init + row, 2 * row), (next + 2 * row, qkv, row)], (init, next, 3 * row))
     }
     pub(crate) fn finish_commit(&self) {
-        self.valid.set(None);
-        self.rows.set(0);
-        self.has_state.set(true);
+        self.s().valid.set(None);
+        self.s().rows.set(0);
+        self.s().has_state.set(true);
     }
     /// No state roundtrip: gather a prefix checkpoint and convolution tail, then
     /// restore them to the next invocation's inputs. The caller owns token commit.
     pub fn commit(&self, accepted: usize) -> Result<()> {
         let (rows, all) = self
-            .valid
+            .s().valid
             .get()
             .ok_or_else(|| anyhow::anyhow!("GDN commit requires completed output"))?;
         ensure!(
             accepted <= rows && (all || accepted == 0 || accepted == rows),
             "GDN unavailable prefix checkpoint"
         );
-        self.valid.set(None);
+        self.s().valid.set(None);
         poison(&self.next_conv)?;
         poison(&self.next_state)?;
         let c = unsafe {
             self.commit.prepare(
                 vec![
-                    Arg::Buffer(&self.projections[0].b),
-                    Arg::Buffer(&self.initial_conv),
-                    Arg::Buffer(&self.initial_state),
-                    Arg::Buffer(&self.states),
+                    Arg::Buffer(&self.proj()[0].b),
+                    Arg::Buffer(&self.s().initial_conv),
+                    Arg::Buffer(&self.s().initial_state),
+                    Arg::Buffer(&self.s().states),
                     Arg::Buffer(&self.next_conv),
                     Arg::Buffer(&self.next_state),
                     Arg::U32(accepted as u32),
@@ -754,19 +813,19 @@ impl<'m, 'd> Gdn<'m, 'd> {
                 vec![
                     Arg::Buffer(&self.next_conv),
                     Arg::Buffer(&self.next_state),
-                    Arg::Buffer(&self.initial_conv),
-                    Arg::Buffer(&self.initial_state),
+                    Arg::Buffer(&self.s().initial_conv),
+                    Arg::Buffer(&self.s().initial_state),
                 ],
                 [STATE.div_ceil(256) as u32, 1, 1],
                 [256, 1, 1],
             )?
         };
-        self.rows.set(0);
-        self.has_state.set(false);
+        self.s().rows.set(0);
+        self.s().has_state.set(false);
         c.enqueue()?;
         restore.enqueue()?;
         self.d.sync()?;
-        self.has_state.set(true);
+        self.s().has_state.set(true);
         Ok(())
     }
 }
@@ -797,7 +856,7 @@ impl Plan<'_, '_, '_> {
         let a = self.owner;
         let t = self.rows;
         ensure!(
-            a.rows.get() == t && a.has_state.get(),
+            a.s().rows.get() == t && a.s().has_state.get(),
             "GDN plan invalidated"
         );
         a.poison()?;
@@ -872,8 +931,8 @@ impl<'m, 'd> Gdn<'m, 'd> {
             Arg::Buffer(&s.proj[1].1),
             Arg::Buffer(&s.proj[2].1),
             Arg::Buffer(&s.proj[3].1),
-            Arg::Buffer(&self.initial_conv),
-            Arg::Buffer(&self.initial_state),
+            Arg::Buffer(&self.s().initial_conv),
+            Arg::Buffer(&self.s().initial_state),
             Arg::Buffer(&self.weights[0]),
             Arg::Buffer(&self.weights[1]),
             Arg::Buffer(&self.weights[2]),
@@ -925,7 +984,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
         let c = unsafe {
             self.commit.prepare(
                 vec![
-                    Arg::Buffer(&s.proj[0].1), Arg::Buffer(&self.initial_conv), Arg::Buffer(&self.initial_state), Arg::Buffer(&s.states),
+                    Arg::Buffer(&s.proj[0].1), Arg::Buffer(&self.s().initial_conv), Arg::Buffer(&self.s().initial_state), Arg::Buffer(&s.states),
                     Arg::Buffer(&self.next_conv), Arg::Buffer(&self.next_state), Arg::U32(rows as u32), Arg::U32(rows as u32), Arg::U32(0),
                 ],
                 [STATE.div_ceil(256) as u32, 1, 1],
@@ -934,7 +993,7 @@ impl<'m, 'd> Gdn<'m, 'd> {
         };
         let r = unsafe {
             self.restore.prepare(
-                vec![Arg::Buffer(&self.next_conv), Arg::Buffer(&self.next_state), Arg::Buffer(&self.initial_conv), Arg::Buffer(&self.initial_state)],
+                vec![Arg::Buffer(&self.next_conv), Arg::Buffer(&self.next_state), Arg::Buffer(&self.s().initial_conv), Arg::Buffer(&self.s().initial_state)],
                 [STATE.div_ceil(256) as u32, 1, 1],
                 [256, 1, 1],
             )?

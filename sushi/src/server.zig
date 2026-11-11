@@ -6226,6 +6226,8 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
 /// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
 fn ssmResidentCap(config: *const model_mod.ModelConfig) ?u64 {
     if (!config.isQwen4() or !diskTierOn(config)) return null;
+    // texas-split R66: the request keeps every checkpoint (`scheduler.qwenCheckpointCapped`); bill them all.
+    if (prefix_cache_mod.hotKeepsAllCheckpoints()) return null;
     return transformer_mod.SSM_RESIDENT_MAX;
 }
 

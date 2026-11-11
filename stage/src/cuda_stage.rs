@@ -138,13 +138,37 @@ impl<'m, 'd> StageHead<'m, 'd> {
         Ok(())
     }
 }
+/// R69: conversation slots on the stage (QD_STAGE_SLOTS, default 1).
+pub fn stage_slots() -> usize {
+    std::env::var("QD_STAGE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 4)
+}
+/// R69: per-row verify states of extra slot `slot` (1..): QD_STAGE_SLOT_VERIFY_ROWS, one value or a comma list per
+/// extra slot (the last value repeats). Default: slot 1 keeps 9 rows (a lookup round), later slots 4 (an MTP round at
+/// depth 3), which is what fits the card beside the 262K-row state.
+pub fn slot_verify_rows(slot: usize) -> usize {
+    let default = if slot <= 1 { SLOT_VERIFY_ROWS } else { 4 };
+    let Ok(v) = std::env::var("QD_STAGE_SLOT_VERIFY_ROWS") else { return default };
+    let parts: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    if parts.is_empty() {
+        return default;
+    }
+    parts[(slot.max(1) - 1).min(parts.len() - 1)].clamp(1, SLOT_VERIFY_ROWS)
+}
+/// R69: rows of each extra slot's KV view (QD_STAGE_SLOT_ROWS, default 65536).
+pub fn slot_rows() -> usize {
+    std::env::var("QD_STAGE_SLOT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(65536) / 4 * 4
+}
+/// R69: per-row verify states each slot keeps in multi-slot mode.
+pub const SLOT_VERIFY_ROWS: usize = 9;
 pub struct Stage<'m, 'd> {
     d: &'d Device,
     pub first: usize,
     layers: Vec<StageLayer<'m, 'd>>,
     input: Buffer<'d>,
-    rows: Cell<usize>,
-    position: Cell<usize>,
+    /// R69: per conversation slot (committed position, rows of its last forward); `active` picks the slot
+    slot_rows: Vec<Cell<usize>>,
+    slot_position: Vec<Cell<usize>>,
+    active: Cell<usize>,
     pub load_s: f64,
     /// Attention KV tokens per layer (the prefill scratch sizes its QSA score rows by it).
     capacity: usize,
@@ -166,6 +190,11 @@ impl<'m, 'd> Stage<'m, 'd> {
         ensure!((2..48).contains(&first), "stage starts after the PLE layer");
         let t = Instant::now();
         let mut layers = vec![];
+        // R69 (QD_STAGE_SLOTS=2, multi-stream only): a second conversation slot. Both slots keep per-row verify states
+        // for 9 rows (observed split verify forwards: 1-4 rows, lookup drafts up to 9, never more); slot 1's KV and
+        // pooled keys view the top QD_STAGE_SLOT_ROWS rows of slot 0's buffers. Unset: one slot, exactly as before.
+        let slots = stage_slots();
+        let prefix = if slots > 1 { SLOT_VERIFY_ROWS } else { gdn::MAX_T };
         for l in first..48 {
             let bank = Bank::canonical(pack, l, None)?;
             layers.push(if l % 4 == 3 {
@@ -173,30 +202,84 @@ impl<'m, 'd> Stage<'m, 'd> {
                 StageLayer::Attention(al::Layer::new_canonical(d, m, attention_module, m8, &w, &bank, capacity)?)
             } else {
                 let w = target_layer::Weights::load(pack, l)?;
-                StageLayer::Recurrent(rl::Layer::new_canonical(d, m, m8, &w, &bank, gdn::MAX_T)?)
+                StageLayer::Recurrent(rl::Layer::new_canonical(d, m, m8, &w, &bank, prefix)?)
             });
+        }
+        for slot in 1..slots {
+            for layer in layers.iter_mut() {
+                match layer {
+                    StageLayer::Attention(at) => at.add_slot_view(slot_rows())?,
+                    StageLayer::Recurrent(r) => r.add_slot(slot_verify_rows(slot))?,
+                };
+            }
         }
         Ok(Self {
             d,
             first,
             layers,
             input: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
-            rows: Cell::new(0),
-            position: Cell::new(0),
+            slot_rows: (0..slots).map(|_| Cell::new(0)).collect(),
+            slot_position: (0..slots).map(|_| Cell::new(0)).collect(),
+            active: Cell::new(0),
             load_s: t.elapsed().as_secs_f64(),
             capacity,
         })
     }
+    /// R69: conversation slots.
+    pub fn slots(&self) -> usize {
+        self.slot_rows.len()
+    }
+    /// R69: rows one forward of `slot` may carry (its per-row verify states).
+    pub fn slot_forward_rows(&self, slot: usize) -> usize {
+        if self.slots() == 1 {
+            hc::MAX_ROWS
+        } else if slot == 0 {
+            SLOT_VERIFY_ROWS
+        } else {
+            slot_verify_rows(slot)
+        }
+    }
+    pub fn active_slot(&self) -> usize {
+        self.active.get()
+    }
+    /// R69: every following call works on `slot`.
+    pub fn select(&self, slot: usize) -> Result<()> {
+        ensure!(slot < self.slots(), "stage slot {slot} of {}", self.slots());
+        if slot == self.active.get() {
+            return Ok(());
+        }
+        for l in &self.layers {
+            match l {
+                StageLayer::Recurrent(r) => r.select_slot(slot)?,
+                StageLayer::Attention(at) => at.select_slot(slot)?,
+            }
+        }
+        self.active.set(slot);
+        Ok(())
+    }
+    /// R69: the active slot (not slot 0) holds nothing from now on (slot 0 may grow into its views again).
+    pub fn drop_slot(&self) -> Result<()> {
+        ensure!(self.active.get() != 0, "slot 0 is never dropped");
+        for l in &self.layers {
+            match l {
+                StageLayer::Recurrent(r) => r.drop_slot_state(),
+                StageLayer::Attention(at) => at.drop_slot_state(),
+            }
+        }
+        self.slot_rows[self.active.get()].set(0);
+        self.slot_position[self.active.get()].set(0);
+        Ok(())
+    }
     pub fn description(&self) -> Value {
-        json!({"first":self.first,"layers":self.layers.len(),"load_s":self.load_s,"position":self.position.get(),
+        json!({"first":self.first,"layers":self.layers.len(),"load_s":self.load_s,"position":self.slot_position[self.active.get()].get(),
             "recurrent_policy":format!("{:?}",recurrent_policy()),"attention_policy":format!("{:?}",attention_policy())})
     }
     pub fn position(&self) -> usize {
-        self.position.get()
+        self.slot_position[self.active.get()].get()
     }
     /// Rows of the last forward not yet committed (0 when none).
     pub fn pending(&self) -> usize {
-        self.rows.get()
+        self.slot_rows[self.active.get()].get()
     }
     /// Seed layer `layer`'s recurrent state (convolution history, FP32 GDN state).
     pub fn import_recurrent(&self, layer: usize, initial: &gdn::Initial) -> Result<()> {
@@ -224,10 +307,32 @@ impl<'m, 'd> Stage<'m, 'd> {
             }
         }
     }
+    /// R66 (incremental seed): the committed row count an attention layer holds from position 0
+    /// (None when it holds no state or a windowed one).
+    pub fn attention_len(&self, layer: usize) -> Option<usize> {
+        match self.layers.get(layer.wrapping_sub(self.first)) {
+            Some(StageLayer::Attention(l)) => l.position_meta().filter(|&(base, _)| base == 0).map(|(_, len)| len),
+            _ => None,
+        }
+    }
+    /// R66: committed K codes of rows [from, to) of an attention layer (the lineage check).
+    pub fn attention_key_codes(&self, layer: usize, from: usize, to: usize) -> Result<Vec<u8>> {
+        match self.layers.get(layer.wrapping_sub(self.first)) {
+            Some(StageLayer::Attention(l)) => l.key_codes(from, to),
+            _ => anyhow::bail!("layer {layer} is not a stage attention layer"),
+        }
+    }
+    /// R66: rows from `cache.base` on replace the held ones; earlier rows stay (Attention::refresh_rows).
+    pub fn refresh_attention(&self, layer: usize, cache: &a::State, index: &qsa::State) -> Result<()> {
+        match self.layers.get(layer.wrapping_sub(self.first)) {
+            Some(StageLayer::Attention(l)) => l.refresh_state(cache, index),
+            _ => anyhow::bail!("layer {layer} is not a stage attention layer"),
+        }
+    }
     /// After every layer was seeded: the committed sequence length.
     pub fn set_position(&self, position: usize) {
-        self.position.set(position);
-        self.rows.set(0);
+        self.slot_position[self.active.get()].set(position);
+        self.slot_rows[self.active.get()].set(0);
     }
     /// The recurrent and attention state of every stage layer (for the prefix cache).
     pub fn export(&self) -> Result<Vec<Value>> {
@@ -278,7 +383,7 @@ impl<'m, 'd> Stage<'m, 'd> {
         ensure!(!x.is_empty() && x.len() % hc::F == 0 && x.len() / hc::F <= hc::MAX_ROWS, "stage input rows");
         let rows = x.len() / hc::F;
         let mut calls: Vec<PreparedCall<'_, 'm, 'd>> = vec![];
-        let prev = self.rows.get();
+        let prev = self.slot_rows[self.active.get()].get();
         if prev > 0 {
             let accepted = commit_prev.unwrap_or(prev);
             ensure!(accepted <= prev, "stage commit beyond the last forward");
@@ -295,8 +400,8 @@ impl<'m, 'd> Stage<'m, 'd> {
                     StageLayer::Attention(at) => at.finish_commit(accepted)?,
                 }
             }
-            self.rows.set(0);
-            self.position.set(self.position.get() + accepted);
+            self.slot_rows[self.active.get()].set(0);
+            self.slot_position[self.active.get()].set(self.slot_position[self.active.get()].get() + accepted);
         } else {
             ensure!(commit_prev.is_none_or(|c| c == 0), "stage commit without a forward");
         }
@@ -338,25 +443,25 @@ impl<'m, 'd> Stage<'m, 'd> {
         self.layers.last().unwrap().output().download(&mut raw)?;
         let out: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         ensure!(out.iter().all(|&v| bf16::from_bits(v).is_finite()), "stage output finite");
-        self.rows.set(rows);
+        self.slot_rows[self.active.get()].set(rows);
         Ok(out)
     }
     /// Drop the last forward's rows without GPU work (the next seed overwrites every state).
     pub fn discard(&self) -> Result<()> {
-        if self.rows.get() > 0 {
+        if self.slot_rows[self.active.get()].get() > 0 {
             for l in &self.layers {
                 match l {
                     StageLayer::Recurrent(r) => r.finish_commit(),
                     StageLayer::Attention(at) => at.finish_commit(0)?,
                 }
             }
-            self.rows.set(0);
+            self.slot_rows[self.active.get()].set(0);
         }
         Ok(())
     }
     /// Keep the first `accepted` rows of the last forward (0..=rows).
     pub fn commit(&self, accepted: usize) -> Result<()> {
-        let rows = self.rows.get();
+        let rows = self.slot_rows[self.active.get()].get();
         ensure!(rows > 0 && accepted <= rows, "stage commit after a forward");
         let rp = recurrent_policy();
         let mut calls: Vec<PreparedCall<'_, 'm, 'd>> = vec![];
@@ -377,8 +482,8 @@ impl<'m, 'd> Stage<'m, 'd> {
                 StageLayer::Attention(at) => at.finish_commit(accepted)?,
             }
         }
-        self.rows.set(0);
-        self.position.set(self.position.get() + accepted);
+        self.slot_rows[self.active.get()].set(0);
+        self.slot_position[self.active.get()].set(self.slot_position[self.active.get()].get() + accepted);
         Ok(())
     }
 }
@@ -446,7 +551,7 @@ impl<'m, 'd> Stage<'m, 'd> {
     /// R60 S4 (prefill v2): as `prefill`, streams as little-endian BF16 bytes straight from and into
     /// the caller's memory (the server's shared file; no intermediate copies).
     pub fn prefill_raw(&self, p: &Prefill<'m, 'd>, input: &[u8], output: &mut [u8]) -> Result<()> {
-        ensure!(self.rows.get() == 0, "stage prefill with an uncommitted forward");
+        ensure!(self.slot_rows[self.active.get()].get() == 0, "stage prefill with an uncommitted forward");
         ensure!(!input.is_empty() && input.len() % (hc::F * 2) == 0 && output.len() == input.len(), "stage prefill input rows");
         let rows = input.len() / (hc::F * 2);
         ensure!(rows <= p.scratch.rows, "stage prefill chunk exceeds its scratch");
@@ -478,7 +583,7 @@ impl<'m, 'd> Stage<'m, 'd> {
         }
         self.d.sync()?;
         p.streams[self.layers.len() % 2].download(output)?;
-        self.position.set(self.position.get() + rows);
+        self.slot_position[self.active.get()].set(self.slot_position[self.active.get()].get() + rows);
         p.ring_rows.set(rows.min(RING_ROWS));
         Ok(())
     }
@@ -490,8 +595,53 @@ impl<'m, 'd> Stage<'m, 'd> {
     ///   tag 2 attention: KV positions [from, to) token-major (key codes, key scales, key biases,
     ///     value codes, value scales, value biases), pooled blocks [from/4, to/4) [., 128] BF16,
     ///     u64 n, the last n raw QSA keys [n, 128] BF16 (n = min(to - from, RING_ROWS)).
+    /// R66d (end-of-turn pull-back): the committed state of rows [from, to) in prefill_export's QDX1 layout, the raw
+    /// keys being the open group at `to` (n = to % 4; the only raw keys a restore at `to` reads). Commit first.
+    pub fn export_rows(&self, from: usize, to: usize, out: &mut Vec<u8>) -> Result<()> {
+        ensure!(from < to && to == self.slot_position[self.active.get()].get() && self.slot_rows[self.active.get()].get() == 0, "export range [{from}, {to}) at {} + {}", self.slot_position[self.active.get()].get(), self.slot_rows[self.active.get()].get());
+        out.clear();
+        let align = |o: &mut Vec<u8>| o.resize(o.len().div_ceil(16) * 16, 0);
+        for v in [0x3158_4451u32, 1, self.first as u32, (48 - self.first) as u32] {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend((from as u64).to_le_bytes());
+        out.extend((to as u64).to_le_bytes());
+        align(out);
+        for l in &self.layers {
+            match l {
+                StageLayer::Recurrent(r) => {
+                    out.extend(1u32.to_le_bytes());
+                    out.extend(0u32.to_le_bytes());
+                    align(out);
+                    let init = r.initial_lean()?;
+                    for v in &init.conv {
+                        out.extend(v.to_le_bytes());
+                    }
+                    align(out);
+                    for v in &init.state {
+                        out.extend(v.to_le_bytes());
+                    }
+                    align(out);
+                }
+                StageLayer::Attention(at) => {
+                    out.extend(2u32.to_le_bytes());
+                    out.extend(0u32.to_le_bytes());
+                    align(out);
+                    at.export_prefill_rows(from, to, out)?;
+                    align(out);
+                    let keys = at.open_keys()?;
+                    ensure!(keys.len() == to % qsa::RATIO * qsa::D * 2, "open-group keys {} bytes at {to}", keys.len());
+                    out.extend(((to % qsa::RATIO) as u64).to_le_bytes());
+                    align(out);
+                    out.extend(&keys);
+                    align(out);
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn prefill_export(&self, p: &Prefill<'m, 'd>, from: usize, to: usize, out: &mut Vec<u8>) -> Result<()> {
-        ensure!(from < to && to == self.position.get(), "prefill export range");
+        ensure!(from < to && to == self.slot_position[self.active.get()].get(), "prefill export range");
         let n = (to - from).min(RING_ROWS);
         ensure!(p.ring_rows.get() >= n, "prefill export: the last call held {} rows, {n} raw keys needed", p.ring_rows.get());
         out.clear();
@@ -543,8 +693,8 @@ impl<'m, 'd> Stage<'m, 'd> {
     /// pooled blocks, open-group raw keys}. Exact device reads of the committed bytes only, through
     /// a bounded host buffer. Nothing may be pending (commit first). Returns the bytes written.
     pub fn snapshot(&self, w: &mut dyn std::io::Write) -> Result<u64> {
-        ensure!(self.rows.get() == 0, "stage snapshot with an uncommitted forward");
-        let position = self.position.get();
+        ensure!(self.slot_rows[self.active.get()].get() == 0, "stage snapshot with an uncommitted forward");
+        let position = self.slot_position[self.active.get()].get();
         struct Out<'w> {
             w: &'w mut dyn std::io::Write,
             at: u64,
@@ -634,7 +784,7 @@ impl<'m, 'd> Stage<'m, 'd> {
     #[cfg(feature = "r53-driver")]
     pub fn prefill_profile(&self, p: &Prefill<'m, 'd>, x: &[u16], replays: usize) -> Result<(Vec<String>, Vec<f64>, f64)> {
         use crate::r53_cal::{read_stamps, stamp_bytes};
-        ensure!(self.rows.get() == 0 && !x.is_empty() && x.len() % hc::F == 0, "stage prefill profile input");
+        ensure!(self.slot_rows[self.active.get()].get() == 0 && !x.is_empty() && x.len() % hc::F == 0, "stage prefill profile input");
         let rows = x.len() / hc::F;
         ensure!(rows <= p.scratch.rows && replays > 0, "stage prefill profile shape");
         p.streams[0].upload(&bytes(x))?;

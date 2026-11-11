@@ -7,6 +7,7 @@ See README.md and INSTALL.md at the repository root.
   texas_split.py start|stop|restart    lifecycle through launchd (installs the agent on start)
   texas_split.py status|health|logs [--follow]
   texas_split.py install-plist|uninstall|write-pins|check
+  texas_split.py concurrency [N]       show, or set, how many requests generate at once (1-16; default 1)
 
 Configuration: texas-split.env at the repository root (written by install.sh; KEY=VALUE lines) and
 TEXAS_SPLIT_* environment variables, which win. The host listens on 127.0.0.1:8003 by default and owns:
@@ -16,7 +17,9 @@ TEXAS_SPLIT_* environment variables, which win. The host listens on 127.0.0.1:80
   foreground/background with exact-progress parking (priority_control.py: leased holds on
   /v1/scheduler with a private control key, a private IPC page Sushi polls, SSD checkpoints; the
   5090 stage's half of a parked request parks to SSD beside Sushi's), one generation at a time in
-  Sushi (later ones wait there, or here while the engine starts or restarts);
+  Sushi by default (later ones wait there, or here while the engine starts or restarts), or up to
+  TEXAS_SPLIT_MAX_CONCURRENT at once: up to four of them decode through the 5090 on conversation
+  slots, interleaved, and the rest run every layer on the Mac beside them;
 - supervision: crashed engines restart with backoff; a stage that cannot start leaves the service
   running every layer on the Mac (mode mac-only) instead of failing;
 - shutdown that never signals the stage server while it puts the card down: Sushi stops first,
@@ -58,6 +61,24 @@ def load_config():
 CFG = load_config()
 
 
+def set_config(key, value):
+    """KEY=VALUE into the configuration file load_config reads: the key's line is replaced, or one is appended."""
+    path = Path(os.environ.get('TEXAS_SPLIT_CONFIG', REPO / 'texas-split.env')).expanduser()
+    lines = path.read_text().splitlines() if path.is_file() else []
+    out, done = [], False
+    for line in lines:
+        if line.strip().startswith(key + '='):
+            if not done:
+                out.append(f'{key}={value}')
+                done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append(f'{key}={value}')
+    path.write_text('\n'.join(out) + '\n')
+    return path
+
+
 def cfg_path(key, default):
     return Path(os.path.expanduser(CFG.get(key) or str(default)))
 
@@ -69,11 +90,11 @@ MODEL_ID = MODEL.name
 ALIAS = 'texas-split'
 ALLOWED_MODELS = {'texas', MODEL_ID, ALIAS}
 BACKEND = VERSION + '-native-priority'    # X-Texas-Backend
-SUSHI = REPO / 'sushi/zig-out/bin/sushi'
+SUSHI = cfg_path('TEXAS_SPLIT_SUSHI_BIN', REPO / 'sushi/zig-out/bin/sushi')   # another build: experiments only (unpinned)
 LIBS = REPO / 'runtime/mlx-lib'           # MLX runtime libraries (install.sh)
 CAPS = REPO / 'runtime/memory_caps.dylib'
 STAGE_DIR = REPO / 'stage'
-STAGE_BIN = STAGE_DIR / 'target/release/canon-stage-server'
+STAGE_BIN = cfg_path('TEXAS_SPLIT_STAGE_BIN', STAGE_DIR / 'target/release/canon-stage-server')   # likewise
 FIRMWARE = REPO / 'driver/libtinynv/third_party/firmware'
 MACUDA = cfg_path('TEXAS_SPLIT_MACUDA', REPO / 'third_party/macuda')
 CACHE = cfg_path('TEXAS_SPLIT_CACHE', Path.home() / 'Library/Caches/Texas-Split')
@@ -88,6 +109,32 @@ FOREIGN_PORTS = ()
 GPU_DEVID = CFG.get('TEXAS_SPLIT_GPU_DEVID') or '0x2b85'   # RTX 5090 (GB202)
 CONTROL_KEY = cfg_path('TEXAS_SPLIT_CONTROL_KEY', Path.home() / '.config/texas-split/control-key')
 MAX_SLOTS = 8                             # at most 8 requests in flight
+
+
+def cfg_int(key, default):
+    try:
+        return int(CFG.get(key) or default)
+    except ValueError:
+        return default
+
+
+# Requests generating at once on the split: TEXAS_SPLIT_MAX_CONCURRENT (1-16; `texas-split concurrency N` writes it to
+# texas-split.env). 1, the default, is one generation at a time. Above that, up to STAGE_SLOTS requests decode
+# through the 5090 at once, interleaved (each one's 5090 half runs while the Mac works on the others'), and any
+# further ones run every layer on the Mac beside them (Sushi's continuous batching).
+MAX_CONCURRENT = max(1, min(16, cfg_int('TEXAS_SPLIT_MAX_CONCURRENT', 1)))
+MAX_SLOTS = max(MAX_SLOTS, MAX_CONCURRENT + 8)
+# Conversation slots on the 5090 stage: 1 when one request runs at a time, else up to 4 (TEXAS_SPLIT_SLOTS). Slot 0
+# is the stage's whole state as before; extra slot k holds STAGE_SLOT_ROWS rows carved from the top of slot 0's
+# 262,160 (slot 0 keeps what the occupied extra slots do not take; Sushi moves an extra slot's request to the Mac
+# before a request crosses a boundary). What fits the card beside the stage (free VRAM at ready): 2 slots with 9
+# verify rows each and 1536-row prefill pieces 0.40 GiB; 3 slots (9, 9, 4 rows) with 1024-row pieces 0.47 GiB;
+# 4 slots (9, 9, 4, 4) with 768-row pieces 0.39 GiB. One slot: 16 rows, 1536-row pieces, 0.58 GiB, as always.
+STAGE_SLOTS = 1 if MAX_CONCURRENT == 1 else max(1, min(4, MAX_CONCURRENT, cfg_int('TEXAS_SPLIT_SLOTS', 4)))
+# Rows per extra slot: an equal share of the stage's rows by default (2 slots: 131,080; 3: 87,384; 4: 65,536), so
+# two long agent conversations both fit. TEXAS_SPLIT_SLOT_ROWS overrides.
+STAGE_SLOT_ROWS = max(4096, min(STAGE_CAPACITY // 2, cfg_int('TEXAS_SPLIT_SLOT_ROWS', STAGE_CAPACITY // max(2, STAGE_SLOTS)))) // 8 * 8
+STAGE_SLOT_LAYOUT = {1: (None, '1536'), 2: ('9', '1536'), 3: ('9,4', '1024'), 4: ('9,4,4', '768')}[STAGE_SLOTS]
 BACKGROUND_MEDIA = {'image', 'image_url', 'input_image', 'video_url', 'input_audio', 'audio_url', 'video', 'audio'}
 GIB = 1024 ** 3
 LABEL = CFG.get('TEXAS_SPLIT_LABEL') or 'com.texas-split.server'
@@ -457,7 +504,8 @@ class Host:
                                engine_pid=self.engine.pid if self.engine else None,
                                stage_pid=self.stage.pid if self.stage else None,
                                stage=self.stage_info or None, restarts=len(self.restarts),
-                               model=MODEL_ID, context=CONTEXT, endpoint=f'http://127.0.0.1:{PORT}/v1')
+                               model=MODEL_ID, context=CONTEXT, endpoint=f'http://127.0.0.1:{PORT}/v1',
+                               concurrency=dict(max=MAX_CONCURRENT, stage_slots=STAGE_SLOTS, slot_rows=STAGE_SLOT_ROWS))
 
     # ---- locks ----
     def clean_old_runs(self):
@@ -560,13 +608,21 @@ class Host:
                    # Its 0.71 GB fits beside the 262K-row state only with 1536-row prefill pieces (2048 leaves
                    # too little for the first decode); time to first token is unchanged. QD_STAGE_HEAD='0'
                    # (with SUSHI_R64_STAGE_HEAD='0') disables it.
-                   QD_STAGE_HEAD='1', QD_STAGE_PREFILL_ROWS='1536',
+                   QD_STAGE_HEAD='1', QD_STAGE_PREFILL_ROWS=STAGE_SLOT_LAYOUT[1],
                    # each MoE block's shared expert runs as a side branch beside the router chain and the routed
                    # experts (driver launch latches, stage/README.md); bit-identical, 1-7 row forwards 0.24-0.36 ms
                    # faster, prefill unchanged. '0' disables it.
                    QD_STAGE_SIDE='1')
+        if STAGE_SLOTS > 1:
+            # conversation slots (see STAGE_SLOTS)
+            env.update(QD_STAGE_SLOTS=str(STAGE_SLOTS), QD_STAGE_SLOT_ROWS=str(STAGE_SLOT_ROWS),
+                       QD_STAGE_SLOT_VERIFY_ROWS=STAGE_SLOT_LAYOUT[0])
+        # experiments only: extra stage variables as a JSON object (QD_ / QWEN_ names)
+        extra = json.loads(CFG.get('TEXAS_SPLIT_STAGE_ENV') or '{}')
+        env.update({k: str(v) for k, v in extra.items() if k.startswith(('QD_', 'QWEN_'))})
         self.hold_display()
         slog = open(self.run_dir / 'stage.log', 'ab', buffering=0)
+        self.ensure_tinygpu_server(env, slog)
         self.stage = subprocess.Popen(['sh', str(MACUDA / 'tools/nv_shim_step.sh'), 'local', 'probe', str(STAGE_BIN),
                                        str(STAGE_FIRST), str(STAGE_CAPACITY)], cwd=STAGE_DIR, env=env, stdout=slog,
                                       stderr=subprocess.STDOUT, start_new_session=True)
@@ -655,6 +711,28 @@ class Host:
             # answered cheaper rounds with shallower drafts. Depth policy only (speculative sampling keeps the
             # target distribution at any depth); the text also stops depending on timing. Mac-only keeps the planner.
             env.update(SUSHI_MTP_ADAPTIVE='0', SUSHI_MTP_COST_TABLE='0', SUSHI_MTP_ADAPTIVE_SERIAL='0')
+            # Hot prefix-cache entries keep every recurrent-state checkpoint in RAM (capped at 16 and thinned) instead
+            # of only the newest two. The others were meant to live in the SSD record, but a split entry whose reply
+            # rows are still on the 5090 cannot persist, so a request that diverged mid-history (an agent's
+            # compaction prompt, a pruned tool result) prefilled from 0. Restore points only. '0': stock retention.
+            env.update(SUSHI_HOT_KEEP_CPS='1')
+            # Incremental stage seed (stage op 10): the stage keeps the rows of the sequence it last held; a request
+            # whose prompt shares them seeds only rows [base, position) and the recurrent states (~50 MB) instead of
+            # every row (~450 MB, ~100 ms at 70K tokens). The stage hashes its rows below base against Sushi's before
+            # accepting; a refusal falls back to the full seed. '0': always the full seed.
+            env.update(SUSHI_STAGE_ISEED='1')
+            # End-of-turn pull-back (stage op 9): after a split turn the reply's rows of layers 28-47 and the
+            # recurrent states are copied back from the 5090 and a checkpoint is taken at the reply's end, so the
+            # next turn resumes after the reply instead of prefilling it again, and the entry can persist. '0': off.
+            env.update(SUSHI_STAGE_PULLBACK_END='1')
+            # An image-bearing request whose uncached rows are all text at one rotary offset (a warm turn with no
+            # new image) prefills through the stage with that offset, as decode rows already do; image rows and
+            # cold image prompts stay on the Mac. Warm image-session turns reach the first token ~30% sooner. '0': off.
+            env.update(SUSHI_STAGE_MROPE_TEXT='1')
+            if STAGE_SLOTS > 1:
+                # the stage's conversation slots, as launched above
+                env.update(SUSHI_STAGE_SLOTS=str(STAGE_SLOTS), SUSHI_STAGE_SLOT_ROWS=str(STAGE_SLOT_ROWS),
+                           SUSHI_STAGE_SLOT_VERIFY_ROWS=STAGE_SLOT_LAYOUT[0], SUSHI_STAGE_CAPACITY=str(STAGE_CAPACITY))
         # qualification only: extra Sushi variables as a JSON object (e.g. a fixed MTP width)
         extra = json.loads(CFG.get('TEXAS_SPLIT_SUSHI_ENV') or '{}')
         env.update({k: str(v) for k, v in extra.items() if k.startswith('SUSHI_')})
@@ -673,7 +751,10 @@ class Host:
                '--max-tokens', '131072', '--temp', '1', '--top-p', '0.95', '--top-k', '20',
                '--mtp', '--kv-quant', '8', '--qwen-gdn', '32', '--mtp-head-kv-quant', '--think', 'xhigh',
                '--max-resident-models', '1', '--max-resident-mem', '108GB',
-               '--max-concurrent', '1', '--prefix-cache-entries', '4', '--prefix-cache-mem', '1GB',
+               # the split's idle allowance is 2 GB (1 GB Mac-only): its entries also carry their checkpoints (~110 MB
+               # each), and an idle conversation that overflows the allowance cannot spill to SSD, it is dropped
+               '--max-concurrent', str(MAX_CONCURRENT if stage_env else 1), '--prefix-cache-entries', '4',
+               '--prefix-cache-mem', '2GB' if stage_env else '1GB',
                '--prefix-cache-disk', '20GB', '--metrics', '--no-update-check',
                '--log-file', str(self.run_dir / 'sushi-native.log')]
         elog = open(self.run_dir / 'engine.log', 'ab', buffering=0)
@@ -751,6 +832,24 @@ class Host:
                 except (ProcessLookupError, PermissionError):
                     pass
                 p.wait(timeout=10)
+
+    def ensure_tinygpu_server(self, env, slog):
+        """The TinyGPU server outlives stage servers. With none listening (after a reboot or a replug) the stage step
+        starts one itself, inside its own process group: that group then never empties when the stage server exits, so
+        every stop waits out its 90 s and signals the group, killing the TinyGPU server each time. Start it here
+        instead, in a session of its own, after the same read-only preflight the step runs; the step's own `ensure`
+        then finds it listening. Any failure here leaves the step to do it as before."""
+        try:
+            pf = subprocess.run(['sh', str(MACUDA / 'tools/preflight.sh')], env=env, capture_output=True, text=True,
+                                timeout=120)
+            verdict = (pf.stdout.strip().splitlines() or [''])[-1]
+            if 'VERDICT: OK' not in verdict:
+                return
+            r = subprocess.run(['sh', str(MACUDA / 'tools/tinygpu-server.sh'), 'ensure'], env=env, capture_output=True,
+                               text=True, timeout=60, start_new_session=True)
+            slog.write(('host: ' + (r.stdout.strip().splitlines() or ['tinygpu-server ensure: no output'])[-1] + '\n').encode())
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f'tinygpu server pre-start skipped: {e}')
 
     def stop_stage(self):
         s, self.stage = self.stage, None
@@ -1255,7 +1354,8 @@ def cli_stop():
 def main():
     p = argparse.ArgumentParser(prog='texas-split')
     p.add_argument('action', choices=['serve', 'start', 'stop', 'restart', 'status', 'health', 'logs', 'install-plist', 'uninstall',
-                                      'write-pins', 'check'])
+                                      'write-pins', 'check', 'concurrency'])
+    p.add_argument('value', nargs='?', help='concurrency: requests generating at once (1-16); omit to show')
     p.add_argument('--run-dir', type=Path, default=CACHE / 'runs')
     p.add_argument('--cache-dir', type=Path, default=CACHE / 'prefix-cache')
     p.add_argument('--checkpoint-dir', type=Path, default=CACHE / 'priority-checkpoints')
@@ -1265,6 +1365,19 @@ def main():
     a = p.parse_args()
     if a.action == 'serve':
         return serve(a)
+    if a.action == 'concurrency':
+        if a.value is not None:
+            n = int(a.value)
+            if not 1 <= n <= 16:
+                print('concurrency: 1 to 16', file=sys.stderr)
+                return 2
+            path = set_config('TEXAS_SPLIT_MAX_CONCURRENT', n)
+            print(f'TEXAS_SPLIT_MAX_CONCURRENT={n} written to {path}; applies at the next `texas-split restart`')
+        else:
+            # what the configuration says now; a running service keeps what it started with (see /health)
+            print(json.dumps(dict(configured=dict(max_concurrent=MAX_CONCURRENT, stage_slots=STAGE_SLOTS,
+                                                  slot_rows=STAGE_SLOT_ROWS)), indent=1))
+        return 0
     if a.action == 'write-pins':
         print(json.dumps(write_pins(), indent=1))
         return 0

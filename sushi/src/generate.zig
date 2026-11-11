@@ -1490,7 +1490,14 @@ fn completeStagePrefillChunk(
         position_base.* = ssm_cp_offset + pos;
         history_started.* = true;
     }
-    try options.mtp.?.appendHistory(xfm, &(mtp_cache.*.?), prompt_ids[pos + 1 .. end + 1], hidden, @intCast(mtp_cache.*.?.step()), null, allocator);
+    // R68: an M-RoPE request's head ropes these rows as the non-split path does
+    const mtp_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+        .pos = positions,
+        .total = ctx.mrope_total,
+        .delta = ctx.mrope_delta,
+        .base = position_base.*,
+    } else null;
+    try options.mtp.?.appendHistory(xfm, &(mtp_cache.*.?), prompt_ids[pos + 1 .. end + 1], hidden, @intCast(mtp_cache.*.?.step()), mtp_mrope_ctx, allocator);
     const ev = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ev);
     mtp_cache.*.?.appendEvalArrays(ev);
@@ -2237,6 +2244,9 @@ pub const Generator = struct {
     mtp_planner_recovering: bool = false,
     mtp_planner_history: group_planner.History = .{},
     mtp_hidden_stale: bool = false,
+    /// R67 multi-stream: this request may run layers [first, 48) on the 5090 stage (the scheduler's stage holder).
+    /// Others run every layer on the Mac beside it. True everywhere when one request runs at a time.
+    stage_allowed: bool = true,
     mtp_planner_plain_ticks: u32 = 0,
     mtp_planner_prime_ticks: u32 = 0,
     mtp_planner_spec_rounds: u32 = 0,
@@ -2629,6 +2639,8 @@ pub const Generator = struct {
         /// `ssm_entries` slice is empty and snapshots become no-op stubs).
         /// Chunked prefill aligns chunk ends to stride positions so each
         /// snapshot reflects a coherent state.
+        /// R67 multi-stream: the prefill may go through the 5090 stage (the scheduler's stage holder only).
+        stage_allowed: bool = true,
         ssm_checkpoint_stride: u32 = 0,
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
@@ -2871,8 +2883,16 @@ pub const Generator = struct {
         // assembled in two steps (layers [0, first) at the chunk's eval, the rest after its import);
         // without it checkpoints are off.
         // M-RoPE turns (an image anywhere in the prompt, cached or not) rope at absolute positions the
-        // stage does not know: they stay on the Mac.
-        const split_prefill_env = qwen4_forward.stagePrefillEnabled() and !has_vision and glm_request == null and ctx.mrope_pos == null;
+        // stage does not know: they stay on the Mac. texas-split R68 (SUSHI_STAGE_MROPE_TEXT=1): unless every row this
+        // turn prefills is text at one rotary offset (no image in the uncached part; checked from the 4-row group the
+        // first new row completes), which the stage's prefill takes as its rope delta, as decode rows already do.
+        const mrope_text_delta: ?i32 = if (ctx.mrope_pos) |mp| blk: {
+            if (!qwen4_forward.stageMropeTextEnabled() or !options.stage_allowed or glm_request != null) break :blk null;
+            const first = options.ssm_checkpoint_pos_offset;
+            break :blk qwen4_forward.mropeTextDelta(mp, ctx.mrope_total, first - first % 4, first + prompt_ids.len);
+        } else null;
+        // R69: a request decoding on stage slot 1 prefills on the Mac (the stage's prefill path is slot 0's)
+        const split_prefill_env = options.stage_allowed and qwen4_forward.stagePrefillEnabled() and (!has_vision or mrope_text_delta != null) and glm_request == null and (ctx.mrope_pos == null or mrope_text_delta != null) and qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&ctx)) == 0;
         const want_ssm_cp = !(split_prefill_env and !qwen4_forward.stagePullbackEnabled()) and shouldCheckpointSsmPrefill(
             options.ssm_checkpoint_stride,
             (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
@@ -2954,6 +2974,8 @@ pub const Generator = struct {
         // window semantics, same rule as the MTP history.
         const dflash_active = options.dflash_enabled and options.dflash != null;
         const split_prefill = split_prefill_env and !dflash_active;
+        ctx.stage_prefill_delta = if (split_prefill) mrope_text_delta else null;
+        if (split_prefill and mrope_text_delta != null) log.info("[stage] M-RoPE turn prefills on the stage (text rows, rope delta {d})\n", .{mrope_text_delta.?});
         if (split_prefill) qwen4_forward.stagePrefillBegin(&ctx);
         var split_pending: ?StageChunk = null;
         var split_cp_new: ?SSMCheckpoint = null;
@@ -6649,6 +6671,25 @@ pub const Generator = struct {
         if (apply_stash) try self.mtpApplyStash();
     }
 
+    /// texas-split R66d (end-of-turn checkpoint): after `mtpDetachHead(.., true)` the head's committed history ends one
+    /// entry short of the trunk: the last pair is (last_hidden, `token` = the token after the trunk's last row: the
+    /// reply's final token when it stopped on length, else the sampled stop token), which only a next round would
+    /// append. Append it the same way, so a checkpoint at the trunk's end can adopt the head next turn (whose prompt
+    /// carries that token at that position). The caller checks the resulting length.
+    pub fn mtpAppendFinalPair(self: *Generator, token: u32) !void {
+        const mc = if (self.mtp_cache) |*m| m else return error.MtpInactive;
+        if (!self.has_last_hidden or self.mtp == null) return error.MtpNoLastHidden;
+        if (self.mtp_hist_stash != null or self.mtp_pre_draft != null) return error.MtpPending;
+        const id = [_]i32{@intCast(token)};
+        const ids = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+        defer _ = mlx.mlx_array_free(ids);
+        const host = [_]u32{token};
+        const out = try self.mtp.?.forward(self.xfm, mc, ids, self.last_hidden, @intCast(mc.step()), .none, self.mtpMropeContext(), host[0..]);
+        if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
+        if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
+        if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
+    }
+
     /// Append the deferred history stash to the head cache now, as a
     /// history-only head forward (lazy; the next head forward realizes it).
     fn mtpApplyStash(self: *Generator) !void {
@@ -6939,7 +6980,7 @@ pub const Generator = struct {
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         // R60 pipeline split: this round's trunk forwards run layers [first, 48) on the 5090 stage.
         const prev_split = self.ctx.stage_split;
-        self.ctx.stage_split = qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
+        self.ctx.stage_split = self.stage_allowed and qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
         defer self.ctx.stage_split = prev_split;
         var st = switch (try self.mtpRoundBegin(allocator)) {
             .done => |r| return r,
@@ -7303,6 +7344,84 @@ pub const Generator = struct {
         // the point at which the entry's n-gram history + `spec_ple_tokens`
         // advance. Must precede BOTH the first eval of anything downstream of
         // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        errdefer xfm.discardDeferredPle(&self.ctx);
+        try xfm.flushDeferredPle(&self.ctx);
+        _ = try self.thinkShiftRows(&verify_logits, st.verify_input);
+        _ = try self.penaltyShiftRows(&verify_logits, st.verify_input);
+        st.verify_logits = verify_logits;
+        st.new_hidden = new_hidden;
+        st.verify_hidden_all = verify_hidden_all;
+    }
+
+    /// texas-split R69 (two interleaved stage slots): mtpRoundVerify in two halves. This half sets the verify up and runs
+    /// the rows through layers [0, first); they go to the stage and it returns true (mtpRoundVerifyPost finishes). If
+    /// the forward ran whole instead (no stage this round), the verify is complete and it returns false.
+    pub fn mtpRoundVerifyPre(self: *Generator, st: *MtpRoundState) !bool {
+        const xfm = self.xfm;
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+        self.ctx.ple_defer = true;
+        @import("qwen4_exp.zig").verify_t0_ns = @import("qwen4_exp.zig").nowBootNs();
+        self.ctx.verify_rows = xfm.config.isMimo();
+        self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
+        self.ctx.stage_head = self.ctx.stage_split and r64EnvOn(&r64_stage_head_env, "SUSHI_R64_STAGE_HEAD") and
+            !penaltyActive(self.sampling) and !self.sampling.think_penalty.active() and self.sampling.call_force == null and
+            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20));
+        self.ctx.stage_async_verify = true;
+        var new_hidden = mlx.mlx_array_new();
+        var verify_hidden_all = mlx.mlx_array_new();
+        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+            self.ctx.stage_async_verify = false;
+            self.mtpVerifyFlagsReset();
+            _ = mlx.mlx_array_free(new_hidden);
+            _ = mlx.mlx_array_free(verify_hidden_all);
+            xfm.discardDeferredPle(&self.ctx);
+            return e;
+        };
+        self.ctx.stage_async_verify = false;
+        if (self.ctx.stage_verify_sent) {
+            _ = mlx.mlx_array_free(verify_logits);
+            _ = mlx.mlx_array_free(new_hidden);
+            _ = mlx.mlx_array_free(verify_hidden_all);
+            return true;
+        }
+        try self.mtpRoundVerifyTail(st, verify_logits, new_hidden, verify_hidden_all);
+        return false;
+    }
+
+    /// texas-split R69: the second half (after the other slot's first half): receive the stage's rows and finish.
+    pub fn mtpRoundVerifyPost(self: *Generator, st: *MtpRoundState) !void {
+        const xfm = self.xfm;
+        var new_hidden = mlx.mlx_array_new();
+        var verify_hidden_all = mlx.mlx_array_new();
+        const verify_logits = xfm.forwardWithCaptureAllResume(&self.ctx, &new_hidden, &verify_hidden_all) catch |e| {
+            self.mtpVerifyFlagsReset();
+            _ = mlx.mlx_array_free(new_hidden);
+            _ = mlx.mlx_array_free(verify_hidden_all);
+            xfm.discardDeferredPle(&self.ctx);
+            return e;
+        };
+        try self.mtpRoundVerifyTail(st, verify_logits, new_hidden, verify_hidden_all);
+    }
+
+    fn mtpVerifyFlagsReset(self: *Generator) void {
+        self.ctx.ple_defer = false;
+        self.ctx.capture_ssm_seq = false;
+        self.ctx.verify_rows = false;
+        self.ctx.capture_settle = true;
+        self.ctx.stage_head = false;
+    }
+
+    /// What mtpRoundVerify does after its forward (R69 halves share it).
+    fn mtpRoundVerifyTail(self: *Generator, st: *MtpRoundState, logits_in: mlx.mlx_array, new_hidden: mlx.mlx_array, verify_hidden_all: mlx.mlx_array) !void {
+        const xfm = self.xfm;
+        var verify_logits = logits_in;
+        errdefer {
+            _ = mlx.mlx_array_free(verify_logits);
+            _ = mlx.mlx_array_free(new_hidden);
+            _ = mlx.mlx_array_free(verify_hidden_all);
+        }
+        self.mtpVerifyFlagsReset();
+        xfm.verify_laps.ple_sync_ns = 0;
         errdefer xfm.discardDeferredPle(&self.ctx);
         try xfm.flushDeferredPle(&self.ctx);
         _ = try self.thinkShiftRows(&verify_logits, st.verify_input);
@@ -10213,7 +10332,7 @@ pub const Generator = struct {
         defer tick_prof.finish();
         // R60 pipeline split: a serial decode step's trunk forward uses the 5090 stage too.
         const prev_split = self.ctx.stage_split;
-        self.ctx.stage_split = qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
+        self.ctx.stage_split = self.stage_allowed and qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
         defer self.ctx.stage_split = prev_split;
         if (self.done) return null;
         if (self.sampling.constraint != null) return self.nextConstrained(allocator);

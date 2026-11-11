@@ -74,6 +74,13 @@ fn read(b: &Buffer<'_>, n: usize) -> Result<Vec<u16>> {
     );
     Ok(v)
 }
+/// R69: a slot's forward bookkeeping.
+#[derive(Default)]
+struct Fwd {
+    rows: Cell<usize>,
+    valid: Cell<Option<(u64, usize)>>,
+    epoch: Cell<u64>,
+}
 pub struct Layer<'m, 'd> {
     d: &'d Device,
     hc: [cuda_hc::Hc<'m, 'd>; 2],
@@ -81,12 +88,37 @@ pub struct Layer<'m, 'd> {
     mlp: cuda_lowbit_moe::Engine<'m, 'd>,
     input: Buffer<'d>,
     output: Buffer<'d>,
-    rows: Cell<usize>,
-    valid: Cell<Option<(u64, usize)>>,
-    epoch: Cell<u64>,
+    /// R69: per conversation slot: the last forward's rows, recorded epoch/rows and invalidation epoch
+    fwd: Vec<Fwd>,
+    active: Cell<usize>,
     layer: usize,
 }
 impl<'m, 'd> Layer<'m, 'd> {
+    fn f(&self) -> &Fwd {
+        &self.fwd[self.active.get()]
+    }
+    /// R69: add a conversation slot whose KV views the top `rows` rows of slot 0's buffers.
+    pub(crate) fn add_slot_view(&mut self, rows: usize) -> Result<usize> {
+        let slot = self.attention.add_slot_view(rows)?;
+        self.fwd.push(Fwd::default());
+        ensure!(slot + 1 == self.fwd.len(), "attention layer slot bookkeeping");
+        Ok(slot)
+    }
+    /// R69: the slot every following call works on.
+    pub(crate) fn select_slot(&self, slot: usize) -> Result<()> {
+        ensure!(slot < self.fwd.len(), "attention layer slot {slot}");
+        self.attention.select_slot(slot)?;
+        self.active.set(slot);
+        Ok(())
+    }
+    /// R69: the active slot holds nothing.
+    pub(crate) fn drop_slot_state(&self) {
+        self.attention.drop_slot_state();
+        let f = self.f();
+        f.rows.set(0);
+        f.valid.set(None);
+        f.epoch.set(f.epoch.get() + 1);
+    }
     /// R53: this layer's MoE trace words (traced variants only).
     pub(crate) fn moe_trace(&self) -> Result<Option<(u32, Vec<u64>)>> {
         self.mlp.r52_trace()
@@ -122,9 +154,8 @@ impl<'m, 'd> Layer<'m, 'd> {
             mlp,
             input: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
             output: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
-            rows: Cell::new(0),
-            valid: Cell::new(None),
-            epoch: Cell::new(0),
+            fwd: vec![Fwd::default()],
+            active: Cell::new(0),
             layer: w.layer,
         })
     }
@@ -154,9 +185,8 @@ impl<'m, 'd> Layer<'m, 'd> {
             mlp,
             input: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
             output: d.alloc(hc::MAX_ROWS * hc::F * 2 + GUARD)?,
-            rows: Cell::new(0),
-            valid: Cell::new(None),
-            epoch: Cell::new(0),
+            fwd: vec![Fwd::default()],
+            active: Cell::new(0),
             layer: w.layer,
         })
     }
@@ -168,16 +198,16 @@ impl<'m, 'd> Layer<'m, 'd> {
         self.prepare_input(x)
     }
     pub(crate) fn prepare_state(&self, cache: &a::State, index: &qsa::State) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.prepare_state(cache, index)
     }
     /// R60 S4: prepare_state without poison or read-back (see Attention::prepare_state_lean).
     pub(crate) fn prepare_state_lean(&self, cache: &a::State, index: &qsa::State) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.prepare_state_lean(cache, index)
     }
     /// R60 S4: rotary offset for the next appended rows (M-RoPE decode delta; 0 for text).
@@ -186,17 +216,17 @@ impl<'m, 'd> Layer<'m, 'd> {
     }
     /// R59 incremental refresh (see Attention::refresh_rows).
     pub(crate) fn refresh_state(&self, cache: &a::State, index: &qsa::State) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.refresh_rows(cache, index)
     }
     pub(crate) fn prepare_resident(&self, rows: usize) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.prepare_resident_input(rows)?;
-        self.rows.set(rows);
+        self.f().rows.set(rows);
         Ok(())
     }
     pub(crate) fn set_mlp_pump(&self, regions: &[(u64, usize)]) -> Result<()> {
@@ -214,9 +244,9 @@ impl<'m, 'd> Layer<'m, 'd> {
         &self.output
     }
     pub fn prepare_input(&self, x: &[u16]) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         ensure!(
             !x.is_empty()
                 && x.len() % hc::F == 0
@@ -229,7 +259,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         ensure!(read(&self.input, x.len())? == x, "layer input readback");
         let rows = x.len() / hc::F;
         self.attention.prepare_resident_input(rows)?;
-        self.rows.set(rows);
+        self.f().rows.set(rows);
         Ok(())
     }
     pub fn state(&self) -> Result<(a::State, qsa::State)> {
@@ -245,6 +275,14 @@ impl<'m, 'd> Layer<'m, 'd> {
     pub(crate) fn export_state(&self) -> Result<(a::State, qsa::State)> {
         self.attention.export_state()
     }
+    /// R66d: the committed open group's raw keys (see Attention::open_keys).
+    pub(crate) fn open_keys(&self) -> Result<Vec<u8>> {
+        self.attention.open_keys()
+    }
+    /// R66: committed K codes of rows [from, to) (see Attention::key_codes).
+    pub(crate) fn key_codes(&self, from: usize, to: usize) -> Result<Vec<u8>> {
+        self.attention.key_codes(from, to)
+    }
     /// R60 S4 (texas-split parking): see Attention::snapshot_ranges.
     pub(crate) fn snapshot_ranges(&self) -> Result<(usize, Vec<Option<Buffer<'d>>>)> {
         self.attention.snapshot_ranges()
@@ -253,31 +291,31 @@ impl<'m, 'd> Layer<'m, 'd> {
         self.attention.position_meta()
     }
     pub(crate) fn set_position_meta(&self, meta: Option<(usize, usize)>) {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.set_position_meta(meta);
     }
     pub(crate) fn finish_commit(&self, accepted: usize) -> Result<()> {
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.finish_commit(accepted)
     }
     pub fn commit(&self, accepted: usize) -> Result<()> {
         let (epoch, rows) = self
-            .valid
+            .f().valid
             .get()
             .ok_or_else(|| anyhow::anyhow!("layer commit requires all stages checked"))?;
         ensure!(
-            epoch == self.epoch.get() && accepted <= rows,
+            epoch == self.f().epoch.get() && accepted <= rows,
             "layer unavailable epoch/prefix"
         );
         // Validation errors leave the last completed result usable. Once the
         // state mutation starts, any launch/sync failure invalidates old plans.
-        self.rows.set(0);
-        self.valid.set(None);
-        self.epoch.set(self.epoch.get() + 1);
+        self.f().rows.set(0);
+        self.f().valid.set(None);
+        self.f().epoch.set(self.f().epoch.get() + 1);
         self.attention.commit(accepted)
     }
     fn record(&self, rows: usize, p: Policy) -> Result<Vec<Vec<PreparedCall<'_, 'm, 'd>>>> {
@@ -290,7 +328,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         p: Policy,
     ) -> Result<Vec<Vec<PreparedCall<'a, 'm, 'd>>>> {
         ensure!(
-            rows == self.rows.get() && rows > 0 && !input.aliases(&self.output),
+            rows == self.f().rows.get() && rows > 0 && !input.aliases(&self.output),
             "attention layer resident readiness/alias"
         );
         let pre = &self.hc[0];
@@ -331,7 +369,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         ])
     }
     pub(crate) fn poison(&self, p: Policy) -> Result<()> {
-        self.valid.set(None);
+        self.f().valid.set(None);
         self.hc[0].poison(p.hc())?;
         self.attention.poison()?;
         self.hc[1].poison(p.hc())?;
@@ -340,7 +378,7 @@ impl<'m, 'd> Layer<'m, 'd> {
     }
     pub(crate) fn collect_from(&self, input: &Buffer<'d>, rows: usize, p: Policy) -> Result<Run> {
         ensure!(
-            rows == self.rows.get() && rows > 0,
+            rows == self.f().rows.get() && rows > 0,
             "attention layer collect readiness"
         );
         let pre = self.hc[0].collect_from(input, rows, false, p.hc())?;
@@ -356,7 +394,7 @@ impl<'m, 'd> Layer<'m, 'd> {
             output == hc::write(&post.stream, &mlp.output, &post.stages.inject)?,
             "conditional final residual"
         );
-        self.valid.set(Some((self.epoch.get(), rows)));
+        self.f().valid.set(Some((self.f().epoch.get(), rows)));
         Ok(Run {
             pre,
             attention,
@@ -370,7 +408,7 @@ impl<'m, 'd> Layer<'m, 'd> {
         })
     }
     pub fn plan(&self, p: Policy, repetitions: usize, graph: bool) -> Result<Plan<'_, 'm, 'd>> {
-        let rows = self.rows.get();
+        let rows = self.f().rows.get();
         ensure!(
             rows > 0 && (1..=3).contains(&repetitions),
             "layer plan readiness/bounds"
@@ -394,7 +432,7 @@ impl<'m, 'd> Layer<'m, 'd> {
             p,
             repetitions,
             calls,
-            epoch: self.epoch.get(),
+            epoch: self.f().epoch.get(),
         })
     }
 }
@@ -427,7 +465,7 @@ impl Plan<'_, '_, '_> {
         let a = self.owner;
         let p = self.p;
         ensure!(
-            a.rows.get() == self.rows && a.epoch.get() == self.epoch,
+            a.f().rows.get() == self.rows && a.f().epoch.get() == self.epoch,
             "layer plan invalidated"
         );
         ensure!(

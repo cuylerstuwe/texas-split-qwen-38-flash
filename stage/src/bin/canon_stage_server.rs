@@ -235,6 +235,82 @@ fn seed<S: Src>(stage: &Stage, b: &mut S, position: usize) -> Result<serde_json:
     Ok(json!({"position":position,"bytes":b.at(),"kv_tokens":kv_tokens}))
 }
 
+/// R66 incremental seed ("QDI1"): header {u32 0x31494451, u32 1, u32 first, u32 count, u64 position, u64 base,
+/// u64 check_from}, then per layer the SEED sections, an attention layer as {u64 hash, K codes/scales/biases and
+/// V codes/scales/biases of rows [base, position), pooled blocks [base/4, position/4), the open group's raw keys}.
+/// Rows [0, base) stay as held. `base` is group aligned. The client's `hash` is FNV-1a 64 over that layer's K
+/// codes of rows [check_from, base) as Sushi holds them: tokens alone do not prove the held rows were computed
+/// the same way (another chunking, or Metal versus CUDA), so a mismatch, or held rows short of `base`, refuses
+/// the seed before anything changes and the client sends a full SEED instead.
+const MAGIC_INCR: u32 = 0x3149_4451; // "QDI1"
+fn fnv64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+fn seed_incremental<S: Src>(stage: &Stage, b: &mut S, position: usize) -> Result<(bool, serde_json::Value)> {
+    ensure!(b.u32()? == MAGIC_INCR && b.u32()? == 1, "incremental seed magic/version");
+    let (first, count) = (b.u32()? as usize, b.u32()? as usize);
+    let (pos, base, check_from) = (b.u64()? as usize, b.u64()? as usize, b.u64()? as usize);
+    ensure!(first == stage.first && first + count == 48 && pos == position && base <= position && base % 4 == 0
+        && check_from <= base, "incremental seed geometry");
+    b.align()?;
+    enum Layer {
+        Recurrent(Initial),
+        Attention(a::State, qsa::State, u64),
+    }
+    let len = position - base;
+    let mut layers = Vec::with_capacity(count);
+    for l in first..48 {
+        let tag = b.u32()?;
+        let _ = b.u32()?;
+        b.align()?;
+        match tag {
+            1 => {
+                ensure!(l % 4 != 3, "recurrent seed for attention layer {l}");
+                let conv = b.u16s(3 * C)?;
+                let state = b.f32s(STATE)?;
+                layers.push(Layer::Recurrent(Initial { conv, state }));
+            }
+            2 => {
+                ensure!(l % 4 == 3, "attention seed for recurrent layer {l}");
+                let hash = b.u64()?;
+                b.align()?;
+                let k = a::Packed { codes: b.take(len * a::KV)?, scales: b.u16s(len * a::META)?, biases: b.u16s(len * a::META)? };
+                let v = a::Packed { codes: b.take(len * a::KV)?, scales: b.u16s(len * a::META)?, biases: b.u16s(len * a::META)? };
+                let pooled = b.u16s(len / 4 * qsa::D)?;
+                let tail = b.u16s(len % 4 * qsa::D)?;
+                let cache = a::State { base, len, k, v };
+                let index = qsa::State { base, len, pooled, tail };
+                cache.validate()?;
+                index.validate()?;
+                layers.push(Layer::Attention(cache, index, hash));
+            }
+            t => bail!("incremental seed tag {t} at layer {l}"),
+        }
+    }
+    // the lineage check, before any state changes
+    for (l, layer) in (first..48).zip(&layers) {
+        if let Layer::Attention(_, _, hash) = layer {
+            let refuse = |why: &str| Ok((false, json!({"refused":why,"layer":l,"base":base,"position":position})));
+            match stage.attention_len(l) {
+                None => return refuse("no held state"),
+                Some(held) if held < base => return refuse("held rows short of base"),
+                Some(_) => {}
+            }
+            if fnv64(&stage.attention_key_codes(l, check_from, base)?) != *hash {
+                return refuse("lineage hash");
+            }
+        }
+    }
+    for (l, layer) in (first..48).zip(layers) {
+        match layer {
+            Layer::Recurrent(initial) => stage.import_recurrent(l, &initial)?,
+            Layer::Attention(cache, index, _) => stage.refresh_attention(l, &cache, &index)?,
+        }
+    }
+    stage.set_position(position);
+    Ok((true, json!({"position":position,"base":base,"rows":len,"bytes":b.at()})))
+}
+
 fn main() -> Result<()> {
     ensure!(std::env::var("QWEN_HYBRID_GUARDED").as_deref() == Ok("1"), "use guarded runner");
     let first: usize = std::env::args().nth(1).map(|a| a.parse()).transpose()?.unwrap_or(28);
@@ -276,19 +352,28 @@ fn main() -> Result<()> {
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket)?;
         let mem = d.memory_info()?;
+        // R69: a captured graph stays resident in VRAM (~16.5 MB measured per (slot, rows) graph). With several slots
+        // every (slot, rows) pair could want one (26 with four slots) and the free memory left beside the slots does
+        // not hold them all, so captures stop at a budget from the free memory at ready (96 MiB kept back, 20 MiB per
+        // graph); forwards past it run uncaptured (the same launches, enqueued one by one). One slot: 0.58 GiB free
+        // budgets 24 graphs for at most 16 row counts, so nothing changes there.
+        let max_graphs: usize = std::env::var("QD_STAGE_MAX_GRAPHS").ok().and_then(|v| v.parse().ok())
+            .unwrap_or((mem.free_bytes.saturating_sub(96 << 20) / (20 << 20)) as usize).max(4);
         println!("{}", json!({"kind":"ready","stage":stage.description(),"socket":socket,"shm":shm_path,"capacity":capacity,
-            "vram_free_bytes":mem.free_bytes,"vram_managed_bytes":mem.managed_bytes}));
+            "vram_free_bytes":mem.free_bytes,"vram_managed_bytes":mem.managed_bytes,"slots":stage.slots(),"max_graphs":max_graphs}));
         let (mut conn, _) = listener.accept()?;
         println!("{}", json!({"kind":"connected"}));
         let (mut forwards, mut fw_us, mut rows_total, mut commits, mut partial) = (0u64, 0f64, 0u64, 0u64, 0u64);
         let mut hist = [0u64; 17];
-        let mut pending_commit: Option<usize> = None;
+        // R69: one pending commit per conversation slot
+        let mut pending_commit: Vec<Option<usize>> = vec![None; stage.slots()];
         let (mut parks, mut restores) = (0u64, 0u64);
         // RESTORE self-check: the live state re-read after the restore must equal the park file
         let restore_verify = std::env::var("QD_STAGE_RESTORE_VERIFY").as_deref() == Ok("1");
         // one captured graph per row count, re-targeted each forward (QD_STAGE_GRAPHS=0: off)
         let use_graphs = std::env::var("QD_STAGE_GRAPHS").as_deref() != Ok("0");
-        let mut graphs: std::collections::HashMap<usize, qwen_hybrid::cuda::Graph<'_, '_, '_>> = std::collections::HashMap::new();
+        // R69: keyed by (slot, rows): a slot's buffers differ, and patch_diff re-targets scalars only
+        let mut graphs: std::collections::HashMap<(usize, usize), qwen_hybrid::cuda::Graph<'_, '_, '_>> = std::collections::HashMap::new();
         let (mut replays, mut captures) = (0u64, 0u64);
         loop {
             let mut msg = [0u8; 32];
@@ -307,12 +392,16 @@ fn main() -> Result<()> {
             if op == 1 || op == 6 {
                 stage.set_rope_delta((aux as i32) >> 8);
             }
+            // R69: aux bits 3-5 name the conversation slot of every op (0 unless the stage runs several)
+            let slot = ((aux >> 3) & 7) as usize;
             let result: Result<(u32, u64)> = (|| match op {
+                _ if slot >= stage.slots() => bail!("slot {slot} of {}", stage.slots()),
+                _ if { stage.select(slot)?; false } => unreachable!(),
                 1 => {
                     let prev = stage.pending();
                     // R64: with no COMMIT before it, the accepted rows follow from the position (a forward
                     // at P commits P - committed of the pending rows), so a client may skip op 2.
-                    let accept = match pending_commit.take() {
+                    let accept = match pending_commit[slot].take() {
                         Some(a) => a,
                         None => {
                             let base = stage.position();
@@ -324,7 +413,7 @@ fn main() -> Result<()> {
                         commits += 1;
                     }
                     ensure!(position == stage.position() + accept, "forward at {position}, stage at {} + {accept}", stage.position());
-                    ensure!((1..=16).contains(&rows), "forward rows");
+                    ensure!((1..=16).contains(&rows) && rows <= stage.slot_forward_rows(slot), "forward rows {rows} on slot {slot} (its limit {})", stage.slot_forward_rows(slot));
                     let raw = &shm.bytes()[..rows * F * 2];
                     let x: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                     let (commits, rows) = stage.begin(&x, Some(accept))?;
@@ -332,17 +421,17 @@ fn main() -> Result<()> {
                         c.enqueue()?;
                     }
                     let fresh = match &r65k { Some(k) => stage.record_forward_side(rows, k)?, None => stage.record_forward(rows)? };
-                    let patched = match graphs.get_mut(&rows) {
+                    let patched = match graphs.get_mut(&(slot, rows)) {
                         Some(g) if use_graphs => g.patch_diff(fresh)?.is_some(),
                         _ => false,
                     };
                     if patched {
-                        graphs[&rows].launch()?;
+                        graphs[&(slot, rows)].launch()?;
                         replays += 1;
-                    } else if use_graphs {
+                    } else if use_graphs && (graphs.contains_key(&(slot, rows)) || graphs.len() < max_graphs) {
                         let g = d.capture_model_diagnostic(match &r65k { Some(k) => stage.record_forward_side(rows, k)?, None => stage.record_forward(rows)? })?;
                         g.launch()?;
-                        graphs.insert(rows, g);
+                        graphs.insert((slot, rows), g);
                         captures += 1;
                     } else {
                         for c in &(match &r65k { Some(k) => stage.record_forward_side(rows, k)?, None => stage.record_forward(rows)? }) {
@@ -388,13 +477,13 @@ fn main() -> Result<()> {
                 2 => {
                     // applied with the next forward, in the same submission
                     ensure!(arg <= stage.pending(), "commit {arg} of {} pending rows", stage.pending());
-                    pending_commit = Some(arg);
+                    pending_commit[slot] = Some(arg);
                     partial += 1;
                     Ok((0, (stage.position() + arg) as u64))
                 }
                 3 => {
                     stage.discard()?;
-                    pending_commit = None;
+                    pending_commit[slot] = None;
                     let info = seed(&stage, &mut Blob { b: shm.bytes(), at: 0 }, position)?;
                     println!("{}", json!({"kind":"seed","ms":t.elapsed().as_secs_f64()*1e3,"info":info}));
                     Ok((0, stage.position() as u64))
@@ -406,7 +495,7 @@ fn main() -> Result<()> {
                     let base = stage.position();
                     ensure!(position >= base && position <= base + prev, "park at {position}, stage at {base} + {prev} pending");
                     let accept = position - base;
-                    if let Some(c) = pending_commit.take() {
+                    if let Some(c) = pending_commit[slot].take() {
                         ensure!(c == accept, "park at {position} beside a pending commit of {c}");
                     }
                     if prev > 0 {
@@ -429,7 +518,7 @@ fn main() -> Result<()> {
                 }
                 8 => {
                     stage.discard()?;
-                    pending_commit = None;
+                    pending_commit[slot] = None;
                     let path = park_path(&shm)?;
                     let file = std::fs::File::open(&path).with_context(|| format!("park file {}", path.display()))?;
                     let mut src = FileSrc { r: std::io::BufReader::with_capacity(8 << 20, file), at: 0 };
@@ -448,11 +537,53 @@ fn main() -> Result<()> {
                     println!("{}", json!({"kind":"restore","ms":t.elapsed().as_secs_f64()*1e3,"info":info,"verified_bytes":verified}));
                     Ok((0, stage.position() as u64))
                 }
+                9 => {
+                    // R66d end-of-turn pull-back: keep `position` rows of the pending forward (as PARK does), then
+                    // the committed rows [arg, position) as a QDX1 blob at shm offset 0 (reply arg: its length)
+                    let prev = stage.pending();
+                    let base = stage.position();
+                    ensure!(position >= base && position <= base + prev, "export at {position}, stage at {base} + {prev} pending");
+                    let accept = position - base;
+                    if let Some(c) = pending_commit[slot].take() {
+                        ensure!(c == accept, "export at {position} beside a pending commit of {c}");
+                    }
+                    if prev > 0 {
+                        stage.commit(accept)?;
+                    }
+                    let mut blob = vec![];
+                    stage.export_rows(arg, position, &mut blob)?;
+                    ensure!(blob.len() <= SHM_BYTES, "export blob {} bytes", blob.len());
+                    shm.bytes()[..blob.len()].copy_from_slice(&blob);
+                    reply_arg = blob.len() as u64;
+                    println!("{}", json!({"kind":"export","from":arg,"position":position,"accepted":accept,"bytes":blob.len(),
+                        "ms":t.elapsed().as_secs_f64()*1e3}));
+                    Ok((0, stage.position() as u64))
+                }
+                10 => {
+                    // R66 incremental seed: reply arg 1 applied, 0 refused (nothing changed; the client
+                    // sends a full SEED). Pending rows are dropped either way, as SEED does.
+                    stage.discard()?;
+                    pending_commit[slot] = None;
+                    let (applied, info) = seed_incremental(&stage, &mut Blob { b: shm.bytes(), at: 0 }, position)?;
+                    println!("{}", json!({"kind":"seed-incremental","applied":applied,"ms":t.elapsed().as_secs_f64()*1e3,"info":info}));
+                    reply_arg = u64::from(applied);
+                    Ok((0, stage.position() as u64))
+                }
                 4 => Ok((0, stage.position() as u64)),
                 5 => Ok((2, 0)),
+                11 => {
+                    // R69: drop a slot's conversation (its rows may be reused; slot 0 may grow into its views again)
+                    ensure!(slot > 0, "slot 0 is never dropped");
+                    pending_commit[slot] = None;
+                    stage.discard()?;
+                    stage.drop_slot()?;
+                    println!("{}", json!({"kind":"drop-slot","slot":slot}));
+                    Ok((0, 0))
+                }
                 6 => {
+                    ensure!(slot == 0, "prefill runs on slot 0 only");
                     let pf = pf.as_ref().ok_or_else(|| anyhow::anyhow!("prefill scratch disabled"))?;
-                    ensure!(stage.pending() == 0 && pending_commit.is_none(), "prefill with an uncommitted forward");
+                    ensure!(stage.pending() == 0 && pending_commit[slot].is_none(), "prefill with an uncommitted forward");
                     ensure!(position == stage.position(), "prefill at {position}, stage at {}", stage.position());
                     const EXPORT: usize = 128 << 20;
                     ensure!(rows > 0 && rows * F * 2 <= EXPORT && arg + 2 * EXPORT <= SHM_BYTES, "prefill rows/slot");
@@ -508,8 +639,11 @@ fn main() -> Result<()> {
                 }
             }
             if forwards > 0 && forwards % 500 == 0 && op == 1 {
+                // R69: the allocator's free VRAM rides the periodic line (graph captures and scratch grow with slots)
+                let free = d.memory_info().map(|m| m.free_bytes).unwrap_or(0);
                 println!("{}", json!({"kind":"stats","forwards":forwards,"rows":rows_total,"forward_us_mean":fw_us/forwards as f64,
-                    "commits":commits,"partial_commits":partial,"rows_hist":hist,"graph_replays":replays,"graph_captures":captures}));
+                    "commits":commits,"partial_commits":partial,"rows_hist":hist,"graph_replays":replays,"graph_captures":captures,
+                    "vram_free_bytes":free}));
             }
         }
         println!("{}", json!({"kind":"park_stats","parks":parks,"restores":restores}));
@@ -517,7 +651,8 @@ fn main() -> Result<()> {
             "rows_per_s":if prefill_us > 0. { prefill_rows as f64 / (prefill_us / 1e6) } else { 0. }}));
         println!("{}", json!({"kind":"head_stats","head_runs":head_runs,"head_on":head.is_some()}));
         println!("{}", json!({"kind":"stats","final":true,"forwards":forwards,"rows":rows_total,"forward_us_mean":if forwards>0 {fw_us/forwards as f64} else {0.},
-            "commits":commits,"partial_commits":partial,"rows_hist":hist,"graph_replays":replays,"graph_captures":captures}));
+            "commits":commits,"partial_commits":partial,"rows_hist":hist,"graph_replays":replays,"graph_captures":captures,
+            "vram_free_bytes":d.memory_info().map(|m| m.free_bytes).unwrap_or(0)}));
         drop(graphs);
     }
     k4.close()?;

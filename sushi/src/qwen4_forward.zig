@@ -4,6 +4,7 @@ const trf = @import("transformer.zig");
 // R60 pipeline split (isolated experiment): native/stage_split.cpp.
 extern "c" fn stage_split_first() c_int;
 extern "c" fn stage_split_invalidate() void;
+extern "c" fn stage_split_invalidate_owner(owner: u64) void;
 extern "c" fn stage_split_valid_at(position: u64) c_int;
 extern "c" fn stage_split_seed_begin(position: u64) c_int;
 extern "c" fn stage_split_seed_recurrent(conv: mlx.mlx_array, ssm: mlx.mlx_array, s: mlx.mlx_stream) c_int;
@@ -20,6 +21,13 @@ fn r64VerifyLadder() u32 {
 }
 extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
 extern "c" fn stage_split_set_head(on: c_int) void;
+extern "c" fn stage_split_forward_send(h: mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
+extern "c" fn stage_split_forward_recv(out: *mlx.mlx_array, s: mlx.mlx_stream) c_int;
+extern "c" fn stage_split_set_wait_hook(f: ?*const fn () callconv(.c) void) void;
+/// R67 multi-stream: `f` runs once inside the next decode forward's stage wait (between send and reply), on this thread.
+pub fn stageSetWaitHook(f: ?*const fn () callconv(.c) void) void {
+    stage_split_set_wait_hook(f);
+}
 extern "c" fn stage_split_head_topk(dst: [*]u32, rows: c_int) c_int;
 pub var r64_head_used: u64 = 0;
 pub var r64_head_fallback: u64 = 0;
@@ -85,10 +93,31 @@ extern "c" fn stage_split_unpark(owner: u64, position: u64) c_int;
 extern "c" fn stage_split_forget(owner: u64) void;
 extern "c" fn stage_split_seed_zero() c_int;
 extern "c" fn stage_split_prefill_export(data: *[*]const u8, len: *u64) c_int;
+extern "c" fn stage_split_note_prompt(toks: [*]const u32, n: u64, restored: u64) void;
+extern "c" fn stage_split_mirror() u64;
+extern "c" fn stage_split_iseed_begin(base: u64, check_from: u64, position: u64) c_int;
+extern "c" fn stage_split_iseed_attention(keys: mlx.mlx_array, ks: mlx.mlx_array, kb: mlx.mlx_array, values: mlx.mlx_array, vs: mlx.mlx_array, vb: mlx.mlx_array, pooled: mlx.mlx_array, raw: mlx.mlx_array, base: u64, check_from: u64, position: u64, s: mlx.mlx_stream) c_int;
+extern "c" fn stage_split_iseed_end(position: u64) c_int;
+/// R66 incremental seed (SUSHI_STAGE_ISEED=1): the stage keeps the rows of the sequence it last held, and a seed
+/// whose prompt shares them sends only the rest (rows [base, position) and the recurrent states). The stage
+/// hashes its K rows below `base` against Sushi's before it accepts; a refusal falls back to the full seed.
+var stage_iseed_env: ?bool = null;
+pub fn stageIseedEnabled() bool {
+    if (stage_iseed_env) |v| return v;
+    const v = if (std.c.getenv("SUSHI_STAGE_ISEED")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
+    stage_iseed_env = v;
+    return v;
+}
+/// R66: a new request's full prompt, for the stage client's incremental seed (rows the stage still holds for
+/// the common prefix stay usable).
+pub fn stageNotePrompt(tokens: []const u32, restored: usize) void {
+    if (!stageIseedEnabled() or stageSplitFirst() == null) return;
+    stage_split_note_prompt(tokens.ptr, @intCast(tokens.len), @intCast(restored));
+}
 extern "c" fn stage_split_pullback_enabled() c_int;
 extern "c" fn stage_split_prefill_ready(position: u64) c_int;
 extern "c" fn stage_split_prefill_inflight() c_int;
-extern "c" fn stage_split_prefill_send(h: mlx.mlx_array, position: u64, s: mlx.mlx_stream) c_int;
+extern "c" fn stage_split_prefill_send(h: mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
 extern "c" fn stage_split_prefill_recv(out: *mlx.mlx_array, dt: mlx.mlx_dtype, s: mlx.mlx_stream) c_int;
 /// R60 S4 (prefill v2): split prefill is on when the stage is connected and SUSHI_STAGE_PREFILL != 0.
 pub fn stagePrefillEnabled() bool {
@@ -105,6 +134,27 @@ pub fn stageDecodeEnabled() bool {
 }
 /// R60 S4: image (M-RoPE) requests decode through the stage with their rope delta unless
 /// SUSHI_STAGE_MROPE=0; their prefill always stays on the Mac.
+/// texas-split R68 (SUSHI_STAGE_MROPE_TEXT=1): an M-RoPE request's prefill goes through the stage when its rows are text.
+pub fn stageMropeTextEnabled() bool {
+    const v = std.c.getenv("SUSHI_STAGE_MROPE_TEXT") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+/// R68: the rotary offset d when every position in [from, to) is a text row (t = h = w = p + d for one d), else null.
+/// `pos` is the flat axis-major [3 x total] table. Callers start `from` at the 4-row group boundary below the first
+/// new row: the stage ropes a pooled QSA key at its group's first row with the chunk's offset.
+pub fn mropeTextDelta(pos: []const i32, total: usize, from: usize, to: usize) ?i32 {
+    if (from >= to or to > total or pos.len < 3 * total) return null;
+    const t = pos[0..total];
+    const h = pos[total .. 2 * total];
+    const w = pos[2 * total .. 3 * total];
+    const d: i64 = @as(i64, t[from]) - @as(i64, @intCast(from));
+    if (d < -(1 << 23) or d >= (1 << 23)) return null;
+    for (from..to) |i| {
+        const want: i64 = @as(i64, @intCast(i)) + d;
+        if (t[i] != want or h[i] != want or w[i] != want) return null;
+    }
+    return @intCast(d);
+}
 pub fn stageMropeEnabled() bool {
     const v = std.c.getenv("SUSHI_STAGE_MROPE") orelse return true;
     return !std.mem.eql(u8, std.mem.span(v), "0");
@@ -119,7 +169,69 @@ pub fn stagePrefillImport(self: *Transformer, ctx: *ForwardCtx) !void {
     var ptr: [*]const u8 = undefined;
     var len: u64 = 0;
     if (stage_split_prefill_export(&ptr, &len) != 0) return error.StageSplitPullback;
-    const blob = ptr[0..@intCast(len)];
+    try importQdx1(self, ctx.cache, ctx.ssm_entries orelse return error.StageSplitNoSsm, ptr[0..@intCast(len)]);
+}
+extern "c" fn stage_split_export(owner: u64, from: u64, position: u64, data: *[*]const u8, len: *u64) c_int;
+extern "c" fn stage_split_mirror_cap(n: u64) void;
+/// R66d end-of-turn pull-back (SUSHI_STAGE_PULLBACK_END=1).
+var stage_pullback_end_env: ?bool = null;
+pub fn stagePullbackEndEnabled() bool {
+    if (stage_pullback_end_env) |v| return v;
+    const v = if (std.c.getenv("SUSHI_STAGE_PULLBACK_END")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
+    stage_pullback_end_env = v;
+    return v;
+}
+/// R66d: at a turn's end the 5090 holds the reply's rows of layers [first, 48) only, so the turn's cache entry was
+/// whole only to the prompt and the next turn re-prefilled the reply. Copy those rows and the recurrent states at
+/// the end into Sushi's caches (stage op 9). Returns the end position (where a checkpoint now restores), or null
+/// when the stage holds nothing of this sequence, nothing is missing, or the import failed.
+pub fn stagePullbackTurnEnd(self: *Transformer, cache: *trf.KVCache, entries: []trf.SSMCacheEntry) ?usize {
+    const first = stageSplitFirst() orelse return null;
+    // the committed length as Sushi's layers [0, first) hold it, and the rows layers [first, 48) hold
+    var end: ?usize = null;
+    var from: ?usize = null;
+    var l: usize = 0;
+    while (l < self.config.num_hidden_layers) : (l += 1) {
+        if (self.config.isLinearLayer(@intCast(l))) continue;
+        const kv = &cache.entries[l];
+        if (!kv.initialized or kv.base != 0) return null;
+        if (l < first) {
+            if (end == null) end = @intCast(kv.offset);
+        } else if (from == null) from = @intCast(kv.offset);
+    }
+    const e = end orelse return null;
+    const f = from orelse return null;
+    if (e <= f) return null;
+    var ptr: [*]const u8 = undefined;
+    var len: u64 = 0;
+    if (stage_split_export(@intFromPtr(cache), @intCast(f), @intCast(e), &ptr, &len) != 0) return null;
+    importQdx1(self, cache, entries, ptr[0..@intCast(len)]) catch |err| {
+        std.debug.print("[stage] end-of-turn pull-back import failed: {s}\n", .{@errorName(err)});
+        stage_split_mirror_cap(@intCast(f));
+        return null;
+    };
+    return e;
+}
+/// R69: Sushi's caches hold the sequence whole (layers [first, 48) as far as layers [0, first)), so it can decode on the
+/// Mac without the stage.
+pub fn stageCachesWhole(self: *Transformer, cache: *trf.KVCache) bool {
+    const first = stageSplitFirst() orelse return true;
+    var end: ?usize = null;
+    var from: ?usize = null;
+    var l: usize = 0;
+    while (l < self.config.num_hidden_layers) : (l += 1) {
+        if (self.config.isLinearLayer(@intCast(l))) continue;
+        const kv = &cache.entries[l];
+        if (!kv.initialized) continue;
+        if (l < first) {
+            if (end == null) end = @intCast(kv.offset);
+        } else if (from == null) from = @intCast(kv.offset);
+    }
+    return (from orelse 0) >= (end orelse 0);
+}
+/// Write a canon-stage-server "QDX1" blob (layers [first, 48): recurrent conv/state at `to`; attention KV rows
+/// [from, to), pooled blocks, the last n raw keys) into Sushi's caches.
+fn importQdx1(self: *Transformer, cache: *trf.KVCache, entries: []trf.SSMCacheEntry, blob: []const u8) !void {
     const r32 = struct {
         fn f(b: []const u8, o: usize) u32 {
             return std.mem.readInt(u32, b[o..][0..4], .little);
@@ -136,7 +248,6 @@ pub fn stagePrefillImport(self: *Transformer, ctx: *ForwardCtx) !void {
     const from: usize = @intCast(r64(blob, 16));
     const to: usize = @intCast(r64(blob, 24));
     const rows: usize = to - from;
-    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
     const s = self.s;
     var at: usize = 32;
     const Arr = struct {
@@ -179,7 +290,7 @@ pub fn stagePrefillImport(self: *Transformer, ctx: *ForwardCtx) !void {
             defer for (kq) |a| {
                 _ = mlx.mlx_array_free(a);
             };
-            var view = try ctx.cache.appendQuantized(@intCast(l), .{ .q = kq[0], .scales = kq[1], .biases = kq[2] }, .{ .q = kq[3], .scales = kq[4], .biases = kq[5] }, s, 0);
+            var view = try cache.appendQuantized(@intCast(l), .{ .q = kq[0], .scales = kq[1], .biases = kq[2] }, .{ .q = kq[3], .scales = kq[4], .biases = kq[5] }, s, 0);
             view.deinit();
             const nb = to / 4 - from / 4;
             if (nb > 0) {
@@ -196,7 +307,7 @@ pub fn stagePrefillImport(self: *Transformer, ctx: *ForwardCtx) !void {
                 defer _ = mlx.mlx_array_free(keys);
                 at += n * 128 * 2;
                 try self.qsaAppendKeys(&entries[l], keys, @intCast(to - n));
-            }
+            } else entries[l].qsa_hist_rows = @intCast(to); // R66d: a group-aligned end needs no raw keys
             at = (at + 15) / 16 * 16;
         } else return error.StageSplitPullback;
         if (at > blob.len) return error.StageSplitPullback;
@@ -210,6 +321,62 @@ pub fn stagePrefillBegin(ctx: *const ForwardCtx) void {
 /// KV cache: the same object in the prefill's and the decode's ForwardCtx).
 pub fn stageOwner(ctx: *const ForwardCtx) u64 {
     return @intFromPtr(ctx.cache);
+}
+extern "c" fn stage_split_assign_slot(owner: u64, slot: c_int) void;
+extern "c" fn stage_split_slot_of(owner: u64) c_int;
+extern "c" fn stage_split_select_owner(owner: u64) void;
+extern "c" fn stage_split_drop_slot(slot: c_int) c_int;
+/// R69 (SUSHI_STAGE_SLOTS=K with a K-slot stage, QD_STAGE_SLOTS=K, K up to 4): conversation slots on the stage.
+pub fn stageSlots() usize {
+    const S = struct {
+        var v: ?usize = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("SUSHI_STAGE_SLOTS");
+    const v: usize = if (raw) |r| std.math.clamp(std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1, 1, 4) else 1;
+    S.v = v;
+    return v;
+}
+/// R69: rows one forward of stage slot `slot` may carry. One slot: the stage's 16. Several: slot 0 keeps 9 (a lookup
+/// round); extra slot k reads SUSHI_STAGE_SLOT_VERIFY_ROWS (one value or a comma list per extra slot, the last value
+/// repeating; the host passes the stage's QD_STAGE_SLOT_VERIFY_ROWS), default 9 for slot 1 and 4 for later slots.
+pub fn stageSlotForwardRows(slot: usize) u32 {
+    if (stageSlots() < 2) return 16;
+    if (slot == 0) return 9;
+    const default: u32 = if (slot <= 1) 9 else 4;
+    const raw = std.c.getenv("SUSHI_STAGE_SLOT_VERIFY_ROWS") orelse return default;
+    var it = std.mem.splitScalar(u8, std.mem.sliceTo(raw, 0), ',');
+    var last: ?u32 = null;
+    var idx: usize = 1;
+    while (it.next()) |part| : (idx += 1) {
+        const v = std.fmt.parseInt(u32, std.mem.trim(u8, part, " "), 10) catch continue;
+        last = v;
+        if (idx == slot) break;
+    }
+    return std.math.clamp(last orelse default, 1, 9);
+}
+/// R69: `owner` decodes on stage slot `slot` (1) or not there any more (0).
+pub fn stageAssignSlot(owner: u64, slot: u32) void {
+    if (stageSlots() < 2) return;
+    stage_split_assign_slot(owner, @intCast(slot));
+}
+/// Do this sequence's layers [first, 48) live on the stage (it decoded or prefilled there)? Still true after the stage
+/// is given up: Sushi's caches then hold no usable state for them, and the request re-runs from its tokens.
+pub fn stageResident(ctx: *const ForwardCtx) bool {
+    return stage_split_resident(stageOwner(ctx)) != 0;
+}
+pub fn stageSlotOf(owner: u64) u32 {
+    if (stageSlots() < 2) return 0;
+    return @intCast(stage_split_slot_of(owner));
+}
+pub fn stageSelectOwner(owner: u64) void {
+    if (stageSlots() < 2) return;
+    stage_split_select_owner(owner);
+}
+/// R69: free the stage's slot `slot` >= 1 (its owner re-seeds at its next forward); false: the stage failed.
+pub fn stageDropSlot(slot: usize) bool {
+    if (stageSlots() < 2 or slot == 0) return true;
+    return stage_split_drop_slot(@intCast(slot)) == 0;
 }
 /// Park the sequence's stage state (layers [first, 48)) at its committed length into `path`:
 /// 1 parked, 0 the stage holds none of it, -1 the stage failed (given up; the sequence re-runs
@@ -265,6 +432,12 @@ fn stageSeed(self: *Transformer, ctx: *ForwardCtx, first: usize, position: usize
         return;
     }
     const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
+    // R66: rows [0, base) the stage holds exactly as Sushi does stay; send only the rest.
+    if (stageIseedEnabled()) {
+        const mirror: usize = @intCast(stage_split_mirror());
+        const base = @min(mirror, position) / 4 * 4;
+        if (base >= 16 and try stageSeedIncremental(self, ctx, first, base, position)) return;
+    }
     if (stage_split_seed_begin(position) != 0) return error.StageSplitSeed;
     var l: usize = first;
     while (l < self.config.num_hidden_layers) : (l += 1) {
@@ -279,6 +452,28 @@ fn stageSeed(self: *Transformer, ctx: *ForwardCtx, first: usize, position: usize
         }
     }
     if (stage_split_seed_end(position) != 0) return error.StageSplitSeed;
+}
+/// R66: the incremental seed (op 10). True when the stage applied it, false when it refused (the caller then
+/// sends the full seed); an error when the stage failed.
+fn stageSeedIncremental(self: *Transformer, ctx: *ForwardCtx, first: usize, base: usize, position: usize) !bool {
+    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
+    const check_from = base - 16;
+    if (stage_split_iseed_begin(@intCast(base), @intCast(check_from), @intCast(position)) != 0) return error.StageSplitSeed;
+    var l: usize = first;
+    while (l < self.config.num_hidden_layers) : (l += 1) {
+        const e = &entries[l];
+        if (self.config.isLinearLayer(@intCast(l))) {
+            if (stage_split_seed_recurrent(e.conv_state, e.ssm_state, self.s) != 0) return error.StageSplitSeed;
+        } else {
+            const kv = &ctx.cache.entries[l];
+            if (!kv.initialized or kv.base != 0 or kv.offset != position) return error.StageSplitSeedKv;
+            if (stage_split_iseed_attention(kv.keys, kv.keys_scales, kv.keys_biases, kv.values, kv.values_scales, kv.values_biases, e.qsa_pooled, e.aux_state, @intCast(base), @intCast(check_from), @intCast(position), self.s) != 0)
+                return error.StageSplitSeed;
+        }
+    }
+    const r = stage_split_iseed_end(@intCast(position));
+    if (r < 0) return error.StageSplitSeed;
+    return r == 1;
 }
 const Transformer = trf.Transformer;
 const std = @import("std");
@@ -1723,7 +1918,8 @@ pub fn forwardQwen4VerifyRows(
     out_last: []mlx.mlx_array,
     out_all: []mlx.mlx_array,
 ) !void {
-    stage_split_invalidate(); // R60: these batched paths run every layer on the Mac
+    // R60: these batched paths run every layer on the Mac; R67: only a batched stage holder's state goes stale
+    for (ctxs) |c| stage_split_invalidate_owner(stageOwner(c));
     const previous_hc_prepared = mtp_verify_hc_prepared_active;
     mtp_verify_hc_prepared_active = true;
     defer mtp_verify_hc_prepared_active = previous_hc_prepared;
@@ -1974,7 +2170,8 @@ pub fn forwardQwen4DecodeRows(
     ctxs: []const *ForwardCtx,
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
-    stage_split_invalidate(); // R60: these batched paths run every layer on the Mac
+    // R60: these batched paths run every layer on the Mac; R67: only a batched stage holder's state goes stale
+    for (ctxs) |c| stage_split_invalidate_owner(stageOwner(c));
     const n = ctxs.len;
     std.debug.assert(n == next_tokens.len and n >= 1 and n <= MAX_BATCH_ROWS);
     if (!qwen4_rows_logged) {
@@ -2254,9 +2451,9 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     // forward (R60 S4) keeps it in step.
     // An M-RoPE prefill (image tokens: 3-D positions) never goes to the stage; M-RoPE decode rows are
     // text and go with their rope delta (stage_split_forward), unless SUSHI_STAGE_MROPE=0.
-    if (ctx.stage_prefill != 0 and ctx.mrope_pos != null) return error.StageSplitMrope;
+    if (ctx.stage_prefill != 0 and ctx.mrope_pos != null and ctx.stage_prefill_delta == null) return error.StageSplitMrope;
     const stage_first: ?usize = if ((ctx.stage_split and (ctx.mrope_pos == null or stageMropeEnabled())) or ctx.stage_prefill != 0) stageSplitFirst() else blk: {
-        stage_split_invalidate();
+        stage_split_invalidate_owner(stageOwner(ctx)); // R67: another stream's Mac-only forward leaves the holder's alone
         break :blk null;
     };
     // texas-split: a sequence whose layers [first, 48) live on the stage (it decoded there) has no
@@ -2284,7 +2481,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             if (ctx.stage_prefill != 0) {
                 // R60 S4 (prefill v2): the chunk's rows through the stage's prefill path.
                 if (stage_split_prefill_ready(@intCast(offset)) == 0) try stageSeedOrRestore(self, ctx, first, offset);
-                if (stage_split_prefill_send(h, @intCast(offset), self.s) != 0) return error.StageSplitPrefill;
+                if (stage_split_prefill_send(h, @intCast(offset), if (ctx.mrope_pos != null) ctx.stage_prefill_delta orelse 0 else 0, self.s) != 0) return error.StageSplitPrefill;
                 if (ctx.stage_prefill == 1) {
                     ctx.stage_prefill_sent = true;
                     ctx.moe_seq_offset.* += @intCast(seq_len);
@@ -2308,6 +2505,17 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             clearStageHead(ctx);
             stage_split_set_head(@intFromBool(want_head));
             defer stage_split_set_head(0);
+            // R69: the async form sends here and returns; forwardQwen4Resume receives (the scheduler interleaves slots)
+            if (ctx.stage_async_verify) {
+                if (stage_split_forward_send(h, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
+                ctx.stage_verify_sent = true;
+                ctx.stage_verify_head = want_head;
+                ctx.stage_verify_rows = seq_len;
+                _ = mlx.mlx_array_free(out);
+                _ = mlx.mlx_array_free(h);
+                h = .{ .ctx = null };
+                return mlx.mlx_array_new();
+            }
             if (stage_split_forward(h, &out, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
             if (want_head) {
                 if (stage_split_head_topk(&head_buf, seq_len) == 0 and stageHeadUsable(self, &head_buf, seq_len)) {
@@ -2504,6 +2712,51 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     const logits = try self.lmHeadProject(final, ctx.argmax_only);
     _ = mlx.mlx_array_free(final);
     if (self.expert_stream) |engine| engine.finishForward(@intCast(batch * seq_len));
+    return logits;
+}
+
+/// texas-split R69: the second half of an async split forward: the stage's stream after layer 47, then what
+/// forwardQwen4With does after its layer loop (hidden captures; the stage head's top-20 or the mixer and lm_head).
+pub fn forwardQwen4Resume(self: *Transformer, ctx: *ForwardCtx) !mlx.mlx_array {
+    if (!ctx.stage_verify_sent) return error.StageSplitForward;
+    ctx.stage_verify_sent = false;
+    const seq_len = ctx.stage_verify_rows;
+    const batch: c_int = 1;
+    var h = mlx.mlx_array_new();
+    errdefer if (h.ctx != null) {
+        _ = mlx.mlx_array_free(h);
+    };
+    stage_split_bind(stageOwner(ctx));
+    if (stage_split_forward_recv(&h, self.s) != 0) return error.StageSplitForward;
+    var head_buf: [16 * 40]u32 = undefined;
+    var head_ready = false;
+    if (ctx.stage_verify_head) {
+        if (stage_split_head_topk(&head_buf, seq_len) == 0 and stageHeadUsable(self, &head_buf, seq_len)) {
+            head_ready = true;
+            r64_head_used += 1;
+        } else r64_head_fallback += 1;
+    }
+    ctx.moe_seq_offset.* += @intCast(seq_len);
+    if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h, true);
+    if (ctx.capture_hidden) |target| try capturePrefillHiddenLast(self.s, target, h, ctx.capture_settle);
+    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, ctx.capture_settle);
+    if (head_ready and !self.embedding_mode and !ctx.skip_lm_head) {
+        const logits = try stageHeadLogits(self, ctx, &head_buf, seq_len);
+        _ = mlx.mlx_array_free(h);
+        h = .{ .ctx = null };
+        return logits;
+    }
+    var pending: ?HcPending = null;
+    defer if (pending) |*pd| pd.deinit();
+    const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
+    _ = mlx.mlx_array_free(h);
+    h = .{ .ctx = null };
+    if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
+    const final = mix.mixed;
+    if (self.embedding_mode or ctx.skip_lm_head) return final;
+    errdefer _ = mlx.mlx_array_free(final);
+    const logits = try self.lmHeadProject(final, ctx.argmax_only);
+    _ = mlx.mlx_array_free(final);
     return logits;
 }
 

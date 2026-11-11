@@ -12903,6 +12903,15 @@ pub const ForwardCtx = struct {
     stage_prefill: u8 = 0,
     /// Set by an async stage-prefill forward that returned early.
     stage_prefill_sent: bool = false,
+    /// texas-split R68: an M-RoPE request whose prefill rows are all text at one rotary offset (no image in the uncached
+    /// part) sends them through the stage's prefill with this offset; null = M-RoPE prefill stays on the Mac.
+    stage_prefill_delta: ?i32 = null,
+    /// texas-split R69 (interleaved stage slots): a split verify/decode forward sends its rows at the stage boundary and
+    /// returns (`stage_verify_sent`); `forwardWithCaptureAllResume` receives them and finishes the forward.
+    stage_async_verify: bool = false,
+    stage_verify_sent: bool = false,
+    stage_verify_head: bool = false,
+    stage_verify_rows: c_int = 0,
     /// MiMo spec verify: every row of this multi-row forward computes with its
     /// own decode tick's arithmetic (`mimoVerifyRowsAttn`), so greedy MTP is serial.
     verify_rows: bool = false,
@@ -16134,6 +16143,25 @@ pub const Transformer = struct {
             ctx.capture_hidden_all = saved_all;
         }
         return self.forwardWith(ctx, token_ids);
+    }
+
+    /// texas-split R69: the second half of an async split forward (`ForwardCtx.stage_async_verify`): the stage's rows,
+    /// the hidden captures and the head, as the forward would have finished.
+    pub fn forwardWithCaptureAllResume(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        out_hidden: *mlx.mlx_array,
+        out_hidden_all: *mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const saved = ctx.capture_hidden;
+        const saved_all = ctx.capture_hidden_all;
+        ctx.capture_hidden = out_hidden;
+        ctx.capture_hidden_all = out_hidden_all;
+        defer {
+            ctx.capture_hidden = saved;
+            ctx.capture_hidden_all = saved_all;
+        }
+        return @import("qwen4_forward.zig").forwardQwen4Resume(self, ctx);
     }
 
     // ── BERT encoder-only forward pass ──

@@ -487,6 +487,21 @@ pub fn ssdFirstEnabled() bool {
     return ssd_first_override orelse true;
 }
 
+/// texas-split R66 (`SUSHI_HOT_KEEP_CPS=1`): a hot entry keeps every SSM checkpoint in RAM (still capped and
+/// thinned by `ssm_checkpoint_max`) even when an SSD record was captured for it. Under SSD-first the record
+/// is meant to hold the older checkpoints and RAM only the newest two, but on the split the record cannot
+/// persist (layers 28-47's decode rows live on the 5090: "layer offset short of the range"), so those
+/// checkpoints were simply lost. A compaction prompt sharing 33K tokens of a 66K conversation then found no
+/// restore point below the conversation's end and prefilled all of it cold. Unset/0 = stock behaviour.
+var hot_keep_cps_env: ?bool = null;
+pub fn hotKeepsAllCheckpoints() bool {
+    if (hot_keep_cps_env) |v| return v;
+    const raw = std.c.getenv("SUSHI_HOT_KEEP_CPS");
+    const v = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    hot_keep_cps_env = v;
+    return v;
+}
+
 /// Test seam: forces the refcount share (false) whose first append copies the whole prefix;
 /// null = restore by move, armed where `HotPrefixCache.ssd_first` is, or on demand when a share
 /// does not fit (`checkoutRestored`).
@@ -2255,7 +2270,8 @@ pub const HotPrefixCache = struct {
         };
         // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
         // A GDN checkpoint past the record's text prefix is not in it and stays.
-        const hot_keeps_newest = self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
+        // texas-split R66: not where the record cannot persist (`hotKeepsAllCheckpoints`).
+        const hot_keeps_newest = !hotKeepsAllCheckpoints() and self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
         const record_text: usize = if (new_glm != null) std.math.maxInt(usize) else disk_len;
         // GDN checkpoints are cut after the byte-budget trim below, which lands on one of them.
         if (hot_keeps_newest and new_glm != null) self.keepNewestCheckpoints(&ssm_cps, record_text);

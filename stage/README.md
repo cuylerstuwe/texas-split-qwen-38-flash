@@ -4,9 +4,19 @@
 RTX 5090 (5 full-attention layers with 8-bit affine KV and QSA block selection, 15 gated-delta-net layers,
 their EXL3 4-bit MoE experts) and serves them to Sushi over a Unix socket. The protocol is documented at
 the top of `src/bin/canon_stage_server.rs`: FORWARD (decode/verify rows, with deferred partial-accept
-COMMIT), SEED (load a sequence's state), PREFILL (pipelined chunks, optional state pull-back), PARK /
-RESTORE (a parked background request's whole stage state to and from an SSD file, verified byte for byte
-when `QD_STAGE_RESTORE_VERIFY=1`), INFO, QUIT.
+COMMIT), SEED (load a sequence's state), incremental SEED (op 10: only the rows after the ones the stage already
+holds, which it hashes against the client's first), PREFILL (pipelined chunks, optional state pull-back), EXPORT
+(op 9: a finished turn's decode-time rows and recurrent states, back to the client), PARK / RESTORE (a parked
+background request's whole stage state to and from an SSD file, verified byte for byte when
+`QD_STAGE_RESTORE_VERIFY=1`), DROP SLOT (op 11), INFO, QUIT.
+
+Conversation slots (`QD_STAGE_SLOTS=2..4`, set by the host when `TEXAS_SPLIT_MAX_CONCURRENT` is above 1): bits 3-5
+of a message's aux word name the slot. Slot 0 is the whole state as with one slot. Extra slot k holds
+`QD_STAGE_SLOT_ROWS` rows as views into the top of slot 0's K/V and pooled-key buffers (stacking downward; slot 0
+stops below the occupied ones), with its own recurrent state, per-row verify state and projection outputs, and
+`QD_STAGE_SLOT_VERIFY_ROWS` verify rows (a value or a comma list; default 9 for slot 1, 4 after). Captured graphs
+are keyed by (slot, rows) and stay resident (~16.5 MB each); their number is budgeted from the card's free memory
+(`QD_STAGE_MAX_GRAPHS` overrides) and forwards past the budget run uncaptured. Prefill is slot 0's.
 
 This crate is the stage's part of a larger research codebase; only the stage server binary is built.
 CUDA kernels ship as prebuilt `kernels/*.cubin` (sources `kernels/*.cu`), each pinned by SHA-256

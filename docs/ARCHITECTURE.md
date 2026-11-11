@@ -57,10 +57,18 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
   (§4, §7).
 - **Seeding** — when the stage does not hold the request's sequence (a new request with a prefix-cache hit,
   say), Sushi uploads its exact committed state for layers 28–47 (about 5.9 KB per position plus 48 MB of
-  recurrent state; up to 1.56 GB at full context, through a 2 GiB shared file).
+  recurrent state; up to 1.56 GB at full context, through a 2 GiB shared file). The stage keeps the rows of the
+  sequence it last held, and the client tracks how many of them still equal Sushi's: a request that shares
+  them (the next turn of the same conversation) sends only the rows after them and the recurrent states
+  (~50 MB), and the stage hashes its rows just below that point against Sushi's before accepting (§10).
+- **End of a turn** — the reply's rows of layers 28–47 exist only on the 5090 while it decodes. After the
+  response is sent, the stage exports them and the recurrent states (~48 MB, ~25 ms) and Sushi imports them and
+  takes a checkpoint at the reply's end, so the next turn resumes after the reply and the conversation's cache
+  entry is whole and can go to SSD (§10).
 - **Images and video** — vision tokens have 3-D M-RoPE positions, so a prompt with an image or video
   prefills entirely on the Mac; its decode rows are text and go to the stage with the request's rope delta
-  (text after an image ropes at position + delta on all three axes).
+  (text after an image ropes at position + delta on all three axes). A later turn of such a session whose
+  uncached rows are all text at one delta prefills through the stage with that delta (§11).
 
 ## Stage side (`stage/`, `driver/`)
 
@@ -103,12 +111,39 @@ Measured: a 192,008-token background request parks its 5090 half (1.15 GB) in 0.
 (2.1 GB) alongside, and restores in 0.58 s; foreground requests start within 1.5 s of the hold. Short
 requests switch in 0.2–0.5 s.
 
+## Several requests at once
+
+By default one request generates at a time. With `TEXAS_SPLIT_MAX_CONCURRENT` above 1 the stage is launched with
+up to four conversation slots and Sushi's scheduler places requests on them (`sushi/FORK.md` §12):
+
+- **Slots.** Slot 0 is the stage's whole state, as with one slot. An extra slot is a fixed number of rows viewed
+  out of the top of slot 0's K/V and pooled-key buffers, plus its own recurrent state and verify-row state
+  (~45 MiB), so extra conversations use only memory a lone one does not need. Slot 0 may grow up to the lowest
+  occupied extra slot; before a request would cross that line, the extra slot's request is moved to the Mac
+  (its rows pulled back first). Later slots verify fewer rows per round (9, 9, 4, 4) because each (slot, rows)
+  graph stays resident on the card.
+- **Interleaved rounds.** A decode round has a Mac half (drafts, layers 0–27, send) and a 5090 half. With two
+  or more slot holders the scheduler runs every holder's first half in turn, then the requests that live on the
+  Mac, then the second halves (receive, accept, sample), so each holder's 5090 time passes while the Mac works
+  for the others. A round of two holders takes ~35 ms, of four ~63 ms. The Mac is the limit: its layers 0–27 run
+  once per request per round, which is why the total settles near 132 tok/s with three or four requests.
+- **Placement.** A request claims slot 0 if it is free, else the first free extra slot it fits; otherwise it
+  runs every layer on the Mac, batched with the other Mac-side requests. When a slot's request ends, the
+  Mac-side request with the most tokens left takes the slot (seeded from Sushi's caches); a request left alone
+  on a narrower extra slot moves to slot 0, so a lone request always runs the single-request path. Requests on
+  extra slots prefill on the Mac, and extra-slot holders pause while slot 0's request prefills through the 5090.
+- **Background requests** run alone, on slot 0, and park exactly as with one request at a time.
+
 ## Failure handling
 
 Every stage call has a deadline (20 s by default). Any failure (the stage process dies, a socket error, a
 timeout, an error the stage reports, a failed restore check) makes Sushi give the stage up for the rest of
 its life and re-run the interrupted request on the Mac: a prefill restarts, a decoding stream re-prefills
-its prompt plus the tokens already sent and keeps streaming (the client sees a pause). The host notices,
+its prompt plus the tokens already sent and keeps streaming (the client sees a pause: the Mac prefills at
+~2.3K tokens/s, so about 7 s for a 16K-token conversation). With several requests in flight only the ones
+whose layers 28–47 lived on the stage re-run, one after another; the requests on the Mac keep streaming
+between the chunks of those re-runs, and no decode tick takes a request until its own re-run has ended
+(`sushi/FORK.md` §13). The host notices,
 reports `mode: mac-only`, lets the stage server exit by itself, and when the service has been idle for two
 minutes restarts the stack to bring the split back (backing off up to an hour if the card stays
 unavailable). A stage that cannot start at all also leaves the service running Mac-only.

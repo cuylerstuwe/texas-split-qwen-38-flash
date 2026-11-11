@@ -165,3 +165,70 @@ those 20 values per row (−inf elsewhere) and the Mac skips its own mixer + hea
   while generating), `SUSHI_R64_PLE_WALK` / `SUSHI_R64_PLE_HYBRID` / `SUSHI_R64_PLE_LEAN` (other ways to
   gather decode-sized PLE rows), `SUSHI_R64_DEFER_CAPTURES` (verify captures outside the accept batch),
   `SUSHI_R64_CPU_ACCEPT` (the sparse acceptance on the host). None paid on this machine.
+
+## 10. Stage state across turns: incremental seed, end-of-turn pull-back, kept checkpoints
+
+- **Incremental seed** (`SUSHI_STAGE_ISEED=1`, set by the host; `native/stage_split.cpp`, `src/qwen4_forward.zig`
+  `stageNotePrompt`). The stage keeps the rows of the sequence it last held. The client notes each request's
+  prompt and restore point and tracks how many rows the stage holds exactly as Sushi does (rows seeded from
+  Sushi, or split-prefill chunks pulled back; decode rows never count). A seed then sends rows [base, position)
+  and the recurrent states only (stage op 10, ~50 MB instead of ~450 MB at 70K tokens), with base = that count
+  capped at the restore point. The stage hashes its K codes of the 16 rows below base against Sushi's and refuses
+  before changing anything on a mismatch; the client then seeds in full. `SUSHI_STAGE_ISEED_TRACE=1` logs the
+  bookkeeping.
+- **End-of-turn pull-back** (`SUSHI_STAGE_PULLBACK_END=1`, set by the host; `stagePullbackTurnEnd`). After a
+  split turn the client commits the last forward's rows and asks the stage for the decode-time rows and
+  recurrent states (stage op 9); Sushi imports them and checkpoints at the trunk's end, so the next turn resumes
+  after the reply and the cache entry can persist to SSD whole. The MTP head has to reach the same position (its
+  deferred stash applied, the last pair appended) or the next turn could not adopt it; the checkpoint goes in
+  only where it does.
+- **Kept checkpoints** (`SUSHI_HOT_KEEP_CPS=1`, set by the host; `src/prefix_cache.zig`). A hot prefix-cache
+  entry keeps every recurrent-state checkpoint (at most 16, thinned) instead of the newest two, so a request
+  that diverges mid-history restores from the nearest one. Restore points only: the restore path is Sushi's own.
+
+## 11. Image sessions: text rows prefill through the stage
+
+`SUSHI_STAGE_MROPE_TEXT=1` (set by the host; `src/generate.zig`, `src/qwen4_forward.zig` `mropeTextDelta`). A
+request with an image anywhere in its prompt has M-RoPE positions and used to prefill entirely on the Mac. When
+every row a turn prefills is text at one rotary offset (checked from the 4-row QSA group the first new row
+completes), the split prefill sends those rows to the stage with that offset in the PREFILL message's aux bits,
+as decode rows already do, and the MTP head's split-path history gets the request's M-RoPE context. Image rows and
+cold image prompts stay on the Mac.
+
+## 12. Several requests at once: stage slots and interleaved rounds
+
+Active only with `--max-concurrent` above 1 (the host's `TEXAS_SPLIT_MAX_CONCURRENT`); with 1 none of this runs.
+
+- **Stage client** (`native/stage_split.cpp`): up to four sequences (`SUSHI_STAGE_SLOTS`), one per stage slot,
+  each with its own position, token mirror and head buffer; the slot rides in bits 3-5 of a message's aux word.
+  Forwards can be sent and received separately (`stage_split_forward_send` / `_recv`), one outstanding per slot;
+  every write to the shared file first drains the other slots' outstanding replies, and no stage call may go out
+  from inside another call's wait.
+- **Forward** (`src/qwen4_forward.zig`): with `ctx.stage_async_verify` a verify forward returns after the send at
+  the stage boundary and `forwardQwen4Resume` finishes it after the receive (`src/generate.zig`:
+  `mtpRoundVerifyPre` / `mtpRoundVerifyPost`).
+- **Scheduler** (`src/scheduler.zig`): `stageHolderClaim` places a request on slot 0, on a free extra slot it
+  fits (`SUSHI_STAGE_SLOT_ROWS`, with `SUSHI_STAGE_SLOT_RESERVE` rows of headroom for the reply), or on the Mac.
+  `runDecodeTick` collects the slot holders: two or more run through `runSplitGroup` (every holder's first half
+  in turn, the Mac-side requests, then the second halves); one holder runs alone with the Mac-side requests
+  decoding inside its stage wait (`SUSHI_STAGE_MS_OVERLAP`, on). Draft counts are capped by the slot's verify
+  rows (`SUSHI_STAGE_SLOT_VERIFY_ROWS`). `stageSlotGuard` moves an extra slot's request to the Mac before a
+  request crosses a slot boundary (its rows are pulled back first), `stageHolderRelease` passes a freed slot to
+  the Mac-side request with the most tokens left, and a request left on a narrower slot moves to slot 0.
+  Extra-slot holders sit a tick out while slot 0's request has split-prefill chunks on the stage (one stream of
+  replies on the socket). A background request takes slot 0 only when nothing else is on the stage, gives it up
+  while parked and claims it again on resume.
+- Switches for experiments: `SUSHI_STAGE_MS_HOLDER=0` (every request on the Mac), `SUSHI_STAGE_MS_TRACE=1` (where
+  a multi-request tick's time goes), `SUSHI_STAGE_FORCE_SLOT1=1` (every holder on slot 1 of a two-slot stage).
+
+## 13. Stage-failure recovery with decode ticks inside a re-run
+
+`src/scheduler.zig`. A decoding request interrupted by a stage failure re-runs from its tokens on the Mac, which
+is a prefill, and decode ticks run between a prefill's chunks. Those ticks used to take the request being re-run
+(no generator until its prefill ends) and failed it, so a re-run longer than one chunk ended in
+`generation failed`. Now `stageMarkRecover` marks the requests to re-run (one request at a time: every request of
+the failed tick; several: the ones on stage slots or resident on the stage), `interleaveDecodeTick` leaves marked
+requests out, and `stageRecoverMarked` re-runs them one after another. A stage error inside a tick hosted by
+another request's prefill marks them for the next pass instead of failing every stream of that tick. Requests
+decoding on the Mac keep their state and carry on. The reset before a re-run clears the MTP head's live state only
+when it is the request's own (`headStateIsSlots`).

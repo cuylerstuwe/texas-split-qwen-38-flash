@@ -1,6 +1,103 @@
 # Changelog
 
-## 2026-11-10, latest: faster decode (shared expert beside the routed experts, warm Mac GPU, windowed draft depth)
+## 2026-11-11, latest: several requests at once (opt-in), the cache across turns, a failure-recovery fix
+
+Existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart` (the stage server and
+Sushi changed; the driver did not).
+
+With one request at a time, which stays the default, replies are identical to the previous build's (a greedy
+four-turn conversation) and decode speed is the same. The agentic replay on this build (two recorded sessions, the
+thinking sampler, 1,024 tokens per turn, three seeds): total task **1.565×** faster than stock Sushi pooled
+(1.52–1.59× by seed; 250.9 s against 260.6 s for the previous release), decode 120.5 tok/s, a cold 54K-token
+prompt's first token in 14.6–16.6 s. Part of the gain over the previous release is the end-of-turn pull-back
+below (+2.3% in a same-session A/B); the rest is within what one build varies between sessions.
+
+### Fixed: a 5090 failure mid-reply in a long conversation ended the request with an error
+
+When the 5090 path fails, Sushi re-runs the interrupted request on the Mac from its tokens and keeps streaming.
+That re-run is a prefill, and decode ticks run between a prefill's chunks. They picked up the very request being
+re-run, which has no generator until its prefill ends, and failed it: any conversation longer than one prefill
+chunk (4,096 tokens) ended in `generation failed` instead of a pause. `fault.py term` uses a short prompt and
+never showed it. The scheduler now marks the requests to re-run and keeps them out of those ticks.
+`host/tests/fault.py long` covers it: the stage killed 13 s into the reply of a 35.8K-token conversation, a 15.8 s
+pause, and the reply (a copy task) continued exactly.
+
+### Several requests at once (opt-in)
+
+```sh
+bin/texas-split concurrency 4     # 1-16; writes TEXAS_SPLIT_MAX_CONCURRENT to texas-split.env
+bin/texas-split restart
+```
+
+Above 1, up to four requests decode through the 5090 at once and any further ones run every layer on the Mac
+beside them (Sushi's continuous batching). The stage holds up to four conversations in slots: slot 0 is the
+stage's whole state as before, each extra slot a view into the top of slot 0's KV buffers with its own recurrent
+state. A decode round is split in two: every slot holder's first half (drafts, layers 0-27 on the Mac, the rows
+sent to the 5090) runs in turn, then the second halves (receive, accept, sample), so each request's 5090 time
+hides behind the Mac's work on the others. A request alone runs exactly the single-request path.
+
+Total throughput at the thinking sampler (seeded, ~500-token prompts, 1,000-token replies, tok/s over the wall,
+mean of two seeds):
+
+| requests at once | 1 | 2 | 3 | 4 | 8 |
+|---|---|---|---|---|---|
+| up to four on the 5090 (this release) | 102.6 | 120.1 | 131.6 | 131.7 | 122.9 |
+| one on the 5090, the rest on the Mac | 101.7 | 98.7 | 95.9 | 98.5 | 114.3 |
+
+Each request is slower than it would be alone (four share ~132 tok/s); the total is what rises. A slot holder's
+reply is byte-identical to the same request run alone (greedy, same prefill path). Each conversation keeps its own
+prefix-cache entry: two 65K-token conversations at concurrency 2 reach the first token of warm turns in 0.7-1.2 s
+with the whole prompt restored. Background requests behave as before: one at a time, alone on slot 0, parked
+exactly while any foreground request runs.
+
+Limits: a request on an extra slot prefills on the Mac, and extra-slot holders pause while slot 0's request
+prefills through the 5090; extra slots have a fixed share of the stage's rows (131,080 each with two slots, 87,384
+with three, 65,536 with four) and a request that outgrows its slot moves to the Mac (its state is pulled back
+first); with three or four slots the later slots verify 4 rows per round instead of 9 and prefill pieces shrink to
+1,024 or 768 rows, which is what fits the card; `smoke.py`'s `queue_concurrent` check expects one request at a time
+and fails by design above 1. If the 5090 fails, only the requests on it re-run on the Mac, one after another; the
+ones already on the Mac keep streaming.
+
+### The cache across turns
+
+- **Incremental stage seed** (`SUSHI_STAGE_ISEED`, stage op 10). Every turn re-sent layers 28-47's whole state to
+  the 5090 (~450 MB, ~100 ms at 70K tokens) although the stage still held those rows. A request whose prompt
+  shares rows with what the stage holds now sends only the rows after them and the recurrent states (~50 MB). The
+  stage hashes its rows just below that point against Sushi's and refuses on a mismatch (then the full seed runs).
+  Warm seeds 13-15 ms instead of 45-53 ms at 24K tokens; every reply identical to the full-seed build's.
+- **End-of-turn pull-back** (`SUSHI_STAGE_PULLBACK_END`, stage op 9). A reply's rows of layers 28-47 lived only on
+  the 5090, so the next turn prefilled the previous reply again and the conversation's cache entry could not be
+  written to SSD. After each split turn those rows and the recurrent states are copied back (~48 MB, ~25 ms, after
+  the response) and a checkpoint is taken at the reply's end. Agentic replay, three seeds, same binaries: total
+  task 1.458x -> 1.491x stock Sushi, time to first token lower on every seed.
+- **Hot cache entries keep their checkpoints** (`SUSHI_HOT_KEEP_CPS`). A request that diverges from a cached
+  conversation mid-history (an agent's compaction prompt, a pruned tool result) restarts from the nearest
+  checkpoint instead of from 0. The split's idle cache allowance is 2 GB.
+
+### Image sessions: warm turns prefill through the 5090
+
+A prompt with an image used to prefill entirely on the Mac, on every turn of the session. When every row a turn
+prefills is text at one rotary offset (no new image), those rows now go through the stage with that offset
+(`SUSHI_STAGE_MROPE_TEXT`). Image rows and cold image prompts stay on the Mac. Four images and a 19K-token cold
+turn, then ~7K-token text turns: time to first token 3.58-3.71 s -> 2.46-2.62 s.
+
+### Host and tests
+
+- The TinyGPU server is started in a session of its own before the stage step. Started by the step itself (after
+  a reboot), it lived in the stage's process group, so every stop waited 90 s and then killed it.
+- `TEXAS_SPLIT_STAGE_BIN`, `TEXAS_SPLIT_SUSHI_BIN` and `TEXAS_SPLIT_STAGE_ENV` (a JSON object of `QD_`/`QWEN_`
+  variables) select other builds and stage settings for experiments; `/health` reports `concurrency`.
+- `smoke.py` sends a 192-px image. With the old 96-px one (9 image tokens) the thinking sampler names one colour
+  for both shapes in about 5% of replies (8 of 150, in every condition tried; greedy is always right), which made
+  the check fail now and then. At 192 px: 0 of 30.
+
+### Validation
+
+Priority suite 8/8 exact with SSD parking, at one request at a time and at `TEXAS_SPLIT_MAX_CONCURRENT=4`;
+`smoke.py` 10/10; `fault.py term`, `prefill` and `long`; stage-failure scenarios with several requests in flight.
+Details in [docs/VALIDATION.md](docs/VALIDATION.md).
+
+## 2026-11-10, third update: faster decode (shared expert beside the routed experts, warm Mac GPU, windowed draft depth)
 
 Existing installs: `git pull`, `./install.sh driver stage sushi pins`, `bin/texas-split restart` (the driver, the
 stage server and Sushi all changed).
@@ -39,7 +136,7 @@ timing: a seed reproduces its text. The Mac-only fallback keeps the planner. To 
 `TEXAS_SPLIT_SUSHI_ENV={"SUSHI_MTP_ADAPTIVE": "1", "SUSHI_MTP_COST_TABLE": "1", "SUSHI_MTP_ADAPTIVE_SERIAL": "1"}`
 in your config and restart.
 
-## 2026-11-10, later: memory guard fix
+## 2026-11-10, second update: memory guard fix
 
 Existing installs already on the 2026-11-10 release below: `git pull`, `bin/texas-split restart` (host only;
 nothing to rebuild).

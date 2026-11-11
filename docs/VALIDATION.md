@@ -177,8 +177,76 @@ is dropped; a cancelled stream frees the engine.
   finished on the Mac; the split came back); `FAULT_NONCE=x fault.py prefill` (the stage killed 4 s into a
   cold 124K-token prefill; the Mac finished it correctly in 66.7 s).
 
+## 2026-11-11 update (see CHANGELOG.md)
+
+- **One request at a time is unchanged.** A greedy four-turn conversation (24K-token context) gives the same four
+  replies as the previous build and as the build before any of this release's changes; decode on the 320-token
+  replies 96.8–98.8 tok/s against 97.7–98.8.
+- **Stage failure in a long conversation** (the bug this release fixes). Copy tasks, so the reply can be checked
+  against the source across the fault. On the previous build, the stage killed mid-reply in a 16K-token
+  conversation: `generation failed`. On this build: a 7.5 s pause and the reply continued exactly.
+  `fault.py long` on the installed service: a 35.8K-token conversation, SIGTERM 13 s into the reply, a 15.8 s
+  pause, 116 of 116 copied lines exact (83 of them after the fault).
+- **Stage failure with several requests in flight** (`TEXAS_SPLIT_MAX_CONCURRENT` 4 or 6, 8–42K-token contexts;
+  every stream ended without an error and kept copying exactly):
+
+  | scenario | result |
+  |---|---|
+  | four requests on four slots, stage killed | each paused (4–17 s, re-run one after another), then continued |
+  | two on slots, two on the Mac, thinking sampler | only the two on slots re-ran; the Mac-side ones kept streaming |
+  | stage killed while a third request prefilled on the Mac | the two slot holders re-ran after that prefill |
+  | stage killed during slot 0's split prefill, another request on slot 1 | the prefill restarted on the Mac; the slot-1 request re-ran after it |
+  | stage frozen (SIGSTOP) with three on slots | the 20 s timeout fired; all three re-ran and continued |
+
+- **Several requests at once.** Thinking sampler, fixed seeds (at this sampler a stream's text differs run to
+  run, so runs are seeded and repeated), ~500-token prompts, 1,000-token replies, total tok/s over the wall,
+  mean of two seeds:
+
+  | requests at once | 1 | 2 | 3 | 4 | 8 |
+  |---|---|---|---|---|---|
+  | four slots | 102.6 | 120.1 | 131.6 | 131.7 | 122.9 |
+  | two slots | 101.3 | 119.3 | 111.6 | 96.2 | 115.1 |
+  | one request on the 5090, the rest on the Mac | 101.7 | 98.7 | 95.9 | 98.5 | 114.3 |
+
+  A slot holder's greedy reply is byte-identical to the same request run alone when both prefill the same way
+  (checked with four staggered requests, with prompt-lookup drafts, and with a Mac-side request between them).
+  Staggered arrivals (1 → 2 → 1 requests, a 27K-token prompt prefilling on slot 0 while slot 1 decodes, 3 → 2 →
+  1, six requests), forced moves of a slot's request to the Mac, and a copy-heavy stress run passed. Caching per
+  conversation under concurrency: three conversations of three turns, six of two, and two 65K-token
+  conversations at concurrency 2 (first token of warm turns in 0.7–1.2 s, the whole prompt restored each time).
+- **The cache across turns.** Incremental seed: a 24K-token four-turn greedy conversation, text and with four
+  images: every reply identical to the full-seed build's, warm seeds 13–15 ms instead of 45–53 ms, none
+  refused. End-of-turn pull-back, agentic replay, three seeds, same binaries: 1.458× → 1.491× stock (wall
+  269.4 → 263.4 s; time to first token 38.2 / 35.8 / 36.0 → 35.9 / 34.5 / 34.0 s).
+- **Image sessions.** Four images and a 19K-token cold turn, then three ~7K-token text turns at the thinking
+  sampler: time to first token of the warm turns 3.58–3.71 → 2.46–2.62 s. Greedy logprob check: first tokens
+  identical, top-5 KL 1e-4–1.4e-3 (the level of split prefill against Mac prefill).
+- **The image check in `smoke.py`.** With a 96-px image (9 image tokens) the thinking sampler names one colour for
+  both shapes in 8 of 150 replies: with the prompt cached or cold, after a text or an image request, with drafts
+  on or off. Greedy replies are always right, and seeded replies are identical whatever request ran before, so
+  this is the model's sampling on a tiny image, not state carried between requests. At 192 px and 448 px: 0 of
+  30 each; the check now sends 192 px (42 of 42).
+- **The agentic replay on this build** (the harness of the first table: two recorded sessions, the thinking
+  sampler, 1,024 tokens per turn, each seed started at nominal thermal pressure):
+
+  | seed | session A | session B | A + B | vs stock | decode | cold 54K first token |
+  |---|---|---|---|---|---|---|
+  | 61 | 34.5 s | 51.1 s | 85.6 s | 1.522× | 119.5 tok/s | 16.6 s |
+  | 62 | 35.1 s | 48.4 s | 83.6 s | 1.594× | 118.1 tok/s | 14.6 s |
+  | 63 | 35.7 s | 45.9 s | 81.7 s | 1.582× | 124.0 tok/s | 15.1 s |
+  | pooled | | | 250.9 s | 1.565× | 120.5 tok/s | |
+
+  The previous release measured 1.507× (260.6 s) and a same-session A/B gave the end-of-turn pull-back +2.3%; the
+  remaining difference is within what one build varies between sessions (machine temperature mostly: the Mac's
+  28 layers bound the cold prefill at 3.3–3.7K tok/s).
+- **Qualification of this build:** priority suite 8/8 exact with SSD parking (6 pauses, no park errors), both at
+  one request at a time and at `TEXAS_SPLIT_MAX_CONCURRENT=4`; smoke.py 10/10; `fault.py term` (the stream
+  finished on the Mac; the split came back), `FAULT_NONCE=x fault.py prefill` (the stage killed 4 s into a cold
+  124K-token prefill; the Mac finished it correctly in 66.7 s) and `fault.py long` (above).
+
 ## Not covered
 
 Sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated by
 killing and freezing the stage server), recovery of parked requests after a crash or reboot, other GPUs or
-Macs.
+Macs. With several requests at once: more than eight together, a mix of long prefills and decoding requests
+under sustained load, and an end-to-end smoke test (`smoke.py`'s `queue_concurrent` expects one at a time).

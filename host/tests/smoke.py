@@ -105,16 +105,19 @@ TOOLS = [{'type': 'function', 'function': {
         'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}}]
 
 
-def png():
-    w = h = 96
+def png(k=2):
+    # 192x192 (36 image tokens). At 96x96 (9 tokens) the thinking-mode sampler names one colour for both shapes in
+    # about 5% of replies (8/150: hot or cold prompt, after text or image requests, drafts on or off), while greedy
+    # is always right and seeded replies do not depend on the request before; at 192 and 448 px it was 0/30 each.
+    w = h = 96 * k
     rows = []
     for y in range(h):
         row = bytearray([0])
         for x in range(w):
             r = g = b = 255
-            if 10 <= x < 46 and 10 <= y < 46:
+            if 10 * k <= x < 46 * k and 10 * k <= y < 46 * k:
                 r, g, b = 220, 30, 30
-            if (x - 70) ** 2 + (y - 28) ** 2 < 16 ** 2:
+            if (x - 70 * k) ** 2 + (y - 28 * k) ** 2 < (16 * k) ** 2:
                 r, g, b = 30, 60, 220
             row += bytes((r, g, b))
         rows.append(bytes(row))

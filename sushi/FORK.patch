@@ -147,10 +147,10 @@ index 00000000..80c7adb0
 +}
 diff --git a/native/stage_split.cpp b/native/stage_split.cpp
 new file mode 100644
-index 00000000..1967b75f
+index 00000000..61da7b02
 --- /dev/null
 +++ b/native/stage_split.cpp
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,1105 @@
 +// R60 pipeline split (isolated experiment): Sushi's side of the RTX 5090 stage, which runs the
 +// canonical target's layers [first, 48) in qwen-hybrid-rs canon-stage-server. One Unix socket
 +// (SUSHI_STAGE_SOCKET) carries 32-byte messages; one shared file (SUSHI_STAGE_SHM) carries the
@@ -194,16 +194,45 @@ index 00000000..1967b75f
 +int g_fd = -1;
 +int g_first = -2;  // -2 unopened, -1 disabled
 +uint8_t* g_shm = nullptr;
-+bool g_valid = false;   // the stage holds this sequence's state
-+uint64_t g_base = 0;    // first position of the last forward
-+uint64_t g_rows = 0;    // rows of the last forward (uncommitted)
++// R69: the stage may hold two conversations (slots, QD_STAGE_SLOTS=2 on the server); each slot's client state below.
++// Slot 1 serves the one owner the scheduler assigned it; every other owner is slot 0's, as before slots existed.
++struct Seq {
++  bool valid = false;    // the stage holds this sequence's state
++  uint64_t base = 0;     // first position of the last forward
++  uint64_t rows = 0;     // rows of the last forward (uncommitted)
++  int head_rows = 0;
++  uint32_t head_buf[16 * 40];
++  uint64_t owner = 0;    // the sequence whose state this slot holds (valid when valid)
++  uint64_t mirror = 0;   // R66: rows known equal to Sushi's caches
++  uint32_t* tok = nullptr;
++  uint64_t tok_n = 0, tok_cap = 0;
++};
++constexpr int kSlots = 4;
++Seq g_seq[kSlots];
++int g_cur = 0;                         // the slot the current call works on (stage_split_bind / the owner's slot)
++uint64_t g_slot_owner[kSlots] = {};    // [k >= 1]: the owner assigned slot k (0: none)
++#define g_valid (g_seq[g_cur].valid)
++#define g_base (g_seq[g_cur].base)
++#define g_rows (g_seq[g_cur].rows)
++#define g_head_rows (g_seq[g_cur].head_rows)
++#define g_head_buf (g_seq[g_cur].head_buf)
++#define g_owner (g_seq[g_cur].owner)
++#define g_mirror (g_seq[g_cur].mirror)
++#define g_tok (g_seq[g_cur].tok)
++#define g_tok_n (g_seq[g_cur].tok_n)
++#define g_tok_cap (g_seq[g_cur].tok_cap)
++int slot_of(uint64_t owner) {
++  if (owner)
++    for (int k = 1; k < kSlots; k++)
++      if (owner == g_slot_owner[k]) return k;
++  return 0;
++}
 +size_t g_at = 0;        // seed blob cursor
 +uint64_t g_forwards = 0, g_seeds = 0, g_partials = 0;
 +double g_rpc_us = 0, g_copy_us = 0;
 +// R64 stage head: request the final mixer + lm_head + top-20 with the next forward (op 1 aux bit 2); the reply's
 +// per-row (20 BF16-valued f32 bit patterns, 20 token ids) are copied out of the shared file at receive time.
-+int g_want_head = 0, g_head_rows = 0;
-+uint32_t g_head_buf[16 * 40];
++int g_want_head = 0;
 +// R64 (SUSHI_STAGE_INFER_COMMIT=1, a stage server that infers commits from positions): no op 2 round trip.
 +static int infer_commit() {
 +  static int v = -1;
@@ -233,9 +262,21 @@ index 00000000..1967b75f
 +// SUSHI_STAGE_TIMEOUT_MS bounds each socket wait (default 60 s; a prefill reply gets twice that);
 +// SUSHI_STAGE_DEAD_FILE receives the reason, for the host.
 +bool g_dead = false;
++// R66 incremental seed (SUSHI_STAGE_ISEED=1): the stage keeps the rows of the sequence it last held. g_tok is the
++// prompt those rows belong to (noted at each request's start), g_mirror how many of them are known equal to
++// Sushi's caches (seeded from them, or computed by a split prefill and pulled back; decode rows live only on the
++// stage and never count). A seed then sends rows [base, position) only; the stage hashes its K rows below base
++// against Sushi's before it accepts (op 10), so a wrong belief here costs a full seed, never wrong state.
++uint64_t g_iseeds = 0, g_irefused = 0;
++constexpr uint32_t kMagicIncr = 0x31494451;  // "QDI1"
++int iseed_trace() {
++  static int v = -1;
++  if (v < 0) { const char* e = getenv("SUSHI_STAGE_ISEED_TRACE"); v = (e && e[0] == '1') ? 1 : 0; }
++  return v;
++}
++#define MIRROR_TRACE(...) do { if (iseed_trace()) fprintf(stderr, __VA_ARGS__); } while (0)
 +int g_timeout_ms = -1;
 +uint64_t g_reply_arg = 0;  // the last reply's arg word
-+uint64_t g_owner = 0;      // the sequence whose state the stage holds (valid when g_valid)
 +uint64_t g_resident[16] = {};
 +struct Park {
 +  uint64_t owner, position;
@@ -281,7 +322,10 @@ index 00000000..1967b75f
 +void mark_dead(const char* why) {
 +  if (g_dead) return;
 +  g_dead = true;
-+  g_valid = false;
++  for (Seq& q : g_seq) {
++    q.valid = false;
++    q.mirror = 0;
++  }
 +  g_inflight = 0;
 +  for (Park& e : g_parks) park_drop(&e);  // a re-run from tokens replaces every parked state
 +  if (g_fd >= 0) {
@@ -358,23 +402,91 @@ index 00000000..1967b75f
 +  }
 +  return true;
 +}
++// R69: a forward split in two (interleaved slots): sent now, received later. At most one forward is outstanding on
++// the socket; any other call first receives it into its slot's stash (`drain_outstanding`).
++struct PendingFwd {
++  bool outstanding = false;  // sent, reply not read yet
++  bool stashed = false;      // reply read, rows copied out of shm
++  uint32_t rows = 0;
++  uint64_t position = 0;
++  int want_head = 0;
++  mlx_dtype dtype = MLX_BFLOAT16;
++  double t1 = 0;
++  std::vector<uint16_t> out;
++  uint32_t head[16 * 40];
++};
++PendingFwd g_pend[kSlots];
++int g_out_slot = -1;  // the slot whose forward is outstanding
++bool read_reply(uint32_t op);
++// Receive the outstanding forward (if any) into its slot's stash. 0 ok, -1 the stage failed.
++int drain_outstanding() {
++  if (g_out_slot < 0) return 0;
++  PendingFwd& p = g_pend[g_out_slot];
++  const int slot = g_out_slot;
++  g_out_slot = -1;
++  p.outstanding = false;
++  if (!read_reply(1)) return -1;
++  p.out.resize(size_t(p.rows) * kF);
++  memcpy(p.out.data(), g_shm, size_t(p.rows) * kF * 2);
++  if (p.want_head) memcpy(p.head, g_shm + size_t(p.rows) * kF * 2, size_t(p.rows) * 40 * 4);
++  p.stashed = true;
++  (void)slot;
++  return 0;
++}
++// R67 multi-stream: a callback run once between a forward's send (op 1) and its reply, while the 5090 computes:
++// the scheduler decodes the Mac-only requests there. Nothing in it may talk to the stage (refused below).
++typedef void (*stage_wait_hook_fn)(void);
++stage_wait_hook_fn g_wait_hook = nullptr;
++bool g_in_hook = false;
++double g_hook_us = 0, g_last_hook_us = 0;
++uint64_t g_hooks = 0;
 +int rpc(uint32_t op, uint32_t rows, uint64_t position, uint64_t arg, uint32_t aux = 0) {
 +  if (g_dead) return -1;
++  if (drain_outstanding()) return -1;
++  if (g_in_hook) {
++    fprintf(stderr, "[stage] op %u refused: a forward's reply is outstanding\n", op);
++    return -1;
++  }
 +  if (g_inflight) {
 +    fprintf(stderr, "[stage] op %u with %d prefill chunks in flight\n", op, g_inflight);
 +    return -1;
 +  }
 +  uint8_t m[32] = {};
++  aux |= uint32_t(g_cur) << 3;  // R69: the slot
 +  memcpy(m, &op, 4);
 +  memcpy(m + 8, &rows, 4);
 +  memcpy(m + 12, &aux, 4);
 +  memcpy(m + 16, &position, 8);
 +  memcpy(m + 24, &arg, 8);
-+  if (!io(m, 32, true) || !io(m, 32, false)) {
++  bool sent = io(m, 32, true);
++  g_last_hook_us = 0;
++  if (sent && op == 1 && g_wait_hook) {
++    const stage_wait_hook_fn f = g_wait_hook;
++    g_wait_hook = nullptr;  // once per registration
++    g_in_hook = true;
++    const int cur = g_cur;  // R69: the hook's requests must not leave another slot selected
++    const double th = now_us();
++    f();
++    g_cur = cur;
++    g_in_hook = false;
++    g_last_hook_us = now_us() - th;
++    g_hook_us += g_last_hook_us;
++    g_hooks++;
++  }
++  if (!sent) {
++    mark_dead("socket failure on send");
++    return -1;
++  }
++  return read_reply(op) ? 0 : -1;
++}
++// The reply of the op just sent (or outstanding): status and reply arg. false: the stage failed (given up).
++bool read_reply(uint32_t op) {
++  uint8_t m[32] = {};
++  if (!io(m, 32, false)) {
 +    char why[96];
 +    snprintf(why, sizeof why, "socket failure or timeout on op %u", op);
 +    mark_dead(why);
-+    return -1;
++    return false;
 +  }
 +  uint32_t status;
 +  memcpy(&status, m + 4, 4);
@@ -383,9 +495,9 @@ index 00000000..1967b75f
 +    char why[480];
 +    snprintf(why, sizeof why, "op %u failed: %.400s", op, reinterpret_cast<const char*>(g_shm));
 +    mark_dead(why);
-+    return -1;
++    return false;
 +  }
-+  return 0;
++  return true;
 +}
 +void align16() { g_at = (g_at + 15) & ~size_t(15); }
 +bool g_put_overflow = false;  // a seed blob outgrew shm: the seed fails instead of writing past it
@@ -437,6 +549,46 @@ index 00000000..1967b75f
 +  mlx_array_free(c);
 +  return 0;
 +}
++// R66: rows [from, to) of axis 2 of [1, H, T, W] as a contiguous evaluated token-major [to-from, H, W] copy
++// (caller frees), and its bytes.
++int token_major_rows(mlx_array* out, mlx_array a, uint64_t from, uint64_t to, mlx_stream s) {
++  const int* sh = mlx_array_shape(a);
++  if (mlx_array_ndim(a) != 4 || from > to || uint64_t(sh[2]) < to) return -1;
++  mlx_array cut = mlx_array_new(), tr = mlx_array_new();
++  const int start[4] = {0, 0, int(from), 0}, stop[4] = {sh[0], sh[1], int(to), sh[3]}, strides[4] = {1, 1, 1, 1};
++  const int axes[4] = {0, 2, 1, 3};
++  int rc = mlx_slice(&cut, a, start, 4, stop, 4, strides, 4, s) || mlx_transpose_axes(&tr, cut, axes, 4, s) ||
++           materialize(out, tr, 0, MLX_UINT8, s);
++  mlx_array_free(cut);
++  mlx_array_free(tr);
++  return rc ? -1 : 0;
++}
++const uint8_t* array_bytes(mlx_array c, size_t* n) {
++  *n = mlx_array_size(c) * mlx_array_itemsize(c);
++  if (*n == 0) return nullptr;
++  switch (mlx_array_dtype(c)) {
++    case MLX_UINT32: return reinterpret_cast<const uint8_t*>(mlx_array_data_uint32(c));
++    case MLX_BFLOAT16: return reinterpret_cast<const uint8_t*>(mlx_array_data_bfloat16(c));
++    case MLX_UINT8: return mlx_array_data_uint8(c);
++    default: fprintf(stderr, "[stage] KV dtype %d\n", int(mlx_array_dtype(c))); *n = 0; return nullptr;
++  }
++}
++int put_token_major_range(mlx_array a, uint64_t from, uint64_t to, mlx_stream s) {
++  mlx_array c = mlx_array_new();
++  if (token_major_rows(&c, a, from, to, s)) return -1;
++  size_t n = 0;
++  const uint8_t* p = array_bytes(c, &n);
++  if (n && !p) { mlx_array_free(c); return -1; }
++  if (n) put(p, n);
++  align16();
++  mlx_array_free(c);
++  return 0;
++}
++uint64_t fnv64(const uint8_t* p, size_t n) {
++  uint64_t h = 0xcbf29ce484222325ull;
++  for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
++  return h;
++}
 +}  // namespace
 +
 +extern "C" {
@@ -480,6 +632,12 @@ index 00000000..1967b75f
 +}
 +// The stage no longer mirrors Sushi's caches (a normal full forward ran).
 +void stage_split_invalidate(void) { g_valid = false; }
++// R67 multi-stream: a Mac-only forward of `owner` leaves the stage behind only if the stage holds that sequence; other
++// streams' forwards (they run every layer on the Mac beside the stage holder) leave its state alone.
++void stage_split_invalidate_owner(uint64_t owner) {
++  for (Seq& q : g_seq)
++    if (owner && owner == q.owner) q.valid = false;
++}
 +int stage_split_valid_at(uint64_t position) {
 +  return !g_dead && g_valid && position >= g_base && position <= g_base + g_rows;
 +}
@@ -490,11 +648,15 @@ index 00000000..1967b75f
 +// The sequence the next stage calls serve. A different one than the stage holds re-seeds (or
 +// restores) first; switching with a prefill chunk in flight would mix two sequences' replies.
 +void stage_split_bind(uint64_t owner) {
++  g_cur = slot_of(owner);
 +  if (owner == g_owner) return;
 +  if (g_inflight) {
 +    mark_dead("sequence switch with a prefill chunk in flight");
 +    return;
 +  }
++  // R66: the mirror is about content, not the slot: a request restored into another slot still shares the rows
++  // (note_prompt matches tokens, op 10 hashes the rows), so an owner switch keeps it.
++  MIRROR_TRACE("[stage] mirror: owner switch %llx -> %llx, mirror %llu kept\n", (unsigned long long)g_owner, (unsigned long long)owner, (unsigned long long)g_mirror);
 +  g_owner = owner;
 +  g_valid = false;
 +}
@@ -504,6 +666,8 @@ index 00000000..1967b75f
 +// 0 nothing to park (the stage holds no state of it), -1 the stage failed (given up).
 +int stage_split_park(uint64_t owner, uint64_t position, const char* path) {
 +  if (g_dead) return -1;
++  if (drain_outstanding()) return -1;  // R69: before shm is written
++  g_cur = slot_of(owner);
 +  if (!g_valid || g_owner != owner) return 0;
 +  if (g_inflight) { fprintf(stderr, "[stage] park with a prefill chunk in flight\n"); return -1; }
 +  if (position < g_base || position > g_base + g_rows) {
@@ -534,6 +698,8 @@ index 00000000..1967b75f
 +// Restore the sequence's parked stage state if it was parked at `position` (op 8; the file is removed
 +// either way). 1 restored, 0 nothing parked there (the caller seeds), -1 the stage failed.
 +int stage_split_unpark(uint64_t owner, uint64_t position) {
++  if (drain_outstanding()) return -1;  // R69: before shm is written
++  g_cur = slot_of(owner);
 +  Park* e = park_find(owner);
 +  if (!e) return 0;
 +  if (g_dead) { park_drop(e); return -1; }
@@ -552,6 +718,7 @@ index 00000000..1967b75f
 +  g_valid = true;
 +  g_base = position;
 +  g_rows = 0;
++  g_mirror = 0;  // R66: a parked sequence's rows are not the noted prompt's
 +  resident_add(owner);
 +  g_restored++;
 +  fprintf(stderr, "[stage] restored at %llu (%.1f ms)\n", (unsigned long long)position, (now_us() - t) / 1e3);
@@ -565,6 +732,7 @@ index 00000000..1967b75f
 +// Seed: begin / per layer / end (sends op 3). conv [1,3,10240], ssm [1,48,128,128].
 +int stage_split_seed_begin(uint64_t position) {
 +  if (g_dead) return -1;
++  if (drain_outstanding()) return -1;  // R69: before shm is written
 +  g_at = 0;
 +  g_put_overflow = false;
 +  const uint32_t hdr[4] = {kMagic, 1, uint32_t(g_first), uint32_t(48 - g_first)};
@@ -633,8 +801,138 @@ index 00000000..1967b75f
 +  g_base = position;
 +  g_rows = 0;
 +  g_seeds++;
++  g_mirror = g_tok_n >= position ? position : 0;
++  MIRROR_TRACE("[stage] mirror: full seed at %llu -> %llu\n", (unsigned long long)position, (unsigned long long)g_mirror);
 +  fprintf(stderr, "[stage] seeded at %llu (%.1f MB, %.1f ms)\n", (unsigned long long)position, g_at / 1e6, (now_us() - t) / 1e3);
 +  return 0;
++}
++// R66: a new request's prompt (`n` tokens) and its restore point. The rows the stage holds stay usable for it up
++// to the common prefix, but only below `restored`: Sushi recomputes every row from there (a chunk shape of its own,
++// so the stage's copies of those rows no longer hash the same).
++void stage_split_note_prompt(const uint32_t* toks, uint64_t n, uint64_t restored) {
++  uint64_t lim = g_mirror < g_tok_n ? g_mirror : g_tok_n;
++  if (lim > n) lim = n;
++  if (lim > restored) lim = restored;
++  uint64_t cp = 0;
++  while (cp < lim && g_tok[cp] == toks[cp]) cp++;
++  MIRROR_TRACE("[stage] mirror: prompt %llu tokens, restored %llu, held %llu of %llu noted -> %llu\n", (unsigned long long)n,
++               (unsigned long long)restored, (unsigned long long)g_mirror, (unsigned long long)g_tok_n, (unsigned long long)cp);
++  g_mirror = cp;
++  if (n > g_tok_cap) {
++    void* p = realloc(g_tok, size_t(n) * sizeof(uint32_t));
++    if (!p) {
++      g_mirror = 0;
++      g_tok_n = 0;
++      return;
++    }
++    g_tok = static_cast<uint32_t*>(p);
++    g_tok_cap = n;
++  }
++  if (n) memcpy(g_tok, toks, size_t(n) * sizeof(uint32_t));
++  g_tok_n = n;
++}
++// R66: rows [0, mirror) of the noted prompt that the stage holds exactly as Sushi's caches do.
++uint64_t stage_split_mirror(void) {
++  MIRROR_TRACE("[stage] mirror: asked, %llu (valid %d base %llu rows %llu)\n", (unsigned long long)g_mirror, int(g_valid),
++               (unsigned long long)g_base, (unsigned long long)g_rows);
++  return g_dead ? 0 : g_mirror;
++}
++// R66 incremental seed: begin / per layer (recurrent layers: stage_split_seed_recurrent) / end (op 10).
++// Rows [base, position) and every recurrent state; `check_from` <= base starts the K rows the stage hashes.
++int stage_split_iseed_begin(uint64_t base, uint64_t check_from, uint64_t position) {
++  if (drain_outstanding()) return -1;  // R69: before shm is written
++  if (g_dead) return -1;
++  g_at = 0;
++  g_put_overflow = false;
++  const uint32_t hdr[4] = {kMagicIncr, 1, uint32_t(g_first), uint32_t(48 - g_first)};
++  put(hdr, 16);
++  put(&position, 8);
++  put(&base, 8);
++  put(&check_from, 8);
++  align16();
++  return 0;
++}
++int stage_split_iseed_attention(mlx_array keys, mlx_array ks, mlx_array kb, mlx_array values, mlx_array vs,
++                                mlx_array vb, mlx_array pooled, mlx_array raw, uint64_t base, uint64_t check_from,
++                                uint64_t position, mlx_stream s) {
++  if (base % 4 || check_from > base || base > position) return -1;
++  const uint32_t tag[2] = {2, 0};
++  put(tag, 8);
++  align16();
++  mlx_array h = mlx_array_new();
++  if (token_major_rows(&h, keys, check_from, base, s)) { fprintf(stderr, "[stage] incremental seed hash rows\n"); return -1; }
++  size_t hn = 0;
++  const uint8_t* hp = array_bytes(h, &hn);
++  const uint64_t hash = fnv64(hp ? hp : reinterpret_cast<const uint8_t*>(""), hp ? hn : 0);
++  mlx_array_free(h);
++  put(&hash, 8);
++  align16();
++  for (mlx_array a : {keys, ks, kb, values, vs, vb})
++    if (put_token_major_range(a, base, position, s)) { fprintf(stderr, "[stage] incremental seed KV layout\n"); return -1; }
++  const uint64_t b0 = base / 4, b1 = position / 4, open = position % 4;
++  if (b1 > b0) {
++    mlx_array p = mlx_array_new();
++    if (materialize(&p, pooled, 1, MLX_BFLOAT16, s)) return -1;
++    if (mlx_array_size(p) < b1 * 128) { fprintf(stderr, "[stage] pooled %zu < %llu\n", mlx_array_size(p), (unsigned long long)b1 * 128); return -1; }
++    put(mlx_array_data_bfloat16(p) + b0 * 128, (b1 - b0) * 128 * 2);
++    align16();
++    mlx_array_free(p);
++  }
++  if (open) {
++    mlx_array r = mlx_array_new();
++    if (materialize(&r, raw, 1, MLX_BFLOAT16, s)) return -1;
++    const size_t rows = mlx_array_size(r) / 128;
++    if (rows < open) { fprintf(stderr, "[stage] raw keys %zu < %llu\n", rows, (unsigned long long)open); return -1; }
++    put(mlx_array_data_bfloat16(r) + (rows - open) * 128, open * 128 * 2);
++    align16();
++    mlx_array_free(r);
++  }
++  return 0;
++}
++// R66d end-of-turn pull-back (op 9): commit the last forward's rows up to `position` (as PARK does) and export the
++// owner's committed rows [from, position) as a QDX1 blob in shm (valid until the next stage call). 0 exported, 1
++// nothing to export (the stage holds no state of this sequence there), -1 the stage failed (given up).
++int stage_split_export(uint64_t owner, uint64_t from, uint64_t position, const uint8_t** data, uint64_t* len) {
++  if (g_dead) return -1;
++  g_cur = slot_of(owner);
++  if (!g_valid || g_owner != owner || g_inflight || from >= position) return 1;
++  if (position < g_base || position > g_base + g_rows) return 1;
++  const double t = now_us();
++  if (rpc(9, 0, position, from)) return -1;
++  g_base = position;
++  g_rows = 0;
++  *data = g_shm;
++  *len = g_reply_arg;
++  if (g_mirror == from) g_mirror = position;  // the caller imports these rows: Sushi then holds them as the stage does
++  fprintf(stderr, "[stage] pulled back [%llu, %llu) (%.1f MB, %.1f ms)\n", (unsigned long long)from,
++          (unsigned long long)position, g_reply_arg / 1e6, (now_us() - t) / 1e3);
++  return 0;
++}
++// R66d: the caller could not import an export; the rows past `n` are not Sushi's.
++void stage_split_mirror_cap(uint64_t n) {
++  if (g_mirror > n) g_mirror = n;
++}
++// 1 applied, 0 refused (the caller sends a full seed), -1 the stage failed (given up).
++int stage_split_iseed_end(uint64_t position) {
++  if (g_put_overflow) return 0;
++  const double t = now_us();
++  if (rpc(10, 0, position, g_at)) return -1;
++  if (g_reply_arg != 1) {
++    g_irefused++;
++    g_mirror = 0;
++    fprintf(stderr, "[stage] incremental seed at %llu refused (%llu so far); full seed\n", (unsigned long long)position,
++            (unsigned long long)g_irefused);
++    return 0;
++  }
++  g_valid = true;
++  g_base = position;
++  g_rows = 0;
++  g_mirror = position;
++  g_iseeds++;
++  fprintf(stderr, "[stage] seeded incrementally at %llu (%.1f MB, %.1f ms; %llu incremental, %llu refused)\n",
++          (unsigned long long)position, g_at / 1e6, (now_us() - t) / 1e3, (unsigned long long)g_iseeds,
++          (unsigned long long)g_irefused);
++  return 1;
 +}
 +// h: the HC stream [1, rows, 10240] after layer first-1 at absolute positions [position, ...).
 +// out: the stream after layer 47, in h's dtype.
@@ -642,7 +940,12 @@ index 00000000..1967b75f
 +// aux bits 8..31 as a signed 24-bit value. The KV row index stays `position`.
 +int stage_split_forward(mlx_array h, mlx_array* out, uint64_t position, int32_t rope_delta, mlx_stream s) {
 +  if (g_dead) return -1;
++  if (drain_outstanding()) return -1;  // R69: before shm is written
 +  if (!stage_split_valid_at(position)) return -2;  // caller re-seeds
++  if (g_mirror > position) {  // R66: rows from here on are the stage's own
++    MIRROR_TRACE("[stage] mirror: forward at %llu clamps %llu\n", (unsigned long long)position, (unsigned long long)g_mirror);
++    g_mirror = position;
++  }
 +  const double t0 = now_us();
 +  mlx_array c = mlx_array_new();
 +  if (materialize(&c, h, 1, MLX_BFLOAT16, s)) return -1;
@@ -684,14 +987,129 @@ index 00000000..1967b75f
 +  mlx_array_free(c);
 +  g_forwards++;
 +  g_copy_us += (t1 - t0) + (now_us() - t2);
-+  g_rpc_us += t2 - t1;
++  g_rpc_us += t2 - t1 - g_last_hook_us;
 +  if (g_forwards % 1000 == 0)
-+    fprintf(stderr, "[stage] %llu forwards: rpc %.0f us, copies %.0f us avg; %llu partial commits, %llu seeds\n",
++    fprintf(stderr, "[stage] %llu forwards: rpc %.0f us, copies %.0f us avg; %llu partial commits, %llu seeds; %llu overlapped (%.1f ms Mac work each)\n",
 +            (unsigned long long)g_forwards, g_rpc_us / g_forwards, g_copy_us / g_forwards,
-+            (unsigned long long)g_partials, (unsigned long long)g_seeds);
++            (unsigned long long)g_partials, (unsigned long long)g_seeds, (unsigned long long)g_hooks,
++            g_hooks ? g_hook_us / g_hooks / 1e3 : 0.0);
 +  return 0;
 +}
 +void stage_split_set_head(int on) { g_want_head = on; }
++// R69: the first half of stage_split_forward for interleaved slots: the rows go to the stage and the call returns;
++// stage_split_forward_recv (same slot) receives them. 0 sent, -1 failed (given up), -2 the caller re-seeds.
++int stage_split_forward_send(mlx_array h, uint64_t position, int32_t rope_delta, mlx_stream s) {
++  if (g_dead) return -1;
++  if (g_inflight) { fprintf(stderr, "[stage] forward send with prefill chunks in flight\n"); return -1; }
++  if (!stage_split_valid_at(position)) return -2;
++  if (g_mirror > position) g_mirror = position;
++  PendingFwd& p = g_pend[g_cur];
++  if (p.outstanding || p.stashed) { fprintf(stderr, "[stage] slot %d: a forward is already pending\n", g_cur); return -1; }
++  if (drain_outstanding()) return -1;  // the other slot's reply, before shm is reused
++  const double t0 = now_us();
++  mlx_array c = mlx_array_new();
++  if (materialize(&c, h, 1, MLX_BFLOAT16, s)) return -1;
++  const int* sh = mlx_array_shape(c);
++  const int nd = int(mlx_array_ndim(c));
++  const uint32_t rows = uint32_t(mlx_array_size(c) / kF);
++  if (rows < 1 || rows > 16 || sh[nd - 1] != kF) { fprintf(stderr, "[stage] forward rows %u\n", rows); mlx_array_free(c); return -1; }
++  // the previous forward's commit, inferred or explicit (before this slot's shm write: op 2 is a full rpc)
++  if (g_rows && position < g_base + g_rows) {
++    if (!infer_commit() && rpc(2, 0, 0, position - g_base)) { mlx_array_free(c); return -1; }
++    g_partials++;
++  }
++  memcpy(g_shm, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
++  mlx_array_free(c);
++  if (rope_delta < -(1 << 23) || rope_delta >= (1 << 23)) { fprintf(stderr, "[stage] rope delta %d out of range\n", rope_delta); return -1; }
++  const int want_head = g_want_head;
++  g_head_rows = 0;
++  uint8_t m[32] = {};
++  const uint32_t op = 1;
++  const uint32_t aux = ((uint32_t(rope_delta) & 0xFFFFFFu) << 8) | (want_head ? 4u : 0u) | (uint32_t(g_cur) << 3);
++  memcpy(m, &op, 4);
++  memcpy(m + 8, &rows, 4);
++  memcpy(m + 12, &aux, 4);
++  memcpy(m + 16, &position, 8);
++  if (!io(m, 32, true)) { mark_dead("socket failure on forward send"); return -1; }
++  p.outstanding = true;
++  p.stashed = false;
++  p.rows = rows;
++  p.position = position;
++  p.want_head = want_head;
++  p.dtype = mlx_array_dtype(h);
++  p.t1 = now_us();
++  g_out_slot = g_cur;
++  g_copy_us += p.t1 - t0;
++  return 0;
++}
++// R69: the second half: the slot's forward output (stashed, or received now). 0 ok, -1 failed (given up).
++int stage_split_forward_recv(mlx_array* out, mlx_stream s) {
++  if (g_dead) return -1;
++  PendingFwd& p = g_pend[g_cur];
++  if (!p.outstanding && !p.stashed) { fprintf(stderr, "[stage] slot %d: no forward to receive\n", g_cur); return -1; }
++  if (p.outstanding) {
++    if (g_out_slot != g_cur) { fprintf(stderr, "[stage] slot %d: outstanding forward mismatch\n", g_cur); return -1; }
++    if (drain_outstanding()) return -1;
++  }
++  const double t2 = now_us();
++  g_rpc_us += t2 - p.t1;
++  p.stashed = false;
++  g_base = p.position;
++  g_rows = p.rows;
++  resident_add(g_owner);
++  if (p.want_head) {
++    memcpy(g_head_buf, p.head, size_t(p.rows) * 40 * 4);
++    g_head_rows = int(p.rows);
++  }
++  int oshape[3] = {1, int(p.rows), kF};
++  mlx_array ob = mlx_array_new_data(p.out.data(), oshape, 3, MLX_BFLOAT16);
++  if (p.dtype != MLX_BFLOAT16) {
++    if (mlx_astype(out, ob, p.dtype, s)) return -1;
++    mlx_array_free(ob);
++  } else {
++    *out = ob;
++  }
++  g_forwards++;
++  g_copy_us += now_us() - t2;
++  return 0;
++}
++// R69: slot k >= 1 serves `owner`, or (slot 0) `owner` leaves whichever slot it had. A slot's client state restarts for
++// a new owner (its first forward seeds); the server's slot is dropped separately (stage_split_drop_slot).
++void stage_split_assign_slot(uint64_t owner, int slot) {
++  for (int k = 1; k < kSlots; k++)
++    if (g_slot_owner[k] == owner && k != slot) g_slot_owner[k] = 0;
++  if (slot < 1 || slot >= kSlots) return;
++  g_slot_owner[slot] = owner;
++  Seq& q = g_seq[slot];
++  if (q.owner != owner) {
++    q.owner = owner;
++    q.valid = false;
++    q.rows = 0;
++    q.mirror = 0;
++    q.tok_n = 0;
++  }
++}
++int stage_split_slot_of(uint64_t owner) { return slot_of(owner); }
++// R69: the slot later calls work on (note_prompt reads the slot's noted prompt) without an owner switch.
++void stage_split_select_owner(uint64_t owner) { g_cur = slot_of(owner); }
++// R69: free the server's slot k >= 1 (op 11); its owner, if any, re-seeds or re-runs at its next forward.
++// 0 done, -1 the stage failed (given up).
++int stage_split_drop_slot(int slot) {
++  if (g_dead) return -1;
++  if (slot < 1 || slot >= kSlots) return 0;
++  const int prev = g_cur;
++  g_cur = slot;
++  const int rc = rpc(11, 0, 0, 0);
++  g_seq[slot].valid = false;
++  g_seq[slot].rows = 0;
++  g_seq[slot].owner = 0;
++  g_slot_owner[slot] = 0;
++  g_pend[slot].outstanding = false;
++  g_pend[slot].stashed = false;
++  g_cur = prev;
++  return rc ? -1 : 0;
++}
++void stage_split_set_wait_hook(stage_wait_hook_fn f) { g_wait_hook = f; }
 +// The last forward's head rows (per row 20 BF16-valued f32 bit patterns then 20 token ids); -1 unless it
 +// carried them for exactly `rows` rows.
 +int stage_split_head_topk(uint32_t* dst, int rows) {
@@ -736,6 +1154,7 @@ index 00000000..1967b75f
 +}
 +// Whether a prefill chunk at `position` can go to the stage without a seed first.
 +int stage_split_prefill_ready(uint64_t position) {
++  if (g_cur != 0) return 0;  // R69: split prefill runs on slot 0 only
 +  if (g_inflight) return position == g_pf_next;
 +  return g_valid && g_rows == 0 && position == g_base;
 +}
@@ -743,8 +1162,11 @@ index 00000000..1967b75f
 +// h: the HC stream [1, rows, 10240] after layer first-1 at positions [position, position+rows).
 +// Copied into the next free slot; op 6 is sent without waiting (stage_split_prefill_recv reads the
 +// reply, oldest first). At most two chunks in flight.
-+int stage_split_prefill_send(mlx_array h, uint64_t position, mlx_stream s) {
++// R68: `rope_delta` = the rows' rotary offset (text rows of an M-RoPE request after an image; 0 otherwise).
++int stage_split_prefill_send(mlx_array h, uint64_t position, int32_t rope_delta, mlx_stream s) {
 +  if (g_dead) return -1;
++  if (drain_outstanding()) return -1;  // R69
++  if (rope_delta < -(1 << 23) || rope_delta >= (1 << 23)) { fprintf(stderr, "[stage] prefill rope delta %d out of range\n", rope_delta); return -1; }
 +  if (g_inflight >= 2) { fprintf(stderr, "[stage] prefill: two chunks already in flight\n"); return -1; }
 +  if (!stage_split_prefill_ready(position)) { fprintf(stderr, "[stage] prefill at %llu not ready\n", (unsigned long long)position); return -1; }
 +  const double t0 = now_us();
@@ -758,7 +1180,7 @@ index 00000000..1967b75f
 +    const char* v = getenv("SUSHI_STAGE_PULLBACK");
 +    g_pullback = !(v && strcmp(v, "0") == 0);
 +  }
-+  const uint32_t aux = uint32_t(g_pullback);
++  const uint32_t aux = uint32_t(g_pullback) | ((uint32_t(rope_delta) & 0xFFFFFFu) << 8);
 +  memcpy(g_shm + off, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
 +  mlx_array_free(c);
 +  uint8_t m[32] = {};
@@ -807,6 +1229,10 @@ index 00000000..1967b75f
 +  g_valid = true;
 +  g_base = g_pf_pos[slot] + rows;
 +  g_rows = 0;
++  // R66: a pulled-back chunk is in Sushi's caches exactly as on the stage
++  if (g_pullback == 1 && g_mirror == g_pf_pos[slot]) g_mirror = g_base;
++  else MIRROR_TRACE("[stage] mirror: chunk [%llu, %llu) not mirrored (pullback %d, mirror %llu)\n", (unsigned long long)g_pf_pos[slot],
++                    (unsigned long long)g_base, g_pullback, (unsigned long long)g_mirror);
 +  resident_add(g_owner);
 +  g_pf_chunks++;
 +  g_pf_wait_us += now_us() - t0;
@@ -1188,7 +1614,7 @@ index 00000000..4867ba77
 +  return avail<total?avail:total;
 +}
 diff --git a/src/generate.zig b/src/generate.zig
-index b026590c..e602eb1a 100644
+index b026590c..7115c528 100644
 --- a/src/generate.zig
 +++ b/src/generate.zig
 @@ -1,4 +1,92 @@
@@ -1284,7 +1710,7 @@ index b026590c..e602eb1a 100644
  const mlx = @import("mlx.zig");
  const transformer_mod = @import("transformer.zig");
  const qwen4_forward = @import("qwen4_forward.zig");
-@@ -1333,6 +1421,82 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
+@@ -1333,6 +1421,89 @@ pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
      return if (adaptive_width) tailMergeMax(default_chunk) else TAIL_MERGE_MAX;
  }
  
@@ -1357,7 +1783,14 @@ index b026590c..e602eb1a 100644
 +        position_base.* = ssm_cp_offset + pos;
 +        history_started.* = true;
 +    }
-+    try options.mtp.?.appendHistory(xfm, &(mtp_cache.*.?), prompt_ids[pos + 1 .. end + 1], hidden, @intCast(mtp_cache.*.?.step()), null, allocator);
++    // R68: an M-RoPE request's head ropes these rows as the non-split path does
++    const mtp_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
++        .pos = positions,
++        .total = ctx.mrope_total,
++        .delta = ctx.mrope_delta,
++        .base = position_base.*,
++    } else null;
++    try options.mtp.?.appendHistory(xfm, &(mtp_cache.*.?), prompt_ids[pos + 1 .. end + 1], hidden, @intCast(mtp_cache.*.?.step()), mtp_mrope_ctx, allocator);
 +    const ev = mlx.mlx_vector_array_new();
 +    defer _ = mlx.mlx_vector_array_free(ev);
 +    mtp_cache.*.?.appendEvalArrays(ev);
@@ -1367,7 +1800,7 @@ index b026590c..e602eb1a 100644
  pub fn nextChunkEnd(
      pos: usize,
      prefix_len: usize,
-@@ -1366,6 +1530,163 @@ pub fn nextChunkEnd(
+@@ -1366,6 +1537,163 @@ pub fn nextChunkEnd(
      return end;
  }
  
@@ -1531,7 +1964,26 @@ index b026590c..e602eb1a 100644
  /// `nextChunkEnd` for a GLM prefill, whose checkpoint grid must be hit exactly: the tail merge never
  /// absorbs a grid point.
  pub fn glmChunkEnd(pos: usize, prefix_len: usize, default_chunk: usize, grid: usize, offset: usize, adaptive_width: bool) usize {
-@@ -2375,6 +2696,7 @@ pub const Generator = struct {
+@@ -1916,6 +2244,9 @@ pub const Generator = struct {
+     mtp_planner_recovering: bool = false,
+     mtp_planner_history: group_planner.History = .{},
+     mtp_hidden_stale: bool = false,
++    /// R67 multi-stream: this request may run layers [first, 48) on the 5090 stage (the scheduler's stage holder).
++    /// Others run every layer on the Mac beside it. True everywhere when one request runs at a time.
++    stage_allowed: bool = true,
+     mtp_planner_plain_ticks: u32 = 0,
+     mtp_planner_prime_ticks: u32 = 0,
+     mtp_planner_spec_rounds: u32 = 0,
+@@ -2308,6 +2639,8 @@ pub const Generator = struct {
+         /// `ssm_entries` slice is empty and snapshots become no-op stubs).
+         /// Chunked prefill aligns chunk ends to stride positions so each
+         /// snapshot reflects a coherent state.
++        /// R67 multi-stream: the prefill may go through the 5090 stage (the scheduler's stage holder only).
++        stage_allowed: bool = true,
+         ssm_checkpoint_stride: u32 = 0,
+         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
+         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
+@@ -2375,6 +2708,7 @@ pub const Generator = struct {
          /// runs atomically (pre-interleave behavior, and the
          /// SUSHI_PREFILL_INTERLEAVE=0 kill switch).
          interleave_hook: ?InterleaveHook = null,
@@ -1539,7 +1991,7 @@ index b026590c..e602eb1a 100644
          /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
          write_through_hook: ?WriteThroughHook = null,
          /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
-@@ -2386,6 +2708,14 @@ pub const Generator = struct {
+@@ -2386,6 +2720,14 @@ pub const Generator = struct {
          adaptive_chunk_width: bool = false,
      };
  
@@ -1554,7 +2006,7 @@ index b026590c..e602eb1a 100644
      pub const InterleaveHook = struct {
          ctx: *anyopaque,
          call: *const fn (ctx: *anyopaque) void,
-@@ -2511,6 +2841,9 @@ pub const Generator = struct {
+@@ -2511,6 +2853,9 @@ pub const Generator = struct {
          ), options.decode_share_width_cap);
          // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
          const trace_enabled = log.isDebug();
@@ -1564,7 +2016,7 @@ index b026590c..e602eb1a 100644
          var prefill_sw = io_util.Stopwatch.init(io);
          var chunked_ns: u64 = 0;
          var eval_ns: u64 = 0;
-@@ -2532,7 +2865,15 @@ pub const Generator = struct {
+@@ -2532,7 +2877,23 @@ pub const Generator = struct {
          }
          const has_vision = ctx.vision_embeddings != null;
          const glm_request = ctx.glm5_request;
@@ -1575,17 +2027,27 @@ index b026590c..e602eb1a 100644
 +        // assembled in two steps (layers [0, first) at the chunk's eval, the rest after its import);
 +        // without it checkpoints are off.
 +        // M-RoPE turns (an image anywhere in the prompt, cached or not) rope at absolute positions the
-+        // stage does not know: they stay on the Mac.
-+        const split_prefill_env = qwen4_forward.stagePrefillEnabled() and !has_vision and glm_request == null and ctx.mrope_pos == null;
++        // stage does not know: they stay on the Mac. texas-split R68 (SUSHI_STAGE_MROPE_TEXT=1): unless every row this
++        // turn prefills is text at one rotary offset (no image in the uncached part; checked from the 4-row group the
++        // first new row completes), which the stage's prefill takes as its rope delta, as decode rows already do.
++        const mrope_text_delta: ?i32 = if (ctx.mrope_pos) |mp| blk: {
++            if (!qwen4_forward.stageMropeTextEnabled() or !options.stage_allowed or glm_request != null) break :blk null;
++            const first = options.ssm_checkpoint_pos_offset;
++            break :blk qwen4_forward.mropeTextDelta(mp, ctx.mrope_total, first - first % 4, first + prompt_ids.len);
++        } else null;
++        // R69: a request decoding on stage slot 1 prefills on the Mac (the stage's prefill path is slot 0's)
++        const split_prefill_env = options.stage_allowed and qwen4_forward.stagePrefillEnabled() and (!has_vision or mrope_text_delta != null) and glm_request == null and (ctx.mrope_pos == null or mrope_text_delta != null) and qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&ctx)) == 0;
 +        const want_ssm_cp = !(split_prefill_env and !qwen4_forward.stagePullbackEnabled()) and shouldCheckpointSsmPrefill(
              options.ssm_checkpoint_stride,
              (ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0) or glm_request != null,
              has_vision,
-@@ -2612,6 +2953,21 @@ pub const Generator = struct {
+@@ -2612,6 +2973,23 @@ pub const Generator = struct {
          // freshly forwarded tail (`base_pos = ssm_cp_offset`) — sliding-
          // window semantics, same rule as the MTP history.
          const dflash_active = options.dflash_enabled and options.dflash != null;
 +        const split_prefill = split_prefill_env and !dflash_active;
++        ctx.stage_prefill_delta = if (split_prefill) mrope_text_delta else null;
++        if (split_prefill and mrope_text_delta != null) log.info("[stage] M-RoPE turn prefills on the stage (text rows, rope delta {d})\n", .{mrope_text_delta.?});
 +        if (split_prefill) qwen4_forward.stagePrefillBegin(&ctx);
 +        var split_pending: ?StageChunk = null;
 +        var split_cp_new: ?SSMCheckpoint = null;
@@ -1603,7 +2065,7 @@ index b026590c..e602eb1a 100644
          var dflash_ctx: ?dflash_mod.DflashCtx = if (!dflash_active)
              null
          else if (options.dflash_ctx_restored) |restored| blk: {
-@@ -2752,10 +3108,15 @@ pub const Generator = struct {
+@@ -2752,10 +3130,15 @@ pub const Generator = struct {
                  // chunk-locally. Boundary alignment is in ABSOLUTE position
                  // (pos + offset), so the saved snapshot list is correct for
                  // the full prompt, not the truncated tail.
@@ -1620,7 +2082,7 @@ index b026590c..e602eb1a 100644
                  if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                  const chunk_len: c_int = @intCast(end - pos);
                  const chunk_shape = [_]c_int{ 1, chunk_len };
-@@ -2772,12 +3133,18 @@ pub const Generator = struct {
+@@ -2772,12 +3155,18 @@ pub const Generator = struct {
                  errdefer if (dflash_active) {
                      for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                  };
@@ -1639,7 +2101,7 @@ index b026590c..e602eb1a 100644
                  if (dflash_active) {
                      ctx.capture_layers = null;
                      try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
-@@ -2799,7 +3166,7 @@ pub const Generator = struct {
+@@ -2799,7 +3188,7 @@ pub const Generator = struct {
                  // tokens [pos+1, end+1) — prompt_ids[end] always exists since
                  // the chunk loop spans [0, prefix_len) and prompt_ids has
                  // prefix_len + 1 entries.
@@ -1648,7 +2110,7 @@ index b026590c..e602eb1a 100644
                      if (!mtp_history_started) {
                          std.debug.assert(mtp_cache.?.step() == 0);
                          mtp_position_base = ssm_cp_offset + pos;
-@@ -2869,6 +3236,7 @@ pub const Generator = struct {
+@@ -2869,6 +3258,7 @@ pub const Generator = struct {
                  }
                  // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
                  _ = mlx.mlx_clear_cache();
@@ -1656,7 +2118,7 @@ index b026590c..e602eb1a 100644
                  if (trace_enabled) {
                      const eval_dt = prefill_sw.read() - eval_start_ns;
                      eval_ns += eval_dt;
-@@ -2887,7 +3255,12 @@ pub const Generator = struct {
+@@ -2887,7 +3277,12 @@ pub const Generator = struct {
                  // are realized; the snapshot is just a refcount-share of the
                  // already-resident state.
                  const abs_end_for_cp2 = end + ssm_cp_offset;
@@ -1670,7 +2132,7 @@ index b026590c..e602eb1a 100644
                      const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
                      ssm_checkpoints.append(allocator, cp) catch |e| {
                          var doomed = cp;
-@@ -2915,6 +3288,18 @@ pub const Generator = struct {
+@@ -2915,6 +3310,18 @@ pub const Generator = struct {
                      }
                  }
  
@@ -1689,7 +2151,7 @@ index b026590c..e602eb1a 100644
                  if (vision_chunked) {
                      vision_rows_consumed += countSpliceRows(
                          ids_i32[pos..end],
-@@ -2927,6 +3312,19 @@ pub const Generator = struct {
+@@ -2927,6 +3334,19 @@ pub const Generator = struct {
                  // Publish progress once per chunk — same cadence discipline as
                  // `inflight_generated_tokens` (once per decode tick), never per token.
                  if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
@@ -1709,7 +2171,7 @@ index b026590c..e602eb1a 100644
                  // Persist this chunk now: the KV bytes for [0, pos) are final.
                  if (options.write_through_hook) |wt| {
                      wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
-@@ -2989,6 +3387,14 @@ pub const Generator = struct {
+@@ -2989,6 +3409,14 @@ pub const Generator = struct {
              // With it, the cache restores to position 749 (~99% of the
              // prompt) and only the last token + new tail re-forwards.
              // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
@@ -1724,7 +2186,7 @@ index b026590c..e602eb1a 100644
              if (want_ssm_cp and loop_end > 0) {
                  // The snapshot sits at the chunk loop's end — snapshot_backoff
                  // tokens BEFORE the prompt end, where the next turn's prefix
-@@ -3074,6 +3480,7 @@ pub const Generator = struct {
+@@ -3074,6 +3502,7 @@ pub const Generator = struct {
          errdefer if (dflash_active) {
              for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
          };
@@ -1732,7 +2194,7 @@ index b026590c..e602eb1a 100644
          const raw_logits = if (tail_mtp_capture) blk: {
              has_captured_hidden = true;
              break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
-@@ -3081,6 +3488,7 @@ pub const Generator = struct {
+@@ -3081,6 +3510,7 @@ pub const Generator = struct {
              has_captured_hidden = true;
              break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
          } else try xfm.forwardWith(&ctx, last_input);
@@ -1740,7 +2202,7 @@ index b026590c..e602eb1a 100644
          // History entries for the held-back span: (hidden[j], token[j+1]) for
          // j in [final_start, prefix_len) — same pairing as the chunk loop.
          // The last row's pair (hidden[last], t1) is appended by the first
-@@ -3995,7 +4403,11 @@ pub const Generator = struct {
+@@ -3995,7 +4425,11 @@ pub const Generator = struct {
      /// rollback without being counted.
      fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
          self.partial_rounds += 1;
@@ -1753,7 +2215,7 @@ index b026590c..e602eb1a 100644
              try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
          }
      }
-@@ -4820,6 +5232,13 @@ pub const Generator = struct {
+@@ -4820,6 +5254,13 @@ pub const Generator = struct {
          /// depth's row is its one-hot. len m_hi; [0..n_qp) valid.
          q_probs: ?[]mlx.mlx_array,
          n_qp: u32,
@@ -1767,7 +2229,7 @@ index b026590c..e602eb1a 100644
          /// Chain hidden after the last built step (owned) — a chunk-B
          /// extension resumes from it; freed once the chain is complete.
          h_chain: ?mlx.mlx_array,
-@@ -4842,6 +5261,15 @@ pub const Generator = struct {
+@@ -4842,6 +5283,15 @@ pub const Generator = struct {
                  for (slots[0..self.n_qp]) |arr| _ = mlx.mlx_array_free(arr);
                  allocator.free(slots);
              }
@@ -1783,7 +2245,7 @@ index b026590c..e602eb1a 100644
              if (self.h_chain) |h| _ = mlx.mlx_array_free(h);
              allocator.free(self.drafts);
          }
-@@ -4873,6 +5301,9 @@ pub const Generator = struct {
+@@ -4873,6 +5323,9 @@ pub const Generator = struct {
              .n_conf = 0,
              .q_probs = q_probs,
              .n_qp = 0,
@@ -1793,7 +2255,7 @@ index b026590c..e602eb1a 100644
              .h_chain = null,
              .m = plan.m_lo,
          };
-@@ -5060,10 +5491,17 @@ pub const Generator = struct {
+@@ -5060,10 +5513,17 @@ pub const Generator = struct {
              // Rerank drafts skip the head's own logits projection entirely:
              // the token comes off the coarse readout's re-scored shortlist,
              // greedily (argmax) or sampled from a q over those 32 rows.
@@ -1812,7 +2274,7 @@ index b026590c..e602eb1a 100644
              );
              const use_rerank = path != .full_logits;
              // `want_logits: bool` could not tell a rerank draft from a history
-@@ -5117,15 +5555,40 @@ pub const Generator = struct {
+@@ -5117,15 +5577,40 @@ pub const Generator = struct {
              defer if (step_out.rerank_x.ctx != null) {
                  _ = mlx.mlx_array_free(step_out.rerank_x);
              };
@@ -1854,7 +2316,7 @@ index b026590c..e602eb1a 100644
                  } else {
                      // The coarse head just retired: propose greedily and hand
                      // the verify the one-hot q that proposal really has.
-@@ -5133,6 +5596,12 @@ pub const Generator = struct {
+@@ -5133,6 +5618,12 @@ pub const Generator = struct {
                      const prop = try argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
                      chain.draft_arrs[i] = prop.id;
                      slots[i] = prop.q;
@@ -1867,7 +2329,7 @@ index b026590c..e602eb1a 100644
                  }
                  chain.n_qp = i + 1;
              } else if (use_rerank) {
-@@ -5147,11 +5616,16 @@ pub const Generator = struct {
+@@ -5147,11 +5638,16 @@ pub const Generator = struct {
                  chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
              }
              chain.n_drafted = i + 1;
@@ -1886,7 +2348,7 @@ index b026590c..e602eb1a 100644
                  chain.n_conf = i + 1;
              }
              if (step_out.logits.ctx != null) _ = mlx.mlx_array_free(step_out.logits);
-@@ -5676,6 +6150,202 @@ pub const Generator = struct {
+@@ -5676,6 +6172,202 @@ pub const Generator = struct {
          return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
      }
  
@@ -2089,18 +2551,44 @@ index b026590c..e602eb1a 100644
      pub fn mtpBatchedTypicalGraph(
          probs_all: mlx.mlx_array,
          draft_arrs: []const mlx.mlx_array,
-@@ -6267,6 +6937,10 @@ pub const Generator = struct {
+@@ -5979,6 +6671,25 @@ pub const Generator = struct {
+         if (apply_stash) try self.mtpApplyStash();
+     }
+ 
++    /// texas-split R66d (end-of-turn checkpoint): after `mtpDetachHead(.., true)` the head's committed history ends one
++    /// entry short of the trunk: the last pair is (last_hidden, `token` = the token after the trunk's last row: the
++    /// reply's final token when it stopped on length, else the sampled stop token), which only a next round would
++    /// append. Append it the same way, so a checkpoint at the trunk's end can adopt the head next turn (whose prompt
++    /// carries that token at that position). The caller checks the resulting length.
++    pub fn mtpAppendFinalPair(self: *Generator, token: u32) !void {
++        const mc = if (self.mtp_cache) |*m| m else return error.MtpInactive;
++        if (!self.has_last_hidden or self.mtp == null) return error.MtpNoLastHidden;
++        if (self.mtp_hist_stash != null or self.mtp_pre_draft != null) return error.MtpPending;
++        const id = [_]i32{@intCast(token)};
++        const ids = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
++        defer _ = mlx.mlx_array_free(ids);
++        const host = [_]u32{token};
++        const out = try self.mtp.?.forward(self.xfm, mc, ids, self.last_hidden, @intCast(mc.step()), .none, self.mtpMropeContext(), host[0..]);
++        if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
++        if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
++        if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
++    }
++
+     /// Append the deferred history stash to the head cache now, as a
+     /// history-only head forward (lazy; the next head forward realizes it).
+     fn mtpApplyStash(self: *Generator) !void {
+@@ -6267,6 +6978,10 @@ pub const Generator = struct {
      pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState, open: MtpRoundOpen };
  
      pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
 +        // R60 pipeline split: this round's trunk forwards run layers [first, 48) on the 5090 stage.
 +        const prev_split = self.ctx.stage_split;
-+        self.ctx.stage_split = qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
++        self.ctx.stage_split = self.stage_allowed and qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
 +        defer self.ctx.stage_split = prev_split;
          var st = switch (try self.mtpRoundBegin(allocator)) {
              .done => |r| return r,
              .verify => |v| v,
-@@ -6590,8 +7264,20 @@ pub const Generator = struct {
+@@ -6590,8 +7305,20 @@ pub const Generator = struct {
          // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
          // 4 evaluates anything. Other arches never set `ple_pending`.
          self.ctx.ple_defer = true;
@@ -2121,7 +2609,92 @@ index b026590c..e602eb1a 100644
          var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
              self.ctx.ple_defer = false;
              self.ctx.capture_ssm_seq = false;
-@@ -6890,6 +7576,7 @@ pub const Generator = struct {
+@@ -6626,6 +7353,84 @@ pub const Generator = struct {
+         st.verify_hidden_all = verify_hidden_all;
+     }
+ 
++    /// texas-split R69 (two interleaved stage slots): mtpRoundVerify in two halves. This half sets the verify up and runs
++    /// the rows through layers [0, first); they go to the stage and it returns true (mtpRoundVerifyPost finishes). If
++    /// the forward ran whole instead (no stage this round), the verify is complete and it returns false.
++    pub fn mtpRoundVerifyPre(self: *Generator, st: *MtpRoundState) !bool {
++        const xfm = self.xfm;
++        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
++        self.ctx.ple_defer = true;
++        @import("qwen4_exp.zig").verify_t0_ns = @import("qwen4_exp.zig").nowBootNs();
++        self.ctx.verify_rows = xfm.config.isMimo();
++        self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
++        self.ctx.stage_head = self.ctx.stage_split and r64EnvOn(&r64_stage_head_env, "SUSHI_R64_STAGE_HEAD") and
++            !penaltyActive(self.sampling) and !self.sampling.think_penalty.active() and self.sampling.call_force == null and
++            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20));
++        self.ctx.stage_async_verify = true;
++        var new_hidden = mlx.mlx_array_new();
++        var verify_hidden_all = mlx.mlx_array_new();
++        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
++            self.ctx.stage_async_verify = false;
++            self.mtpVerifyFlagsReset();
++            _ = mlx.mlx_array_free(new_hidden);
++            _ = mlx.mlx_array_free(verify_hidden_all);
++            xfm.discardDeferredPle(&self.ctx);
++            return e;
++        };
++        self.ctx.stage_async_verify = false;
++        if (self.ctx.stage_verify_sent) {
++            _ = mlx.mlx_array_free(verify_logits);
++            _ = mlx.mlx_array_free(new_hidden);
++            _ = mlx.mlx_array_free(verify_hidden_all);
++            return true;
++        }
++        try self.mtpRoundVerifyTail(st, verify_logits, new_hidden, verify_hidden_all);
++        return false;
++    }
++
++    /// texas-split R69: the second half (after the other slot's first half): receive the stage's rows and finish.
++    pub fn mtpRoundVerifyPost(self: *Generator, st: *MtpRoundState) !void {
++        const xfm = self.xfm;
++        var new_hidden = mlx.mlx_array_new();
++        var verify_hidden_all = mlx.mlx_array_new();
++        const verify_logits = xfm.forwardWithCaptureAllResume(&self.ctx, &new_hidden, &verify_hidden_all) catch |e| {
++            self.mtpVerifyFlagsReset();
++            _ = mlx.mlx_array_free(new_hidden);
++            _ = mlx.mlx_array_free(verify_hidden_all);
++            xfm.discardDeferredPle(&self.ctx);
++            return e;
++        };
++        try self.mtpRoundVerifyTail(st, verify_logits, new_hidden, verify_hidden_all);
++    }
++
++    fn mtpVerifyFlagsReset(self: *Generator) void {
++        self.ctx.ple_defer = false;
++        self.ctx.capture_ssm_seq = false;
++        self.ctx.verify_rows = false;
++        self.ctx.capture_settle = true;
++        self.ctx.stage_head = false;
++    }
++
++    /// What mtpRoundVerify does after its forward (R69 halves share it).
++    fn mtpRoundVerifyTail(self: *Generator, st: *MtpRoundState, logits_in: mlx.mlx_array, new_hidden: mlx.mlx_array, verify_hidden_all: mlx.mlx_array) !void {
++        const xfm = self.xfm;
++        var verify_logits = logits_in;
++        errdefer {
++            _ = mlx.mlx_array_free(verify_logits);
++            _ = mlx.mlx_array_free(new_hidden);
++            _ = mlx.mlx_array_free(verify_hidden_all);
++        }
++        self.mtpVerifyFlagsReset();
++        xfm.verify_laps.ple_sync_ns = 0;
++        errdefer xfm.discardDeferredPle(&self.ctx);
++        try xfm.flushDeferredPle(&self.ctx);
++        _ = try self.thinkShiftRows(&verify_logits, st.verify_input);
++        _ = try self.penaltyShiftRows(&verify_logits, st.verify_input);
++        st.verify_logits = verify_logits;
++        st.new_hidden = new_hidden;
++        st.verify_hidden_all = verify_hidden_all;
++    }
++
+     pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) !void {
+         const n = gens.len;
+         std.debug.assert(n == states.len);
+@@ -6890,6 +7695,7 @@ pub const Generator = struct {
          // The group already built and dispatched this row's Phase 4 with the rest
          // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
          const prepared = stochastic and st.accept_p.ctx != null;
@@ -2129,7 +2702,7 @@ index b026590c..e602eb1a 100644
          if (prepared) {
              _ = mlx.mlx_array_free(accept_p_vec);
              accept_p_vec = st.accept_p;
-@@ -6905,9 +7592,26 @@ pub const Generator = struct {
+@@ -6905,9 +7711,26 @@ pub const Generator = struct {
              var live_logits = mlx.mlx_array_new();
              defer _ = mlx.mlx_array_free(live_logits);
              try mlx.check(mlx.mlx_slice(&live_logits, verify_logits, &.{ 0, 0, 0 }, 3, &.{ vl_shape[0], @intCast(1 + m), vl_shape[2] }, 3, &.{ 1, 1, 1 }, 3, s));
@@ -2158,7 +2731,7 @@ index b026590c..e602eb1a 100644
                  probs_all,
                  draft_arrs[0..m],
                  if (q_probs) |qs| qs[0..m] else null,
-@@ -6921,6 +7625,7 @@ pub const Generator = struct {
+@@ -6921,6 +7744,7 @@ pub const Generator = struct {
              accept_p_vec = bg.accept_p;
              accept_q_vec = bg.accept_q;
              accept_defer_vec = bg.accept_defer;
@@ -2166,7 +2739,7 @@ index b026590c..e602eb1a 100644
          }
  
          const group_argmax = st.verify_argmax.present();
-@@ -6939,21 +7644,27 @@ pub const Generator = struct {
+@@ -6939,21 +7763,27 @@ pub const Generator = struct {
  
          // ── Phase 4b: one batched async eval for the whole round ──
          // A prepared row rode the group's eval; everything here is already on it.
@@ -2198,7 +2771,7 @@ index b026590c..e602eb1a 100644
              try mlx.check(mlx.mlx_async_eval(eval_vec));
          }
          dispatch_lap.stop(&self.mtp_trace, .dispatch);
-@@ -6973,7 +7684,63 @@ pub const Generator = struct {
+@@ -6973,7 +7803,63 @@ pub const Generator = struct {
  
          var accepted: u32 = 0;
          var greedy_next_pending: u32 = 0;
@@ -2263,7 +2836,7 @@ index b026590c..e602eb1a 100644
              // Sharp drafts: full Leviathan ratio min(1, p/q) against the
              // proposal's own density. Greedy-forced drafts keep the exact
              // one-hot rule min(1, target_p).
-@@ -7012,7 +7779,38 @@ pub const Generator = struct {
+@@ -7012,7 +7898,38 @@ pub const Generator = struct {
          accepted = stop_prefix.accepted;
          const next_pending: u32 = blk: {
              if (stop_prefix.stop) |stop| break :blk stop;
@@ -2303,7 +2876,7 @@ index b026590c..e602eb1a 100644
                  try mlx.check(mlx.mlx_array_eval(corr_batch));
                  const d = mlx.mlx_array_data_int32(corr_batch) orelse {
                      return error.MlxArrayDataNull;
-@@ -7023,6 +7821,13 @@ pub const Generator = struct {
+@@ -7023,6 +7940,13 @@ pub const Generator = struct {
              }
          };
  
@@ -2317,7 +2890,7 @@ index b026590c..e602eb1a 100644
          if (tracing) {
              self.mtp_trace.add(.eval, ph.read());
              ph.reset();
-@@ -9371,6 +10176,22 @@ pub const Generator = struct {
+@@ -9371,6 +10295,22 @@ pub const Generator = struct {
                  t.subAvgMs(.chain),
              },
          );
@@ -2340,18 +2913,18 @@ index b026590c..e602eb1a 100644
          t.reset();
      }
  
-@@ -9390,6 +10211,10 @@ pub const Generator = struct {
+@@ -9390,6 +10330,10 @@ pub const Generator = struct {
      pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
          var tick_prof = TickProf.begin();
          defer tick_prof.finish();
 +        // R60 pipeline split: a serial decode step's trunk forward uses the 5090 stage too.
 +        const prev_split = self.ctx.stage_split;
-+        self.ctx.stage_split = qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
++        self.ctx.stage_split = self.stage_allowed and qwen4_forward.stageDecodeEnabled() and (self.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
 +        defer self.ctx.stage_split = prev_split;
          if (self.done) return null;
          if (self.sampling.constraint != null) return self.nextConstrained(allocator);
  
-@@ -10142,6 +10967,59 @@ fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx
+@@ -10142,6 +11086,59 @@ fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx
  /// = log p_head(draft). Two vocab reductions on the head's own (draft-head)
  /// logits — must be built BEFORE the caller frees the logits handle (lazy
  /// graphs hold their inputs internally). Returns a `[1]`-shaped lazy array.
@@ -2411,7 +2984,7 @@ index b026590c..e602eb1a 100644
  fn draftConfidenceGraph(logits: mlx.mlx_array, draft_id: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
      var lse = mlx.mlx_array_new();
      defer _ = mlx.mlx_array_free(lse);
-@@ -10433,6 +11311,42 @@ fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx
+@@ -10433,6 +11430,42 @@ fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx
      return .{ .id = id, .q = q };
  }
  
@@ -2720,6 +3293,42 @@ index 3595ba4d..10639ac7 100644
              for (out[0..built]) |*sl| sl.deinit();
              return false;
          };
+diff --git a/src/prefix_cache.zig b/src/prefix_cache.zig
+index d0bf6590..f7a0e08b 100644
+--- a/src/prefix_cache.zig
++++ b/src/prefix_cache.zig
+@@ -487,6 +487,21 @@ pub fn ssdFirstEnabled() bool {
+     return ssd_first_override orelse true;
+ }
+ 
++/// texas-split R66 (`SUSHI_HOT_KEEP_CPS=1`): a hot entry keeps every SSM checkpoint in RAM (still capped and
++/// thinned by `ssm_checkpoint_max`) even when an SSD record was captured for it. Under SSD-first the record
++/// is meant to hold the older checkpoints and RAM only the newest two, but on the split the record cannot
++/// persist (layers 28-47's decode rows live on the 5090: "layer offset short of the range"), so those
++/// checkpoints were simply lost. A compaction prompt sharing 33K tokens of a 66K conversation then found no
++/// restore point below the conversation's end and prefilled all of it cold. Unset/0 = stock behaviour.
++var hot_keep_cps_env: ?bool = null;
++pub fn hotKeepsAllCheckpoints() bool {
++    if (hot_keep_cps_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_HOT_KEEP_CPS");
++    const v = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
++    hot_keep_cps_env = v;
++    return v;
++}
++
+ /// Test seam: forces the refcount share (false) whose first append copies the whole prefix;
+ /// null = restore by move, armed where `HotPrefixCache.ssd_first` is, or on demand when a share
+ /// does not fit (`checkoutRestored`).
+@@ -2255,7 +2270,8 @@ pub const HotPrefixCache = struct {
+         };
+         // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
+         // A GDN checkpoint past the record's text prefix is not in it and stays.
+-        const hot_keeps_newest = self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
++        // texas-split R66: not where the record cannot persist (`hotKeepsAllCheckpoints`).
++        const hot_keeps_newest = !hotKeepsAllCheckpoints() and self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
+         const record_text: usize = if (new_glm != null) std.math.maxInt(usize) else disk_len;
+         // GDN checkpoints are cut after the byte-budget trim below, which lands on one of them.
+         if (hot_keeps_newest and new_glm != null) self.keepNewestCheckpoints(&ssm_cps, record_text);
 diff --git a/src/qwen4_exp.zig b/src/qwen4_exp.zig
 index 30cfaeb6..5fb9fc92 100644
 --- a/src/qwen4_exp.zig
@@ -3037,16 +3646,17 @@ index 30cfaeb6..5fb9fc92 100644
      const N = 48;
      const MAX_ROWS = 64;
 diff --git a/src/qwen4_forward.zig b/src/qwen4_forward.zig
-index 3ab27c9f..86b1bb6c 100644
+index 3ab27c9f..936a43c9 100644
 --- a/src/qwen4_forward.zig
 +++ b/src/qwen4_forward.zig
-@@ -1,6 +1,285 @@
+@@ -1,6 +1,480 @@
  //! Flash-Next (qwen4_exp) forward: attention, GDN wiring, native MTP head, decode/verify rows.
  
  const trf = @import("transformer.zig");
 +// R60 pipeline split (isolated experiment): native/stage_split.cpp.
 +extern "c" fn stage_split_first() c_int;
 +extern "c" fn stage_split_invalidate() void;
++extern "c" fn stage_split_invalidate_owner(owner: u64) void;
 +extern "c" fn stage_split_valid_at(position: u64) c_int;
 +extern "c" fn stage_split_seed_begin(position: u64) c_int;
 +extern "c" fn stage_split_seed_recurrent(conv: mlx.mlx_array, ssm: mlx.mlx_array, s: mlx.mlx_stream) c_int;
@@ -3063,6 +3673,13 @@ index 3ab27c9f..86b1bb6c 100644
 +}
 +extern "c" fn stage_split_forward(h: mlx.mlx_array, out: *mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
 +extern "c" fn stage_split_set_head(on: c_int) void;
++extern "c" fn stage_split_forward_send(h: mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_forward_recv(out: *mlx.mlx_array, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_set_wait_hook(f: ?*const fn () callconv(.c) void) void;
++/// R67 multi-stream: `f` runs once inside the next decode forward's stage wait (between send and reply), on this thread.
++pub fn stageSetWaitHook(f: ?*const fn () callconv(.c) void) void {
++    stage_split_set_wait_hook(f);
++}
 +extern "c" fn stage_split_head_topk(dst: [*]u32, rows: c_int) c_int;
 +pub var r64_head_used: u64 = 0;
 +pub var r64_head_fallback: u64 = 0;
@@ -3128,10 +3745,31 @@ index 3ab27c9f..86b1bb6c 100644
 +extern "c" fn stage_split_forget(owner: u64) void;
 +extern "c" fn stage_split_seed_zero() c_int;
 +extern "c" fn stage_split_prefill_export(data: *[*]const u8, len: *u64) c_int;
++extern "c" fn stage_split_note_prompt(toks: [*]const u32, n: u64, restored: u64) void;
++extern "c" fn stage_split_mirror() u64;
++extern "c" fn stage_split_iseed_begin(base: u64, check_from: u64, position: u64) c_int;
++extern "c" fn stage_split_iseed_attention(keys: mlx.mlx_array, ks: mlx.mlx_array, kb: mlx.mlx_array, values: mlx.mlx_array, vs: mlx.mlx_array, vb: mlx.mlx_array, pooled: mlx.mlx_array, raw: mlx.mlx_array, base: u64, check_from: u64, position: u64, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_iseed_end(position: u64) c_int;
++/// R66 incremental seed (SUSHI_STAGE_ISEED=1): the stage keeps the rows of the sequence it last held, and a seed
++/// whose prompt shares them sends only the rest (rows [base, position) and the recurrent states). The stage
++/// hashes its K rows below `base` against Sushi's before it accepts; a refusal falls back to the full seed.
++var stage_iseed_env: ?bool = null;
++pub fn stageIseedEnabled() bool {
++    if (stage_iseed_env) |v| return v;
++    const v = if (std.c.getenv("SUSHI_STAGE_ISEED")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    stage_iseed_env = v;
++    return v;
++}
++/// R66: a new request's full prompt, for the stage client's incremental seed (rows the stage still holds for
++/// the common prefix stay usable).
++pub fn stageNotePrompt(tokens: []const u32, restored: usize) void {
++    if (!stageIseedEnabled() or stageSplitFirst() == null) return;
++    stage_split_note_prompt(tokens.ptr, @intCast(tokens.len), @intCast(restored));
++}
 +extern "c" fn stage_split_pullback_enabled() c_int;
 +extern "c" fn stage_split_prefill_ready(position: u64) c_int;
 +extern "c" fn stage_split_prefill_inflight() c_int;
-+extern "c" fn stage_split_prefill_send(h: mlx.mlx_array, position: u64, s: mlx.mlx_stream) c_int;
++extern "c" fn stage_split_prefill_send(h: mlx.mlx_array, position: u64, rope_delta: i32, s: mlx.mlx_stream) c_int;
 +extern "c" fn stage_split_prefill_recv(out: *mlx.mlx_array, dt: mlx.mlx_dtype, s: mlx.mlx_stream) c_int;
 +/// R60 S4 (prefill v2): split prefill is on when the stage is connected and SUSHI_STAGE_PREFILL != 0.
 +pub fn stagePrefillEnabled() bool {
@@ -3148,6 +3786,27 @@ index 3ab27c9f..86b1bb6c 100644
 +}
 +/// R60 S4: image (M-RoPE) requests decode through the stage with their rope delta unless
 +/// SUSHI_STAGE_MROPE=0; their prefill always stays on the Mac.
++/// texas-split R68 (SUSHI_STAGE_MROPE_TEXT=1): an M-RoPE request's prefill goes through the stage when its rows are text.
++pub fn stageMropeTextEnabled() bool {
++    const v = std.c.getenv("SUSHI_STAGE_MROPE_TEXT") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++/// R68: the rotary offset d when every position in [from, to) is a text row (t = h = w = p + d for one d), else null.
++/// `pos` is the flat axis-major [3 x total] table. Callers start `from` at the 4-row group boundary below the first
++/// new row: the stage ropes a pooled QSA key at its group's first row with the chunk's offset.
++pub fn mropeTextDelta(pos: []const i32, total: usize, from: usize, to: usize) ?i32 {
++    if (from >= to or to > total or pos.len < 3 * total) return null;
++    const t = pos[0..total];
++    const h = pos[total .. 2 * total];
++    const w = pos[2 * total .. 3 * total];
++    const d: i64 = @as(i64, t[from]) - @as(i64, @intCast(from));
++    if (d < -(1 << 23) or d >= (1 << 23)) return null;
++    for (from..to) |i| {
++        const want: i64 = @as(i64, @intCast(i)) + d;
++        if (t[i] != want or h[i] != want or w[i] != want) return null;
++    }
++    return @intCast(d);
++}
 +pub fn stageMropeEnabled() bool {
 +    const v = std.c.getenv("SUSHI_STAGE_MROPE") orelse return true;
 +    return !std.mem.eql(u8, std.mem.span(v), "0");
@@ -3162,7 +3821,69 @@ index 3ab27c9f..86b1bb6c 100644
 +    var ptr: [*]const u8 = undefined;
 +    var len: u64 = 0;
 +    if (stage_split_prefill_export(&ptr, &len) != 0) return error.StageSplitPullback;
-+    const blob = ptr[0..@intCast(len)];
++    try importQdx1(self, ctx.cache, ctx.ssm_entries orelse return error.StageSplitNoSsm, ptr[0..@intCast(len)]);
++}
++extern "c" fn stage_split_export(owner: u64, from: u64, position: u64, data: *[*]const u8, len: *u64) c_int;
++extern "c" fn stage_split_mirror_cap(n: u64) void;
++/// R66d end-of-turn pull-back (SUSHI_STAGE_PULLBACK_END=1).
++var stage_pullback_end_env: ?bool = null;
++pub fn stagePullbackEndEnabled() bool {
++    if (stage_pullback_end_env) |v| return v;
++    const v = if (std.c.getenv("SUSHI_STAGE_PULLBACK_END")) |e| std.mem.eql(u8, std.mem.span(e), "1") else false;
++    stage_pullback_end_env = v;
++    return v;
++}
++/// R66d: at a turn's end the 5090 holds the reply's rows of layers [first, 48) only, so the turn's cache entry was
++/// whole only to the prompt and the next turn re-prefilled the reply. Copy those rows and the recurrent states at
++/// the end into Sushi's caches (stage op 9). Returns the end position (where a checkpoint now restores), or null
++/// when the stage holds nothing of this sequence, nothing is missing, or the import failed.
++pub fn stagePullbackTurnEnd(self: *Transformer, cache: *trf.KVCache, entries: []trf.SSMCacheEntry) ?usize {
++    const first = stageSplitFirst() orelse return null;
++    // the committed length as Sushi's layers [0, first) hold it, and the rows layers [first, 48) hold
++    var end: ?usize = null;
++    var from: ?usize = null;
++    var l: usize = 0;
++    while (l < self.config.num_hidden_layers) : (l += 1) {
++        if (self.config.isLinearLayer(@intCast(l))) continue;
++        const kv = &cache.entries[l];
++        if (!kv.initialized or kv.base != 0) return null;
++        if (l < first) {
++            if (end == null) end = @intCast(kv.offset);
++        } else if (from == null) from = @intCast(kv.offset);
++    }
++    const e = end orelse return null;
++    const f = from orelse return null;
++    if (e <= f) return null;
++    var ptr: [*]const u8 = undefined;
++    var len: u64 = 0;
++    if (stage_split_export(@intFromPtr(cache), @intCast(f), @intCast(e), &ptr, &len) != 0) return null;
++    importQdx1(self, cache, entries, ptr[0..@intCast(len)]) catch |err| {
++        std.debug.print("[stage] end-of-turn pull-back import failed: {s}\n", .{@errorName(err)});
++        stage_split_mirror_cap(@intCast(f));
++        return null;
++    };
++    return e;
++}
++/// R69: Sushi's caches hold the sequence whole (layers [first, 48) as far as layers [0, first)), so it can decode on the
++/// Mac without the stage.
++pub fn stageCachesWhole(self: *Transformer, cache: *trf.KVCache) bool {
++    const first = stageSplitFirst() orelse return true;
++    var end: ?usize = null;
++    var from: ?usize = null;
++    var l: usize = 0;
++    while (l < self.config.num_hidden_layers) : (l += 1) {
++        if (self.config.isLinearLayer(@intCast(l))) continue;
++        const kv = &cache.entries[l];
++        if (!kv.initialized) continue;
++        if (l < first) {
++            if (end == null) end = @intCast(kv.offset);
++        } else if (from == null) from = @intCast(kv.offset);
++    }
++    return (from orelse 0) >= (end orelse 0);
++}
++/// Write a canon-stage-server "QDX1" blob (layers [first, 48): recurrent conv/state at `to`; attention KV rows
++/// [from, to), pooled blocks, the last n raw keys) into Sushi's caches.
++fn importQdx1(self: *Transformer, cache: *trf.KVCache, entries: []trf.SSMCacheEntry, blob: []const u8) !void {
 +    const r32 = struct {
 +        fn f(b: []const u8, o: usize) u32 {
 +            return std.mem.readInt(u32, b[o..][0..4], .little);
@@ -3179,7 +3900,6 @@ index 3ab27c9f..86b1bb6c 100644
 +    const from: usize = @intCast(r64(blob, 16));
 +    const to: usize = @intCast(r64(blob, 24));
 +    const rows: usize = to - from;
-+    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
 +    const s = self.s;
 +    var at: usize = 32;
 +    const Arr = struct {
@@ -3222,7 +3942,7 @@ index 3ab27c9f..86b1bb6c 100644
 +            defer for (kq) |a| {
 +                _ = mlx.mlx_array_free(a);
 +            };
-+            var view = try ctx.cache.appendQuantized(@intCast(l), .{ .q = kq[0], .scales = kq[1], .biases = kq[2] }, .{ .q = kq[3], .scales = kq[4], .biases = kq[5] }, s, 0);
++            var view = try cache.appendQuantized(@intCast(l), .{ .q = kq[0], .scales = kq[1], .biases = kq[2] }, .{ .q = kq[3], .scales = kq[4], .biases = kq[5] }, s, 0);
 +            view.deinit();
 +            const nb = to / 4 - from / 4;
 +            if (nb > 0) {
@@ -3239,7 +3959,7 @@ index 3ab27c9f..86b1bb6c 100644
 +                defer _ = mlx.mlx_array_free(keys);
 +                at += n * 128 * 2;
 +                try self.qsaAppendKeys(&entries[l], keys, @intCast(to - n));
-+            }
++            } else entries[l].qsa_hist_rows = @intCast(to); // R66d: a group-aligned end needs no raw keys
 +            at = (at + 15) / 16 * 16;
 +        } else return error.StageSplitPullback;
 +        if (at > blob.len) return error.StageSplitPullback;
@@ -3253,6 +3973,62 @@ index 3ab27c9f..86b1bb6c 100644
 +/// KV cache: the same object in the prefill's and the decode's ForwardCtx).
 +pub fn stageOwner(ctx: *const ForwardCtx) u64 {
 +    return @intFromPtr(ctx.cache);
++}
++extern "c" fn stage_split_assign_slot(owner: u64, slot: c_int) void;
++extern "c" fn stage_split_slot_of(owner: u64) c_int;
++extern "c" fn stage_split_select_owner(owner: u64) void;
++extern "c" fn stage_split_drop_slot(slot: c_int) c_int;
++/// R69 (SUSHI_STAGE_SLOTS=K with a K-slot stage, QD_STAGE_SLOTS=K, K up to 4): conversation slots on the stage.
++pub fn stageSlots() usize {
++    const S = struct {
++        var v: ?usize = null;
++    };
++    if (S.v) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_SLOTS");
++    const v: usize = if (raw) |r| std.math.clamp(std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1, 1, 4) else 1;
++    S.v = v;
++    return v;
++}
++/// R69: rows one forward of stage slot `slot` may carry. One slot: the stage's 16. Several: slot 0 keeps 9 (a lookup
++/// round); extra slot k reads SUSHI_STAGE_SLOT_VERIFY_ROWS (one value or a comma list per extra slot, the last value
++/// repeating; the host passes the stage's QD_STAGE_SLOT_VERIFY_ROWS), default 9 for slot 1 and 4 for later slots.
++pub fn stageSlotForwardRows(slot: usize) u32 {
++    if (stageSlots() < 2) return 16;
++    if (slot == 0) return 9;
++    const default: u32 = if (slot <= 1) 9 else 4;
++    const raw = std.c.getenv("SUSHI_STAGE_SLOT_VERIFY_ROWS") orelse return default;
++    var it = std.mem.splitScalar(u8, std.mem.sliceTo(raw, 0), ',');
++    var last: ?u32 = null;
++    var idx: usize = 1;
++    while (it.next()) |part| : (idx += 1) {
++        const v = std.fmt.parseInt(u32, std.mem.trim(u8, part, " "), 10) catch continue;
++        last = v;
++        if (idx == slot) break;
++    }
++    return std.math.clamp(last orelse default, 1, 9);
++}
++/// R69: `owner` decodes on stage slot `slot` (1) or not there any more (0).
++pub fn stageAssignSlot(owner: u64, slot: u32) void {
++    if (stageSlots() < 2) return;
++    stage_split_assign_slot(owner, @intCast(slot));
++}
++/// Do this sequence's layers [first, 48) live on the stage (it decoded or prefilled there)? Still true after the stage
++/// is given up: Sushi's caches then hold no usable state for them, and the request re-runs from its tokens.
++pub fn stageResident(ctx: *const ForwardCtx) bool {
++    return stage_split_resident(stageOwner(ctx)) != 0;
++}
++pub fn stageSlotOf(owner: u64) u32 {
++    if (stageSlots() < 2) return 0;
++    return @intCast(stage_split_slot_of(owner));
++}
++pub fn stageSelectOwner(owner: u64) void {
++    if (stageSlots() < 2) return;
++    stage_split_select_owner(owner);
++}
++/// R69: free the stage's slot `slot` >= 1 (its owner re-seeds at its next forward); false: the stage failed.
++pub fn stageDropSlot(slot: usize) bool {
++    if (stageSlots() < 2 or slot == 0) return true;
++    return stage_split_drop_slot(@intCast(slot)) == 0;
 +}
 +/// Park the sequence's stage state (layers [first, 48)) at its committed length into `path`:
 +/// 1 parked, 0 the stage holds none of it, -1 the stage failed (given up; the sequence re-runs
@@ -3308,6 +4084,12 @@ index 3ab27c9f..86b1bb6c 100644
 +        return;
 +    }
 +    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
++    // R66: rows [0, base) the stage holds exactly as Sushi does stay; send only the rest.
++    if (stageIseedEnabled()) {
++        const mirror: usize = @intCast(stage_split_mirror());
++        const base = @min(mirror, position) / 4 * 4;
++        if (base >= 16 and try stageSeedIncremental(self, ctx, first, base, position)) return;
++    }
 +    if (stage_split_seed_begin(position) != 0) return error.StageSplitSeed;
 +    var l: usize = first;
 +    while (l < self.config.num_hidden_layers) : (l += 1) {
@@ -3323,26 +4105,50 @@ index 3ab27c9f..86b1bb6c 100644
 +    }
 +    if (stage_split_seed_end(position) != 0) return error.StageSplitSeed;
 +}
++/// R66: the incremental seed (op 10). True when the stage applied it, false when it refused (the caller then
++/// sends the full seed); an error when the stage failed.
++fn stageSeedIncremental(self: *Transformer, ctx: *ForwardCtx, first: usize, base: usize, position: usize) !bool {
++    const entries = ctx.ssm_entries orelse return error.StageSplitNoSsm;
++    const check_from = base - 16;
++    if (stage_split_iseed_begin(@intCast(base), @intCast(check_from), @intCast(position)) != 0) return error.StageSplitSeed;
++    var l: usize = first;
++    while (l < self.config.num_hidden_layers) : (l += 1) {
++        const e = &entries[l];
++        if (self.config.isLinearLayer(@intCast(l))) {
++            if (stage_split_seed_recurrent(e.conv_state, e.ssm_state, self.s) != 0) return error.StageSplitSeed;
++        } else {
++            const kv = &ctx.cache.entries[l];
++            if (!kv.initialized or kv.base != 0 or kv.offset != position) return error.StageSplitSeedKv;
++            if (stage_split_iseed_attention(kv.keys, kv.keys_scales, kv.keys_biases, kv.values, kv.values_scales, kv.values_biases, e.qsa_pooled, e.aux_state, @intCast(base), @intCast(check_from), @intCast(position), self.s) != 0)
++                return error.StageSplitSeed;
++        }
++    }
++    const r = stage_split_iseed_end(@intCast(position));
++    if (r < 0) return error.StageSplitSeed;
++    return r == 1;
++}
  const Transformer = trf.Transformer;
  const std = @import("std");
  const sushi_exl3 = @import("sushi_exl3");
-@@ -1444,6 +1723,7 @@ pub fn forwardQwen4VerifyRows(
+@@ -1444,6 +1918,8 @@ pub fn forwardQwen4VerifyRows(
      out_last: []mlx.mlx_array,
      out_all: []mlx.mlx_array,
  ) !void {
-+    stage_split_invalidate(); // R60: these batched paths run every layer on the Mac
++    // R60: these batched paths run every layer on the Mac; R67: only a batched stage holder's state goes stale
++    for (ctxs) |c| stage_split_invalidate_owner(stageOwner(c));
      const previous_hc_prepared = mtp_verify_hc_prepared_active;
      mtp_verify_hc_prepared_active = true;
      defer mtp_verify_hc_prepared_active = previous_hc_prepared;
-@@ -1694,6 +1974,7 @@ pub fn forwardQwen4DecodeRows(
+@@ -1694,6 +2170,8 @@ pub fn forwardQwen4DecodeRows(
      ctxs: []const *ForwardCtx,
      hidden_rows: ?*?[]mlx.mlx_array,
  ) ![]mlx.mlx_array {
-+    stage_split_invalidate(); // R60: these batched paths run every layer on the Mac
++    // R60: these batched paths run every layer on the Mac; R67: only a batched stage holder's state goes stale
++    for (ctxs) |c| stage_split_invalidate_owner(stageOwner(c));
      const n = ctxs.len;
      std.debug.assert(n == next_tokens.len and n >= 1 and n <= MAX_BATCH_ROWS);
      if (!qwen4_rows_logged) {
-@@ -1969,9 +2250,75 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -1969,9 +2447,86 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
          !diagEnvOnCached(&trf.expert_defer_sync_env, "SUSHI_EXPERT_DEFER_SYNC");
      var deferred: ?DeferredQwenMoe = null;
      defer if (deferred) |*d| d.deinit();
@@ -3350,9 +4156,9 @@ index 3ab27c9f..86b1bb6c 100644
 +    // forward (R60 S4) keeps it in step.
 +    // An M-RoPE prefill (image tokens: 3-D positions) never goes to the stage; M-RoPE decode rows are
 +    // text and go with their rope delta (stage_split_forward), unless SUSHI_STAGE_MROPE=0.
-+    if (ctx.stage_prefill != 0 and ctx.mrope_pos != null) return error.StageSplitMrope;
++    if (ctx.stage_prefill != 0 and ctx.mrope_pos != null and ctx.stage_prefill_delta == null) return error.StageSplitMrope;
 +    const stage_first: ?usize = if ((ctx.stage_split and (ctx.mrope_pos == null or stageMropeEnabled())) or ctx.stage_prefill != 0) stageSplitFirst() else blk: {
-+        stage_split_invalidate();
++        stage_split_invalidate_owner(stageOwner(ctx)); // R67: another stream's Mac-only forward leaves the holder's alone
 +        break :blk null;
 +    };
 +    // texas-split: a sequence whose layers [first, 48) live on the stage (it decoded there) has no
@@ -3380,7 +4186,7 @@ index 3ab27c9f..86b1bb6c 100644
 +            if (ctx.stage_prefill != 0) {
 +                // R60 S4 (prefill v2): the chunk's rows through the stage's prefill path.
 +                if (stage_split_prefill_ready(@intCast(offset)) == 0) try stageSeedOrRestore(self, ctx, first, offset);
-+                if (stage_split_prefill_send(h, @intCast(offset), self.s) != 0) return error.StageSplitPrefill;
++                if (stage_split_prefill_send(h, @intCast(offset), if (ctx.mrope_pos != null) ctx.stage_prefill_delta orelse 0 else 0, self.s) != 0) return error.StageSplitPrefill;
 +                if (ctx.stage_prefill == 1) {
 +                    ctx.stage_prefill_sent = true;
 +                    ctx.moe_seq_offset.* += @intCast(seq_len);
@@ -3404,6 +4210,17 @@ index 3ab27c9f..86b1bb6c 100644
 +            clearStageHead(ctx);
 +            stage_split_set_head(@intFromBool(want_head));
 +            defer stage_split_set_head(0);
++            // R69: the async form sends here and returns; forwardQwen4Resume receives (the scheduler interleaves slots)
++            if (ctx.stage_async_verify) {
++                if (stage_split_forward_send(h, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
++                ctx.stage_verify_sent = true;
++                ctx.stage_verify_head = want_head;
++                ctx.stage_verify_rows = seq_len;
++                _ = mlx.mlx_array_free(out);
++                _ = mlx.mlx_array_free(h);
++                h = .{ .ctx = null };
++                return mlx.mlx_array_new();
++            }
 +            if (stage_split_forward(h, &out, @intCast(offset), rope_delta, self.s) != 0) return error.StageSplitForward;
 +            if (want_head) {
 +                if (stage_split_head_topk(&head_buf, seq_len) == 0 and stageHeadUsable(self, &head_buf, seq_len)) {
@@ -3418,7 +4235,7 @@ index 3ab27c9f..86b1bb6c 100644
          if (dumping) trf.moe_dump_layer = li;
          const lw = &ml[layer_idx];
          const entry = &entries[layer_idx];
-@@ -2083,6 +2430,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -2083,6 +2638,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
              }
          }
  
@@ -3437,7 +4254,7 @@ index 3ab27c9f..86b1bb6c 100644
          if (ctx.capture_layers) |cl| {
              for (cl.ids, cl.out) |cid, *slot| {
                  if (cid == li) {
-@@ -2119,10 +2478,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+@@ -2119,10 +2686,18 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
      // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
      // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
      if (ctx.capture_hidden) |target| {
@@ -3458,7 +4275,59 @@ index 3ab27c9f..86b1bb6c 100644
      const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
      // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
      _ = mlx.mlx_array_free(h);
-@@ -3055,6 +3422,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
+@@ -2140,6 +2715,51 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
+     return logits;
+ }
+ 
++/// texas-split R69: the second half of an async split forward: the stage's stream after layer 47, then what
++/// forwardQwen4With does after its layer loop (hidden captures; the stage head's top-20 or the mixer and lm_head).
++pub fn forwardQwen4Resume(self: *Transformer, ctx: *ForwardCtx) !mlx.mlx_array {
++    if (!ctx.stage_verify_sent) return error.StageSplitForward;
++    ctx.stage_verify_sent = false;
++    const seq_len = ctx.stage_verify_rows;
++    const batch: c_int = 1;
++    var h = mlx.mlx_array_new();
++    errdefer if (h.ctx != null) {
++        _ = mlx.mlx_array_free(h);
++    };
++    stage_split_bind(stageOwner(ctx));
++    if (stage_split_forward_recv(&h, self.s) != 0) return error.StageSplitForward;
++    var head_buf: [16 * 40]u32 = undefined;
++    var head_ready = false;
++    if (ctx.stage_verify_head) {
++        if (stage_split_head_topk(&head_buf, seq_len) == 0 and stageHeadUsable(self, &head_buf, seq_len)) {
++            head_ready = true;
++            r64_head_used += 1;
++        } else r64_head_fallback += 1;
++    }
++    ctx.moe_seq_offset.* += @intCast(seq_len);
++    if (ctx.capture_stream_all) |target| try capturePrefillHidden(self.s, target, h, true);
++    if (ctx.capture_hidden) |target| try capturePrefillHiddenLast(self.s, target, h, ctx.capture_settle);
++    if (ctx.capture_hidden_all) |target_all| try capturePrefillHidden(self.s, target_all, h, ctx.capture_settle);
++    if (head_ready and !self.embedding_mode and !ctx.skip_lm_head) {
++        const logits = try stageHeadLogits(self, ctx, &head_buf, seq_len);
++        _ = mlx.mlx_array_free(h);
++        h = .{ .ctx = null };
++        return logits;
++    }
++    var pending: ?HcPending = null;
++    defer if (pending) |*pd| pd.deinit();
++    const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
++    _ = mlx.mlx_array_free(h);
++    h = .{ .ctx = null };
++    if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
++    const final = mix.mixed;
++    if (self.embedding_mode or ctx.skip_lm_head) return final;
++    errdefer _ = mlx.mlx_array_free(final);
++    const logits = try self.lmHeadProject(final, ctx.argmax_only);
++    _ = mlx.mlx_array_free(final);
++    return logits;
++}
++
+ /// Average `[B, L, hc*H]` over its `hc` streams into a bf16 `[B, L, H]` tap.
+ fn hcStreamMean(s: mlx.mlx_stream, h: mlx.mlx_array, hc: u32) !mlx.mlx_array {
+     const shape = mlx.getShape(h);
+@@ -3055,6 +3675,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
          switch (which) {
              0 => "sushi_hc_read_n",
              1 => "sushi_hc_read_d",
@@ -3466,7 +4335,7 @@ index 3ab27c9f..86b1bb6c 100644
              else => "sushi_hc_read_u",
          },
          in_vec,
-@@ -3062,6 +3430,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
+@@ -3062,6 +3683,7 @@ pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
          switch (which) {
              0 => HC_FUSED_N_SOURCE,
              1 => HC_FUSED_D_SOURCE,
@@ -3577,7 +4446,7 @@ index e366a11d..1d96d861 100644
              var got: usize = 0;
              errdefer {
 diff --git a/src/scheduler.zig b/src/scheduler.zig
-index 8adeb60a..9c9a059f 100644
+index 8adeb60a..cc520371 100644
 --- a/src/scheduler.zig
 +++ b/src/scheduler.zig
 @@ -32,6 +32,7 @@
@@ -3604,7 +4473,33 @@ index 8adeb60a..9c9a059f 100644
      allocator: std.mem.Allocator,
      /// io reference for Stopwatch / async-eval (captured from Scheduler).
      io: std.Io,
-@@ -1632,6 +1635,15 @@ pub const Scheduler = struct {
+@@ -522,6 +525,9 @@ pub const Slot = struct {
+     /// t1 streamed at the MTP prefill handover; the first block still commits it, and its
+     /// echo is not published twice (`takeHandoverEcho`).
+     handover_token: ?u32 = null,
++    /// texas-split: the stage was given up while this request's layers [first, 48) lived there. It re-runs from its
++    /// tokens on the Mac before its next tick (`stageRecoverMarked`); no decode tick takes it until then.
++    stage_recover_pending: bool = false,
+     cancelled: std.atomic.Value(bool),
+     /// Inference thread only: the request's outcome has been counted in `Metrics`.
+     metrics_recorded: bool = false,
+@@ -1329,7 +1335,14 @@ pub const Scheduler = struct {
+     /// requests because that path is bit-identical to legacy and supports
+     /// speculative decoding (which the batched kernel doesn't).
+     force_batched: bool,
+-
++    /// R67 multi-stream: the request whose forwards run layers [first, 48) on the 5090 stage (`stageHolderClaim`).
++    stage_holder: ?*Slot = null,
++
++    /// R69 (several stage slots): the requests decoding on the stage's slots 1.. (index k = slot k + 1), interleaved
++    /// with `stage_holder` (slot 0).
++    stage_extra: [STAGE_EXTRA_MAX]?*Slot = @splat(null),
++    /// R69: extra slot k ended with nobody to pass it to: free it on the stage at the next tick (not inside a stage wait).
++    stage_slot_drop: [STAGE_EXTRA_MAX]bool = @splat(false),
+     queue_mu: std.Io.Mutex,
+     queue_cond: std.Io.Condition,
+     pending: std.ArrayList(*Slot),
+@@ -1632,6 +1645,15 @@ pub const Scheduler = struct {
      /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
      /// the scheduler is shutting down this returns `error.Shutdown`.
      pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
@@ -3620,7 +4515,7 @@ index 8adeb60a..9c9a059f 100644
          // Construct the slot up front so we don't hold the queue mutex
          // through any allocation. Per-request `kv_quant_config` override (Wave
          // 1.A) wins over the process-level default carried on the scheduler.
-@@ -1683,7 +1695,9 @@ pub const Scheduler = struct {
+@@ -1683,7 +1705,9 @@ pub const Scheduler = struct {
          const eff_kv_quant = params.kv_quant_config orelse
              transformer_mod.KvCacheChoice.resolve(slot_config.kv_quant_override, self.kv_quant_config, self.kv_quant_explicit).config;
          if (slot_config.isGlm5() and eff_kv_quant.glmLatentBits() == null) return error.GlmKvQuantUnsupported;
@@ -3631,7 +4526,7 @@ index 8adeb60a..9c9a059f 100644
      }
  
      /// `submit` failed before any slot owned `ve`; only the inference thread may free it. Waits
-@@ -2482,6 +2496,7 @@ fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
+@@ -2482,6 +2506,7 @@ fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
      var outstanding: u64 = 0;
      for (sch.decoding.items) |s| {
          if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
@@ -3639,7 +4534,7 @@ index 8adeb60a..9c9a059f 100644
          live = true;
          outstanding +|= slotOutstandingGrowth(s);
      }
-@@ -5134,6 +5149,12 @@ pub fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[orphan_vision_cap]mlx.ml
+@@ -5134,6 +5159,12 @@ pub fn takeOrphanedVisionLocked(sch: *Scheduler, out: *[orphan_vision_cap]mlx.ml
  
  /// Caller holds `queue_mu`. Shared with the wait condition below.
  fn hasWorkPendingLocked(sch: *const Scheduler) bool {
@@ -3652,7 +4547,7 @@ index 8adeb60a..9c9a059f 100644
      return sch.pending.items.len > 0 or
          sch.decoding.items.len > 0 or
          sch.vision_queue.items.len > 0 or
-@@ -5232,12 +5253,239 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5232,12 +5263,261 @@ fn inferenceLoop(ctx: ThreadCtx) void {
          }
      }
  
@@ -3679,13 +4574,20 @@ index 8adeb60a..9c9a059f 100644
 +fn admitNativePendingLocked(sch: *Scheduler, out: []*Slot) usize {
 +    // Texas keeps the qualified solo foreground path while one background
 +    // stack may be suspended. Priority never changes a request's batch kernel.
++    // R67 multi-stream: up to --max-concurrent foregrounds live at once (one holds the 5090 stage, the others run on
++    // the Mac); a background still never runs beside live work. At 1 this is the solo path unchanged.
++    var live_fg: usize = 0;
 +    for ([_][]*Slot{ sch.prefilling.items, sch.decoding.items }) |slots| {
-+        for (slots) |s| if (!s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) return 0;
++        for (slots) |s| if (!s.background and !s.finished and s.error_code == null and !s.cancelled.load(.acquire)) {
++            live_fg += 1;
++        };
 +    }
++    if (live_fg >= @max(@as(usize, sch.max_concurrent), 1)) return 0;
 +    var selected: ?usize = null;
 +    for (sch.pending.items, 0..) |s, i| {
 +        if (!s.background) { selected = i; break; }
 +    }
++    if (live_fg > 0 and selected == null) return 0;
 +    if (selected == null and !texas_priority.nested and !texas_priority.held()) {
 +        var live = false;
 +        for (sch.decoding.items) |s| if (!s.finished and s.error_code == null and !s.cancelled.load(.acquire)) { live = true; };
@@ -3861,6 +4763,21 @@ index 8adeb60a..9c9a059f 100644
 +    while (true) {
 +        texas_priority.set(.state, 2);
 +        nativeStagePark(slot, forward);
++        // R69 multi-stream: while this request is parked the foregrounds take the stage (slot 0 too); it claims slot 0
++        // again when it resumes (its parked stage half restores at its next stage call).
++        const held_slot0 = stageMultiStream(sch) and stageHolderIs(sch, slot);
++        if (held_slot0) sch.stage_holder = null;
++        defer if (held_slot0) {
++            stageReapEnded(sch, slot);
++            if (sch.stage_holder == null) {
++                sch.stage_holder = slot;
++            } else if (!stageHolderIs(sch, slot)) {
++                // cannot happen while backgrounds only resume with no foreground live: its layers [first, 48) are parked
++                // for the stage, so without slot 0 the split is given up and it re-runs on the Mac
++                log.err("[stage] a resumed background found slot 0 taken; giving the stage up\n", .{});
++                stage_split_give_up("resumed background without slot 0");
++            }
++        };
 +        var active_before: usize = 0;
 +        _ = mlx.mlx_get_active_memory(&active_before);
 +        var parked = texas_priority.Parked.create(&roots, &protected, slot.request_id);
@@ -3897,7 +4814,15 @@ index 8adeb60a..9c9a059f 100644
          // 0a. Drain slots queued for cleanup. Conn threads hand finished
          //     slots here in `complete()` — we own the mlx stream binding,
          //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
-@@ -5321,13 +5569,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5309,6 +5589,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
+             // record must not outlive the bytes `s.deinit()` frees.
+             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
++            stageHolderRelease(sch, s); // R67: a decode-phase cancel never reaches finishSlot
+             if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+         }
+         deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
+@@ -5321,13 +5602,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
          if (load_req) |req| runLoadRequest(sch, req);
          if (unload_req) |req| runUnloadRequest(sch, req);
          if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
@@ -3916,7 +4841,7 @@ index 8adeb60a..9c9a059f 100644
          if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
  
          // 1. Wait for work. Drain pending slots into a local list under lock,
-@@ -5339,33 +5587,46 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5339,33 +5620,46 @@ fn inferenceLoop(ctx: ThreadCtx) void {
              defer sch.queue_mu.unlock(sch.io);
              const warm_ns: u64 = @as(u64, gpu_warm_secs) * std.time.ns_per_s;
              while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
@@ -3973,7 +4898,7 @@ index 8adeb60a..9c9a059f 100644
  
              // Single-flight admission: a model with
              // MODULE-OWNED decode state admits at most one live slot.
-@@ -5376,6 +5637,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5376,6 +5670,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
              // condition above never blocks while `pending` is non-empty,
              // so a held slot admits on the first tick after the active one
              // is culled (step 5, same mutex).
@@ -3983,7 +4908,7 @@ index 8adeb60a..9c9a059f 100644
              var live_buf: [32]AdmitCand = undefined;
              const n_live = heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slotExclusiveDecode);
              var cand_buf: [32]AdmitCand = undefined;
-@@ -5396,6 +5660,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5396,6 +5693,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                  r -= 1;
                  _ = sch.pending.orderedRemove(admit_idx[r]);
              }
@@ -3991,7 +4916,7 @@ index 8adeb60a..9c9a059f 100644
          }
  
          if (sch.budget_revise_sw) |sw| {
-@@ -5422,10 +5687,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5422,10 +5720,22 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                      finishSlot(sch, slot, "cancelled");
                      continue;
                  }
@@ -4014,7 +4939,7 @@ index 8adeb60a..9c9a059f 100644
                          if (err == error.Cancelled) {
                              log.info("[scheduler] prefill aborted: client disconnected\n", .{});
                              finishSlot(sch, slot, "cancelled");
-@@ -5486,6 +5763,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5486,6 +5796,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
              defer sch.queue_mu.unlock(sch.io);
              for (sch.decoding.items) |s| {
                  if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
@@ -4022,8 +4947,12 @@ index 8adeb60a..9c9a059f 100644
                  active.append(sch.allocator, s) catch break;
                  _ = s.in_pass.fetchAdd(1, .acq_rel);
              }
-@@ -5501,18 +5779,33 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+@@ -5499,20 +5810,28 @@ fn inferenceLoop(ctx: ThreadCtx) void {
+         //    throughput a user actually observes (their stream advances at
+         //    the tick cadence regardless of how many peers share it).
          if (active.items.len > 0) {
++            // texas-split: requests a tick hosted inside a prefill left marked after a stage failure re-run first
++            stageRecoverMarked(sch, active.items);
              var decode_sw = io_util.Stopwatch.init(sch.io);
              runDecodeTick(sch, active.items) catch |err| {
 -                log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
@@ -4031,17 +4960,8 @@ index 8adeb60a..9c9a059f 100644
 +                if (isStageSplitError(err)) {
 +                    stage_split_give_up("split decode failed in the scheduler");
 +                    log.warn("[stage] decode tick failed ({s}); continuing the stream on the Mac\n", .{@errorName(err)});
-+                    for (active.items) |s| {
-+                        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
-+                        stageRecoverDecodingSlot(sch, s) catch |e| {
-+                            if (e == error.Cancelled) {
-+                                finishSlot(sch, s, "cancelled");
-+                            } else {
-+                                log.err("[stage] Mac-only recovery failed: {s}\n", .{@errorName(e)});
-+                                s.markError(@errorName(e));
-+                            }
-+                        };
-+                    }
++                    stageMarkRecover(sch, active.items);
++                    stageRecoverMarked(sch, active.items);
 +                } else {
 +                    log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
 +                    for (active.items) |s| s.markError(@errorName(err));
@@ -4061,23 +4981,164 @@ index 8adeb60a..9c9a059f 100644
  }
  
  fn postPrefillTerminal(slot: *Slot) bool {
-@@ -6420,6 +6713,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+@@ -5999,21 +6318,89 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
+     const n_gen = gen_ptr.generated_ids.items.len;
+     if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
+ 
+-    // Construct the full token sequence: the original prompt + everything
+-    // generated this turn. The cache reflects exactly this state — Generator
+-    // forwarded each emitted token into slot.cache as it was sampled.
+-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+-    const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
+-    defer sch.allocator.free(total_tokens);
+-    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
+-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+-
+     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
+     // loop and hand them to the cache alongside the KV snapshot. For plain-
+     // attn models this returns an empty slice (no allocator hit). Ownership
+     // transfers to the cache via `commitWithSsm`; freeing happens on
+     // eviction.
+-    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
++    var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
++    // R66d: the stop token the trunk already forwarded (an accepted EOS draft, or the pipelined lookahead): it is in
++    // the KV, so the entry's tokens carry it and a checkpoint after it can restore.
++    var end_eos: ?u32 = null;
++    // R66d (SUSHI_STAGE_PULLBACK_END=1): the 5090 holds this turn's reply in layers 28-47 only, so the entry was whole
++    // only to the prompt and the next turn re-prefilled the reply. Copy it back and take a checkpoint at its end: the
++    // next turn resumes there, and the entry can persist.
++    if (qwen4_forward.stagePullbackEndEnabled()) end_cp: {
++        const ents = slot.ssm_entries orelse break :end_cp;
++        const xf = slot.model.transformer orelse break :end_cp;
++        const end_pos = qwen4_forward.stagePullbackTurnEnd(xf, &slot.cache, ents) orelse break :end_cp;
++        if (ssm_cps_slice.len > 0 and ssm_cps_slice[ssm_cps_slice.len - 1].pos >= end_pos) break :end_cp;
++        // A checkpoint restores only within the entry's tokens: one row past them is the forwarded stop token.
++        const token_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
++        if (end_pos == token_len + 1 and generate_mod.isEosId(gen_ptr.next_token_id, slot.eos_token_ids)) {
++            end_eos = gen_ptr.next_token_id;
++        } else if (end_pos > token_len) break :end_cp;
++        // The MTP head's last round sits in its deferred stash (the next round would append it): apply it, or the
++        // head's committed history ends short of `end_pos` and the next turn's restore there cannot adopt it.
++        gen_ptr.mtpDetachHead(slot.allocator, true) catch |err| {
++            log.warn("[hot-cache] end-of-turn MTP stash not applied: {s}\n", .{@errorName(err)});
++        };
++        // ... and its last pair (the stop token after the trunk's last row). The checkpoint goes in only where the head's
++        // committed history reaches it: the next turn restores the head with it, or the head drafts from a short history
++        // (measured: -24% tokens per round when it restarted at every turn).
++        if (gen_ptr.mtp_cache != null) {
++            // the token at `end_pos` in the next turn's prompt: still in this entry (the trunk had not forwarded the
++            // reply's last token), else the chat template's end of the assistant message (after a stop token, or a
++            // reply cut on length, the client's history renders "<|im_end|>" there)
++            const n_prompt = slot.full_prompt.len;
++            const next_tok: ?u32 = if (end_eos != null) null else if (end_pos < token_len)
++                (if (end_pos >= n_prompt) gen_ptr.generated_ids.items[end_pos - n_prompt] else slot.full_prompt[end_pos])
++            else slot.model.tokenizer.?.specialTokenId("<|im_end|>");
++            if (next_tok) |t| gen_ptr.mtpAppendFinalPair(t) catch |err| log.warn("[hot-cache] end-of-turn MTP pair not appended: {s}\n", .{@errorName(err)});
++            // the head's QSA leftover at the checkpoint, as a prefill checkpoint marks it: without it the head restores
++            // blind to its open group there (measured: -27% tokens per round)
++            if (gen_ptr.mtp_cache) |*mc| mc.activate();
++            xf.qwen4MtpMarkQsaLeftover(end_pos -| gen_ptr.mtp_position_base) catch |err|
++                log.warn("[hot-cache] end-of-turn MTP leftover not marked: {s}\n", .{@errorName(err)});
++            const head_end = gen_ptr.mtp_position_base + gen_ptr.mtpCommittedHistoryLen();
++            if (head_end != end_pos) {
++                log.info("  [hot-cache] no end-of-turn checkpoint: the MTP head ends at {d}, the trunk at {d}\n", .{ head_end, end_pos });
++                end_eos = null;
++                break :end_cp;
++            }
++        }
++        const a = gen_ptr.ssm_checkpoint_alloc orelse hc.allocator;
++        var cp = transformer_mod.captureSsmCheckpoint(a, ents, end_pos, xf.s) catch |err| {
++            log.warn("[hot-cache] end-of-turn checkpoint at {d} not captured: {s}\n", .{ end_pos, @errorName(err) });
++            break :end_cp;
++        };
++        const grown = a.alloc(transformer_mod.SSMCheckpoint, ssm_cps_slice.len + 1) catch {
++            cp.deinit(a);
++            break :end_cp;
++        };
++        @memcpy(grown[0..ssm_cps_slice.len], ssm_cps_slice);
++        grown[ssm_cps_slice.len] = cp;
++        if (gen_ptr.ssm_checkpoint_alloc) |old| old.free(ssm_cps_slice);
++        ssm_cps_slice = grown;
++        gen_ptr.ssm_checkpoint_alloc = a;
++        log.info("  [hot-cache] end-of-turn checkpoint at {d} ({d} checkpoints)\n", .{ end_pos, ssm_cps_slice.len });
++    }
++
++    // Construct the full token sequence: the original prompt + everything
++    // generated this turn. The cache reflects exactly this state — Generator
++    // forwarded each emitted token into slot.cache as it was sampled.
++    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len + @intFromBool(end_eos != null);
++    const total_tokens = sch.allocator.alloc(u32, total_len) catch {
++        if (gen_ptr.ssm_checkpoint_alloc) |a| {
++            for (ssm_cps_slice) |*cp| cp.deinit(a);
++            a.free(ssm_cps_slice);
++        }
++        return;
++    };
++    defer sch.allocator.free(total_tokens);
++    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
++    @memcpy(total_tokens[slot.full_prompt.len..][0..gen_ptr.generated_ids.items.len], gen_ptr.generated_ids.items);
++    if (end_eos) |t| total_tokens[total_len - 1] = t;
+     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
+         // Empty list — free the (zero-length) slice we got back so the
+@@ -6420,6 +6807,8 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
      // the record now describes bytes that die with `slot.cache`. Above every early return.
      if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
      releaseNativeState(slot);
 +    qwen4_forward.stageSplitForget(&slot.cache);
++    stageHolderRelease(sch, slot);
      // SSD flush runs AFTER markFinished so the client never waits on the
      // chunk-append — but everything it needs must be captured BEFORE the
      // broadcast: the conn thread may complete()+free the slot immediately.
-@@ -6831,6 +7125,7 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
+@@ -6711,6 +7100,9 @@ var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
+ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
+     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+     if (!hc.ssd_first) return false;
++    // texas-split R66: the split's chunk records cannot carry layers 28-47 (they persist with 0 checkpoints and
++    // fail the restore's QSA history check), and the hand-off frees each checkpoint once "written": keep them.
++    if (prefix_cache_mod.hotKeepsAllCheckpoints()) return false;
+     const d = if (hc.disk) |*dd| dd else return false;
+     if (d.writer == null) return false;
+     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
+@@ -6734,6 +7126,8 @@ fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
+ fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
+     const cfg = slot.model.config orelse return false;
+     if (write_through or !cfg.isQwen4()) return false;
++    // texas-split R66: every checkpoint stays in RAM (`--ssm-checkpoint-max` still caps and thins the list).
++    if (prefix_cache_mod.hotKeepsAllCheckpoints()) return false;
+     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+     return hc.disk != null;
+ }
+@@ -6831,6 +7225,9 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
      sch.queue_mu.lockUncancelable(sch.io);
      for (sch.decoding.items) |s| {
          if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
 +        if (s.background) continue;
++        // texas-split: waiting for, or in, its Mac re-run after a stage failure (no usable state until it ends)
++        if (s.stage_recover_pending) continue;
          if (n >= buf.len) break;
          buf[n] = s;
          _ = s.in_pass.fetchAdd(1, .acq_rel);
-@@ -6895,6 +7190,55 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
+@@ -6851,8 +7248,16 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
+     }
+     var sw = io_util.Stopwatch.init(sch.io);
+     runDecodeTick(sch, buf[0..n]) catch |err| {
+-        log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
+-        for (buf[0..n]) |s| s.markError(@errorName(err));
++        if (isStageSplitError(err)) {
++            // texas-split: the stage failed under a tick hosted inside a prefill. Its requests re-run on the Mac at the
++            // next pass, outside this prefill (`stageRecoverMarked`); the requests on the Mac carry on.
++            stage_split_give_up("split decode failed between prefill chunks");
++            log.warn("[stage] decode tick between prefill chunks failed ({s}); the stage's requests re-run on the Mac after this prefill\n", .{@errorName(err)});
++            stageMarkRecover(sch, buf[0..n]);
++        } else {
++            log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
++            for (buf[0..n]) |s| s.markError(@errorName(err));
++        }
+     };
+     const tick_ns = sw.read();
+     for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+@@ -6895,6 +7300,95 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
      slot.handover_token = t1;
  }
  
@@ -4091,13 +5152,25 @@ index 8adeb60a..9c9a059f 100644
 +    return err == error.StageSplitForward or err == error.StageSplitSeed or err == error.StageSplitSeedKv or
 +        err == error.StageSplitNoSsm or err == error.StageSplitPrefill or err == error.StageSplitPullback;
 +}
++/// Is the MTP head's live state this slot's own, or nobody's?
++fn headStateIsSlots(slot: *Slot, xf: *Transformer) bool {
++    const owner = xf.qwen4_mtp_owner orelse return true;
++    const g = if (slot.legacy_gen) |*gg| gg else return false;
++    const mc = if (g.mtp_cache) |*m| m else return false;
++    return switch (mc.*) {
++        .qwen4 => |r| r.st == owner,
++        else => false,
++    };
++}
 +fn resetSlotForStageRetry(slot: *Slot) void {
 +    qwen4_forward.stageSplitForget(&slot.cache);
 +    if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
 +    if (slot.model.transformer) |xf| {
 +        slot.cache.truncate(0, xf.s) catch {};
 +        xf.resetQsaPooledRope();
-+        xf.qwen4MtpResetOwned(slot.enable_mtp);
++        // With several requests in flight the head's live state can be another request's: only this one's own (or
++        // nobody's) is reset.
++        if (headStateIsSlots(slot, xf)) xf.qwen4MtpResetOwned(slot.enable_mtp);
 +    }
 +    if (slot.legacy_gen) |*g| {
 +        g.deinit(slot.allocator);
@@ -4129,11 +5202,39 @@ index 8adeb60a..9c9a059f 100644
 +    slot.completion_tokens = done;
 +    slot.prompt_tokens = prompt_tokens;
 +}
++/// The stage has just been given up: mark the requests that must re-run from their tokens on the Mac. With one request
++/// at a time that is every request of the tick, as before. With several (multi-stream) it is the ones whose layers
++/// [first, 48) lived on the stage; the requests decoding on the Mac hold their whole state and carry on.
++fn stageMarkRecover(sch: *Scheduler, slots: []const *Slot) void {
++    for (slots) |s| {
++        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
++        if (sch.max_concurrent <= 1 or stageOnStage(sch, s) or qwen4_forward.stageResident(&s.ctx)) s.stage_recover_pending = true;
++    }
++}
++/// Re-run the marked requests, one after another. A re-run is a prefill, and decode ticks run between its chunks: they
++/// take neither the request re-running (it has no generator until its prefill ends) nor the ones still waiting (their
++/// caches lack the stage's layers); `interleaveDecodeTick` leaves the marked out.
++fn stageRecoverMarked(sch: *Scheduler, slots: []const *Slot) void {
++    for (slots) |s| {
++        if (!s.stage_recover_pending) continue;
++        if (!(s.finished or s.error_code != null or s.cancelled.load(.acquire))) {
++            stageRecoverDecodingSlot(sch, s) catch |e| {
++                if (e == error.Cancelled) {
++                    finishSlot(sch, s, "cancelled");
++                } else {
++                    log.err("[stage] Mac-only recovery failed: {s}\n", .{@errorName(e)});
++                    s.markError(@errorName(e));
++                }
++            };
++        }
++        s.stage_recover_pending = false;
++    }
++}
 +
  fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
      // Mark the phase for the whole of prefill, and clear both signals on EVERY
      // exit path (success, cancel, error). `requests_prefilling` flips at entry
-@@ -6924,6 +7268,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+@@ -6924,6 +7418,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
      // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
      // but cheap).
      slot.ctx.cache = &slot.cache;
@@ -4142,7 +5243,7 @@ index 8adeb60a..9c9a059f 100644
      slot.ctx.moe_seq_offset = &slot.moe_seq_offset;
      slot.ctx.ssm_entries = slot.ssm_entries;
      slot.ctx.vision_embeddings = slot.vision_embeddings;
-@@ -7220,7 +7566,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+@@ -7220,7 +7716,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
      // out of prefill_ns below (the decoding slots got the time).
      var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
      var write_through_ctx = WriteThroughCtx{ .slot = slot };
@@ -4151,7 +5252,33 @@ index 8adeb60a..9c9a059f 100644
      cp_max = qwenCheckpointCap(slot, cp_max, write_through_on);
      // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
      var width_ctx = ChunkWidthCtx{
-@@ -7314,6 +7660,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+@@ -7258,6 +7754,17 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+     // nothing between here and `initWithOptions` may fail.
+     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+     if (hot_checked_out) slot.cache.adoptRestored();
++    // R67: the stage holder (multi-stream), or the only request; R66: the stage client learns the holder's prompt (its
++    // incremental seed reuses rows the stage still holds).
++    const stage_ok = stageHolderClaim(sch, slot);
++    // R69 test hook (SUSHI_STAGE_FORCE_SLOT1=1, two-slot stage): every holder decodes on slot 1
++    if (stage_ok and qwen4_forward.stageSlots() > 1) {
++        if (stageExtraOf(sch, slot)) |k| {
++            qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&slot.ctx), @intCast(k + 1));
++        } else if (forceSlot1()) qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&slot.ctx), 1);
++    }
++    if (stage_ok) qwen4_forward.stageSelectOwner(qwen4_forward.stageOwner(&slot.ctx));
++    if (stage_ok) qwen4_forward.stageNotePrompt(slot.full_prompt, hot_matched);
+     var gen = try Generator.initWithOptions(
+         sch.io,
+         slot.allocator,
+@@ -7289,6 +7796,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+             // transition shim sync-forwards [t1] on the first decode call.
+             // DFlash/MTP init paths already skip preforward unconditionally.
+             .skip_lazy_preforward = !use_mtp and !use_dflash,
++            .stage_allowed = stage_ok,
+             .ssm_checkpoint_stride = cp_stride,
+             .ssm_checkpoint_max = cp_max,
+             .ssm_checkpoint_pos_offset = hot_matched,
+@@ -7314,6 +7822,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
              .cancelled_checkpoint_sink = &slot.cancelled_prefill,
              .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
              .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
@@ -4159,7 +5286,683 @@ index 8adeb60a..9c9a059f 100644
              .interleave_hook = if (prefillInterleaveEnabled())
                  .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
              else
-@@ -8084,17 +8431,20 @@ test "the inference loop parks without holding the sleep-inhibition assertion" {
+@@ -7341,6 +7850,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+     gen.logprobs_n = slot.logprobs_n;
+ 
+     slot.legacy_gen = gen;
++    slot.legacy_gen.?.stage_allowed = stage_ok;
+     publishHandoverToken(slot, &slot.legacy_gen.?);
+     // A long reply compacts the ring past the prompt end, where the next turn diverges.
+     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
+@@ -7389,8 +7899,613 @@ fn sumInflightGeneratedTokens(active: anytype) u64 {
+     return inflight;
+ }
+ 
++/// R67 multi-stream: with more than one request in flight on the split, one request at a time holds the 5090 stage, from
++/// its prefill until it ends however it ends; the others run every layer on the Mac beside it (batched among
++/// themselves as usual). A background request never takes the stage. With one request in flight it is always the
++/// holder, as before.
++fn stageMultiStream(sch: *const Scheduler) bool {
++    return sch.max_concurrent > 1 and qwen4_forward.stageSplitFirst() != null;
++}
++fn stageHolderIs(sch: *const Scheduler, slot: *const Slot) bool {
++    return if (sch.stage_holder) |h| h == slot else false;
++}
++/// R69 test hook: SUSHI_STAGE_FORCE_SLOT1=1 puts every stage holder on slot 1 (a two-slot stage; checks slot 1 against 0).
++var force_slot1_env: ?bool = null;
++fn forceSlot1() bool {
++    if (force_slot1_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_FORCE_SLOT1");
++    const v = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
++    force_slot1_env = v;
++    return v;
++}
++/// Experiments: SUSHI_STAGE_MS_HOLDER=0 keeps every multi-stream request on the Mac (nobody holds the stage).
++var stage_ms_holder_env: ?bool = null;
++fn stageHolderWanted() bool {
++    if (stage_ms_holder_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_MS_HOLDER");
++    const v = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
++    stage_ms_holder_env = v;
++    return v;
++}
++fn stageHolderClaim(sch: *Scheduler, slot: *Slot) bool {
++    if (!stageMultiStream(sch)) return true;
++    if (!stageHolderWanted()) return false;
++    stageReapEnded(sch, slot);
++    if (slot.background) {
++        // A background request runs with no foreground beside it (native priority parks it, and its stage half, for
++        // them): alone it takes slot 0, exactly as when one request runs at a time. It gives the slot up while parked
++        // (nativeBoundary).
++        if (sch.stage_holder == null and !stageAnyExtra(sch)) sch.stage_holder = slot;
++        return stageHolderIs(sch, slot);
++    }
++    if (sch.stage_holder == null) {
++        sch.stage_holder = slot;
++        // R69: slot 0 stops below the occupied extra slots: a request too long for that takes their rows
++        stageMakeRoomForSlot0(sch, stageSlotNeed(slot), "a longer request takes slot 0");
++    }
++    if (stageHolderIs(sch, slot)) return true;
++    // R69: an extra slot (the highest rows first), when this request fits its rows and slot 0's request stays below them
++    if (!stageSlotFits(slot.full_prompt.len, slot.max_tokens)) return false;
++    for (0..stageExtraCount()) |k| {
++        if (sch.stage_extra[k] != null) continue;
++        if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > stageSlotBase(k)) break;
++        sch.stage_extra[k] = slot;
++        return true;
++    }
++    return false;
++}
++/// R69: a request that ended or was cancelled keeps its stage slot until its slot is cleaned up, a tick or more later.
++/// Release it now, so a request starting or resuming (a background after a foreground's client went away) finds the
++/// slot free. The later cleanup's release is then a no-op.
++fn stageReapEnded(sch: *Scheduler, except: *const Slot) void {
++    if (sch.stage_holder) |h| {
++        if (h != except and (h.finished or h.error_code != null or h.cancelled.load(.acquire))) stageHolderRelease(sch, h);
++    }
++    for (sch.stage_extra) |maybe| {
++        const h = maybe orelse continue;
++        if (h != except and (h.finished or h.error_code != null or h.cancelled.load(.acquire))) stageHolderRelease(sch, h);
++    }
++}
++/// R69: extra stage slots (slots 1..) this server may use.
++pub const STAGE_EXTRA_MAX = 3;
++fn stageExtraCount() usize {
++    return @min(qwen4_forward.stageSlots() -| 1, STAGE_EXTRA_MAX);
++}
++/// The extra slot index k (stage slot k + 1) `slot` decodes on, or null.
++fn stageExtraOf(sch: *const Scheduler, slot: *const Slot) ?usize {
++    for (sch.stage_extra, 0..) |h, k| if (h == slot) return k;
++    return null;
++}
++fn stageOnStage(sch: *const Scheduler, slot: *const Slot) bool {
++    return stageHolderIs(sch, slot) or stageExtraOf(sch, slot) != null;
++}
++fn stageAnyExtra(sch: *const Scheduler) bool {
++    for (sch.stage_extra) |h| if (h != null) return true;
++    return false;
++}
++/// R69: rows of each extra stage slot (SUSHI_STAGE_SLOT_ROWS, the host's QD_STAGE_SLOT_ROWS; default 65536).
++var stage_slot_rows_env: ?usize = null;
++fn stageSlotRows() usize {
++    if (stage_slot_rows_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_SLOT_ROWS");
++    const v: usize = if (raw) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 65536) else 65536;
++    stage_slot_rows_env = v;
++    return v;
++}
++/// R69: a request of `len` tokens so far fits an extra slot with room for its reply (capped at 16K tokens).
++fn stageSlotFits(len: usize, max_tokens: u32) bool {
++    return len + @min(@as(usize, max_tokens), stageSlotReserve()) + 64 <= stageSlotRows();
++}
++/// R69: reply rows an extra-slot claim reserves at most (SUSHI_STAGE_SLOT_RESERVE, default 16384; tests shrink it).
++var stage_slot_reserve_env: ?usize = null;
++fn stageSlotReserve() usize {
++    if (stage_slot_reserve_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_SLOT_RESERVE");
++    const v: usize = if (raw) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 16384) else 16384;
++    stage_slot_reserve_env = v;
++    return v;
++}
++/// R69: attention rows on the stage (the host's STAGE_CAPACITY, SUSHI_STAGE_CAPACITY; default 262160). Extra slot k's
++/// views are rows [capacity - (k + 1) * stageSlotRows(), capacity - k * stageSlotRows()); slot 0 may not reach an
++/// occupied slot's rows.
++var stage_capacity_env: ?usize = null;
++fn stageCapacity() usize {
++    if (stage_capacity_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_CAPACITY");
++    const v: usize = if (raw) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 262160) else 262160;
++    stage_capacity_env = v;
++    return v;
++}
++fn stageSlotBase(k: usize) usize {
++    return stageCapacity() -| (k + 1) * stageSlotRows();
++}
++/// Rows slot 0 may hold: below the lowest occupied extra slot.
++fn stageSlot0Limit(sch: *const Scheduler) usize {
++    var limit = stageCapacity();
++    for (sch.stage_extra, 0..) |h, k| if (h != null) {
++        limit = @min(limit, stageSlotBase(k));
++    };
++    return limit;
++}
++/// Rows a forward may add before the next guard check (verify rows, with room).
++const STAGE_SLOT_MARGIN: usize = 64;
++/// R69: rows a slot's request holds or will soon hold (its tokens so far plus a forward's worth, or its whole prompt
++/// while it prefills).
++fn stageSlotNeed(s: *const Slot) usize {
++    const made: usize = if (s.legacy_gen) |*g| g.generated_ids.items.len else 0;
++    return s.full_prompt.len + made + STAGE_SLOT_MARGIN;
++}
++/// R69: drafts a round of `slot` may carry on its stage slot (verify rows - 1); 0 = no cap (one stage slot, or a
++/// request on the Mac).
++fn stageDraftCap(sch: *const Scheduler, slot: *const Slot) u32 {
++    if (!stageMultiStream(sch) or qwen4_forward.stageSlots() < 2) return 0;
++    if (stageExtraOf(sch, slot)) |k| return qwen4_forward.stageSlotForwardRows(k + 1) - 1;
++    if (stageHolderIs(sch, slot)) return qwen4_forward.stageSlotForwardRows(0) - 1;
++    return 0;
++}
++/// R69: the request's layers [first, 48) come back from its extra slot into Sushi's caches (the R66d pull-back) and the
++/// slot is freed on the stage. True when Sushi's caches then hold the request whole. Between ticks only.
++fn stageExtraPullOut(sch: *Scheduler, k: usize) bool {
++    const h = sch.stage_extra[k] orelse return true;
++    sch.stage_extra[k] = null;
++    const owner = qwen4_forward.stageOwner(&h.ctx);
++    var whole = false;
++    if (h.model.transformer) |xf| {
++        if (h.ssm_entries) |ents| _ = qwen4_forward.stagePullbackTurnEnd(xf, &h.cache, ents);
++        whole = qwen4_forward.stageCachesWhole(xf, &h.cache);
++    }
++    qwen4_forward.stageAssignSlot(owner, 0);
++    if (!qwen4_forward.stageDropSlot(k + 1)) log.warn("[stage] slot {d}: drop failed\n", .{k + 1});
++    sch.stage_slot_drop[k] = false;
++    if (whole) qwen4_forward.stageSplitForget(&h.cache);
++    return whole;
++}
++/// R69: an extra slot ends early (slot 0 is about to need its rows, or its own request is about to outgrow it): its
++/// request decodes on the Mac from here on. Between ticks only (no stage wait open).
++fn stageEvictExtra(sch: *Scheduler, k: usize, why: []const u8) void {
++    const h = sch.stage_extra[k] orelse return;
++    if (stageExtraPullOut(sch, k)) {
++        if (h.legacy_gen) |*g| g.stage_allowed = false;
++        log.info("[stage] slot {d}: evicted ({s}); its request continues on the Mac\n", .{ k + 1, why });
++    } else {
++        // its state did not come back: give the stage up (every split request re-runs on the Mac at the next tick, the
++        // path any stage failure takes)
++        log.warn("[stage] slot {d}: evicted ({s}) without its state; giving the stage up\n", .{ k + 1, why });
++        stage_split_give_up("extra slot eviction: its state did not come back");
++    }
++}
++/// R69: slot 0 needs `need` rows: the occupied extra slots in its way leave, lowest rows first.
++fn stageMakeRoomForSlot0(sch: *Scheduler, need: usize, why: []const u8) void {
++    var k: usize = STAGE_EXTRA_MAX;
++    while (k > 0) {
++        k -= 1;
++        if (sch.stage_extra[k] != null and need > stageSlotBase(k)) stageEvictExtra(sch, k, why);
++    }
++}
++/// R69: slot 0 is free while a request decodes on an extra slot with fewer verify rows than slot 0: it moves to slot 0
++/// (pull-back, then its next forward seeds slot 0), so a request left alone runs exactly as a single stream does.
++fn stageMoveToSlot0(sch: *Scheduler) void {
++    if (sch.stage_holder != null) return;
++    var best: ?usize = null;
++    var best_left: u64 = 0;
++    for (sch.stage_extra, 0..) |maybe, k| {
++        const h = maybe orelse continue;
++        if (h.finished or h.error_code != null or h.cancelled.load(.acquire)) continue;
++        if (qwen4_forward.stageSlotForwardRows(k + 1) >= qwen4_forward.stageSlotForwardRows(0)) continue;
++        const g = if (h.legacy_gen) |*gg| gg else continue;
++        if (g.done) continue;
++        // it must fit below the other occupied extra slots
++        var limit = stageCapacity();
++        for (sch.stage_extra, 0..) |o, ko| if (o != null and ko != k) {
++            limit = @min(limit, stageSlotBase(ko));
++        };
++        if (stageSlotNeed(h) > limit) continue;
++        const made: u64 = g.generated_ids.items.len;
++        const left: u64 = if (h.max_tokens > made) h.max_tokens - made else 0;
++        if (best == null or left > best_left) {
++            best = k;
++            best_left = left;
++        }
++    }
++    const k = best orelse return;
++    const h = sch.stage_extra[k].?;
++    if (stageExtraPullOut(sch, k)) {
++        sch.stage_holder = h;
++        log.info("[stage] slot {d}: its request moves to slot 0 ({d} tokens left)\n", .{ k + 1, best_left });
++    } else {
++        log.warn("[stage] slot {d}: move to slot 0 without its state; giving the stage up\n", .{k + 1});
++        stage_split_give_up("move to slot 0: its state did not come back");
++    }
++}
++/// R69: before a tick, extra slots leave if a request is about to cross the line between slots; a request left on a
++/// narrower extra slot with slot 0 free moves there.
++fn stageSlotGuard(sch: *Scheduler) void {
++    for (sch.stage_extra, 0..) |maybe, k| {
++        const h = maybe orelse continue;
++        if (h.finished or h.error_code != null) continue;
++        if (stageSlotNeed(h) > stageSlotRows()) stageEvictExtra(sch, k, "its request outgrew the slot");
++    }
++    if (sch.stage_holder) |h0| stageMakeRoomForSlot0(sch, stageSlotNeed(h0), "slot 0 needs its rows");
++    stageMoveToSlot0(sch);
++}
++/// The holder ended: the stage passes to the decoding foreground request with the most tokens left to generate, whose
++/// next forward seeds it from Sushi's caches (a Mac-only request's are whole). None decoding: the next prefill claims it.
++fn stageHolderRelease(sch: *Scheduler, slot: *Slot) void {
++    if (stageExtraOf(sch, slot)) |k| {
++        // R69: the extra slot frees (its rows go back to slot 0's reach) and passes to another decoding request
++        sch.stage_extra[k] = null;
++        qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&slot.ctx), 0);
++        // the next holder's first forward seeds over the slot; with none, free it at the next tick (a release can run
++        // inside another holder's stage wait, where no stage call may go out)
++        stagePromoteExtra(sch, k, slot);
++        sch.stage_slot_drop[k] = sch.stage_extra[k] == null;
++        return;
++    }
++    if (!stageHolderIs(sch, slot)) return;
++    sch.stage_holder = null;
++    if (!stageMultiStream(sch)) return;
++    var best: ?*Slot = null;
++    var best_left: u64 = 0;
++    const limit0 = stageSlot0Limit(sch);
++    for (sch.decoding.items) |s| {
++        if (s == slot or s.background or stageExtraOf(sch, s) != null) continue;
++        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
++        if (stageSlotNeed(s) > limit0) continue;
++        const g = if (s.legacy_gen) |*gg| gg else continue;
++        if (g.done) continue;
++        const made: u64 = g.generated_ids.items.len;
++        const left: u64 = if (s.max_tokens > made) s.max_tokens - made else 0;
++        if (best == null or left > best_left) {
++            best = s;
++            best_left = left;
++        }
++    }
++    if (best) |b| {
++        sch.stage_holder = b;
++        b.legacy_gen.?.stage_allowed = true;
++        log.info("[stage] holder: the 5090 passes to another in-flight request ({d} tokens left)\n", .{best_left});
++    }
++}
++
++/// R69: extra slot k passes to the decoding foreground request (not on the stage) with the most tokens left that fits;
++/// its next forward seeds the slot from Sushi's caches (a Mac-only request's are whole).
++fn stagePromoteExtra(sch: *Scheduler, k: usize, except: *const Slot) void {
++    if (k >= stageExtraCount() or !stageMultiStream(sch)) return;
++    if (sch.stage_holder) |h0| if (stageSlotNeed(h0) > stageSlotBase(k)) return;
++    var best: ?*Slot = null;
++    var best_left: u64 = 0;
++    for (sch.decoding.items) |s| {
++        if (s == except or s.background or stageOnStage(sch, s)) continue;
++        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
++        const g = if (s.legacy_gen) |*gg| gg else continue;
++        if (g.done) continue;
++        const made: u64 = g.generated_ids.items.len;
++        const left: u64 = if (s.max_tokens > made) s.max_tokens - made else 0;
++        if (!stageSlotFits(s.full_prompt.len + @as(usize, @intCast(made)), @intCast(@min(left, std.math.maxInt(u32))))) continue;
++        if (best == null or left > best_left) {
++            best = s;
++            best_left = left;
++        }
++    }
++    if (best) |b| {
++        sch.stage_extra[k] = b;
++        b.legacy_gen.?.stage_allowed = true;
++        qwen4_forward.stageAssignSlot(qwen4_forward.stageOwner(&b.ctx), @intCast(k + 1));
++        log.info("[stage] slot {d}: passes to another in-flight request ({d} tokens left)\n", .{ k + 1, best_left });
++    }
++}
++
++/// R67 multi-stream: the stage holder decodes alone, through the 5090, before and apart from the MTP group planner and
++/// the groups, which see only the requests running on the Mac. A holder the planner still owns (promoted from the Mac
++/// side) stays with the planner until its head's hidden is fresh, then leaves it for good.
+ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+     if (active.len == 0) return;
++    // SUSHI_STAGE_MS_TRACE=1: where a multi-stream tick's time goes (every 200 ticks of two or more requests)
++    const tracing = active.len > 1 and msTraceOn() and ms_trace.depth == 0;
++    const t_enter = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
++    if (tracing) {
++        if (ms_trace.last_end != 0) ms_trace.gap_ns += t_enter - ms_trace.last_end;
++        ms_trace.rows += active.len;
++    }
++    ms_trace.depth += 1;
++    defer {
++        ms_trace.depth -= 1;
++        if (tracing) msTraceTickEnd(t_enter);
++    }
++    // R69: extra slots leave before a request crosses the line between slots; a slot left empty is freed here, outside
++    // every stage wait and split prefill
++    if (ms_trace.depth == 1 and qwen4_forward.stagePrefillInflight() == 0 and stageMultiStream(sch)) {
++        if (stageAnyExtra(sch)) stageSlotGuard(sch);
++        for (&sch.stage_slot_drop, 0..) |*d, k| if (d.* and sch.stage_extra[k] == null) {
++            d.* = false;
++            if (!qwen4_forward.stageDropSlot(k + 1)) log.warn("[stage] slot {d}: drop failed\n", .{k + 1});
++        };
++    }
++    if (active.len <= MAX_BATCH_GROUP and (sch.stage_holder != null or stageAnyExtra(sch)) and stageMultiStream(sch)) {
++        var rest: [MAX_BATCH_GROUP]*Slot = undefined;
++        var n: usize = 0;
++        var holders: [1 + STAGE_EXTRA_MAX]*Slot = undefined;
++        var hn: usize = 0;
++        // R69: an extra slot's holder sits a tick out while a split prefill (slot 0's request) has chunks on the stage:
++        // the socket carries one stream of replies, and its layers [first, 48) live on the stage, so it cannot decode
++        // on the Mac either. It is in no list this tick.
++        const prefill_busy = qwen4_forward.stagePrefillInflight() > 0;
++        var sat_out = false;
++        for (active) |s| {
++            const extra = stageExtraOf(sch, s) != null;
++            if ((extra or stageHolderIs(sch, s)) and stageHolderSolo(s) and hn < holders.len) {
++                if (extra and prefill_busy) {
++                    sat_out = true;
++                } else {
++                    holders[hn] = s;
++                    hn += 1;
++                }
++            } else {
++                rest[n] = s;
++                n += 1;
++            }
++        }
++        if (hn == 0 and sat_out) {
++            if (n > 0) try runDecodeTickShared(sch, rest[0..n]);
++            return;
++        }
++        if (hn >= 2) {
++            // R69: several stage slots, interleaved: each holder's 5090 half hides behind the others' Mac halves
++            defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
++            for (holders[0..hn]) |h| holderPrep(h, false);
++            const th0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
++            try runSplitGroup(sch, holders[0..hn], rest[0..n]);
++            if (tracing) {
++                ms_trace.pair_ns += @import("qwen4_exp.zig").nowBootNs() - th0;
++                ms_trace.pair_n += 1;
++                ms_trace.pair_holders += hn;
++            }
++            return;
++        }
++        if (hn == 1) {
++            const h = holders[0];
++            defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
++            holderPrep(h, active.len == 1);
++            // The Mac-only requests decode inside the holder's stage wait when its round reaches one (overlap);
++            // otherwise after it, as before.
++            const overlap = n > 0 and stageOverlapWanted();
++            if (overlap) {
++                ms_hook = .{ .sch = sch, .rest = rest[0..n] };
++                qwen4_forward.stageSetWaitHook(&msWaitHook);
++            }
++            defer if (overlap) {
++                qwen4_forward.stageSetWaitHook(null);
++                ms_hook = .{};
++            };
++            const th0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
++            if (h.error_code == null) try runSingleDecodeTick(sch, h);
++            if (tracing) {
++                ms_trace.holder_ns += @import("qwen4_exp.zig").nowBootNs() - th0;
++                ms_trace.holder_n += 1;
++            }
++            if (overlap) {
++                qwen4_forward.stageSetWaitHook(null);
++                if (ms_hook.err) |e| return e;
++                if (ms_hook.ran) return;
++            }
++            const tr0 = if (tracing) @import("qwen4_exp.zig").nowBootNs() else 0;
++            if (n > 0) try runDecodeTickShared(sch, rest[0..n]);
++            if (tracing and n > 0) {
++                ms_trace.rest_ns += @import("qwen4_exp.zig").nowBootNs() - tr0;
++                ms_trace.rest_n += 1;
++            }
++            return;
++        }
++    }
++    return runDecodeTickShared(sch, active);
++}
++
++/// R67 overlap: what the stage wait hook decodes (set for one holder tick).
++const MsHook = struct {
++    sch: ?*Scheduler = null,
++    rest: []*Slot = &.{},
++    ran: bool = false,
++    err: ?anyerror = null,
++};
++var ms_hook: MsHook = .{};
++fn msWaitHook() callconv(.c) void {
++    if (ms_hook.ran) return;
++    const sch = ms_hook.sch orelse return;
++    ms_hook.ran = true;
++    const t0 = if (msTraceOn()) @import("qwen4_exp.zig").nowBootNs() else 0;
++    runDecodeTickShared(sch, ms_hook.rest) catch |e| {
++        ms_hook.err = e;
++    };
++    if (msTraceOn()) {
++        ms_trace.hook_ns += @import("qwen4_exp.zig").nowBootNs() - t0;
++        ms_trace.hook_n += 1;
++    }
++}
++const MsTrace = struct {
++    depth: u32 = 0,
++    n: u64 = 0,
++    rows: u64 = 0,
++    total_ns: u64 = 0,
++    gap_ns: u64 = 0,
++    holder_ns: u64 = 0,
++    holder_n: u64 = 0,
++    hook_ns: u64 = 0,
++    hook_n: u64 = 0,
++    rest_ns: u64 = 0,
++    rest_n: u64 = 0,
++    pair_ns: u64 = 0,
++    pair_n: u64 = 0,
++    /// R69 group tick parts: every holder's begin (draft, layers [0, first), send), the early finishes, the Mac-only
++    /// requests, the last finish
++    pair_parts: [4]u64 = @splat(0),
++    pair_holders: u64 = 0,
++    last_end: u64 = 0,
++};
++fn msLap(acc: *u64, t0: u64) u64 {
++    const t1 = @import("qwen4_exp.zig").nowBootNs();
++    acc.* += t1 - t0;
++    return t1;
++}
++var ms_trace: MsTrace = .{};
++var ms_trace_env: ?bool = null;
++fn msTraceOn() bool {
++    if (ms_trace_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_MS_TRACE");
++    const v = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
++    ms_trace_env = v;
++    return v;
++}
++fn msTraceTickEnd(t_enter: u64) void {
++    const now = @import("qwen4_exp.zig").nowBootNs();
++    ms_trace.total_ns += now - t_enter;
++    ms_trace.last_end = now;
++    ms_trace.n += 1;
++    if (ms_trace.n < 200) return;
++    const t = &ms_trace;
++    const ms = struct {
++        fn f(ns: u64, n: u64) f64 {
++            return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
++        }
++    }.f;
++    log.info("[ms-trace] {d} ticks, {d:.1} rows: tick {d:.2} ms + gap {d:.2} ms; holder round {d:.2} ms x{d} (inside it, Mac-only tick {d:.2} ms x{d}); Mac-only tick after {d:.2} ms x{d}; slot pair {d:.2} ms x{d}\n", .{
++        t.n, @as(f64, @floatFromInt(t.rows)) / @as(f64, @floatFromInt(t.n)), ms(t.total_ns, t.n), ms(t.gap_ns, t.n),
++        ms(t.holder_ns, t.holder_n), t.holder_n, ms(t.hook_ns, t.hook_n), t.hook_n, ms(t.rest_ns, t.rest_n), t.rest_n,
++        ms(t.pair_ns, t.pair_n), t.pair_n,
++    });
++    if (t.pair_n > 0) log.info("[ms-trace] group parts (ms), {d:.1} holders: begins {d:.2}, early finishes {d:.2}, Mac-only {d:.2}, last finish {d:.2}\n", .{
++        @as(f64, @floatFromInt(t.pair_holders)) / @as(f64, @floatFromInt(t.pair_n)),
++        ms(t.pair_parts[0], t.pair_n), ms(t.pair_parts[1], t.pair_n), ms(t.pair_parts[2], t.pair_n), ms(t.pair_parts[3], t.pair_n),
++    });
++    const keep_last = t.last_end;
++    t.* = .{};
++    t.last_end = keep_last;
++}
++/// SUSHI_STAGE_MS_OVERLAP=0 decodes the Mac-only requests after the holder's round instead of inside its stage wait.
++var stage_ms_overlap_env: ?bool = null;
++fn stageOverlapWanted() bool {
++    if (stage_ms_overlap_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_STAGE_MS_OVERLAP");
++    const v = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else true;
++    stage_ms_overlap_env = v;
++    return v;
++}
++
++/// A stage holder about to decode outside the planner (R67/R69): its planner state cleared, its head detached once.
++fn holderPrep(h: *Slot, solo: bool) void {
++    if (h.legacy_gen) |*g| {
++        g.spec_cost_solo = solo;
++        g.mtp_planner_width = null;
++        g.mtp_planner_probe = false;
++        g.mtp_planner_recovering = false;
++        g.mtp_planner_pending = false;
++        if (g.mtp_planner_owned) {
++            g.mtpDetachHead(h.allocator, true) catch |e| h.markError(@errorName(e));
++            g.mtp_planner_owned = false;
++            log.info("[stage] holder: leaves the MTP group planner\n", .{});
++        }
++    }
++    h.planner_plain_transition = false;
++    h.planner_force_plain = false;
++}
++
++/// R69: one tick of the stage holders on their slots: each holder's draft and layers [0, first) and send in turn (the
++/// one before it computes on the 5090 meanwhile), then each one's tail; the Mac-only requests run before the last tail
++/// (that holder's 5090 half runs meanwhile). A holder whose tick is not an MTP round runs whole at its turn.
++fn runSplitGroup(sch: *Scheduler, hs: []*Slot, rest: []*Slot) !void {
++    const tr = msTraceOn();
++    var t = if (tr) @import("qwen4_exp.zig").nowBootNs() else 0;
++    var rounds: [1 + STAGE_EXTRA_MAX]?SplitRound = @splat(null);
++    errdefer for (hs, 0..) |h, i| if (rounds[i]) |*r| r.st.deinit(h.allocator);
++    for (hs, 0..) |h, i| {
++        rounds[i] = if (h.error_code == null) try splitRoundBegin(sch, h) else null;
++    }
++    if (tr) t = msLap(&ms_trace.pair_parts[0], t);
++    for (hs, 0..) |h, i| {
++        if (i + 1 == hs.len) {
++            if (tr) t = msLap(&ms_trace.pair_parts[1], t);
++            if (rest.len > 0) try runDecodeTickShared(sch, rest);
++            if (tr) t = msLap(&ms_trace.pair_parts[2], t);
++        }
++        if (rounds[i]) |r0| {
++            var r = r0;
++            rounds[i] = null;
++            try splitRoundFinish(sch, h, &r);
++        }
++    }
++    if (tr) t = msLap(&ms_trace.pair_parts[3], t);
++    mlx.checkErrorDecode() catch |mlx_err| {
++        log.err("[scheduler] split group aborted: MLX failure mid-generation ({s})\n", .{@errorName(mlx_err)});
++        for (hs) |h| h.markError(@errorName(mlx_err));
++    };
++}
++
++var r69_debug_env: ?bool = null;
++fn r69Debug() bool {
++    if (r69_debug_env) |v| return v;
++    const raw = std.c.getenv("SUSHI_R69_DEBUG");
++    const v = if (raw) |x| std.mem.eql(u8, std.mem.sliceTo(x, 0), "1") else false;
++    r69_debug_env = v;
++    return v;
++}
++const SplitRound = struct {
++    st: Generator.MtpRoundState,
++    sent: bool,
++    prev_split: bool,
++};
++
++/// R69: the first half of a stage holder's MTP round. null: the slot's tick is already complete (it finished, the loop
++/// guard stopped it, or it was not an MTP round and ran whole).
++fn splitRoundBegin(sch: *Scheduler, slot: *Slot) !?SplitRound {
++    const gen = if (slot.legacy_gen) |*g| g else {
++        slot.markError("no_generator");
++        return null;
++    };
++    const mtp_mode = !thinkBoundFired(gen) and specTickMode(slot.enable_mtp, gen.mtp != null, slot.enable_drafter, gen.dflash != null) == .mtp;
++    if (!mtp_mode) {
++        try runSingleDecodeTick(sch, slot);
++        return null;
++    }
++    if (try loopGuardTick(sch, slot, gen)) return null;
++    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
++    gen.mtp_group_cap = stageDraftCap(sch, slot);
++    const prev_split = gen.ctx.stage_split;
++    gen.ctx.stage_split = gen.stage_allowed and qwen4_forward.stageDecodeEnabled() and (gen.ctx.mrope_pos == null or qwen4_forward.stageMropeEnabled());
++    errdefer gen.ctx.stage_split = prev_split;
++    var st = switch (try gen.mtpRoundBegin(slot.allocator)) {
++        .done => |r| {
++            gen.ctx.stage_split = prev_split;
++            publishMtpResult(sch, slot, gen, r);
++            return null;
++        },
++        .verify => |v| v,
++        .open => |o| try gen.mtpRoundContinue(slot.allocator, o),
++    };
++    errdefer st.deinit(slot.allocator);
++    const sent = try gen.mtpRoundVerifyPre(&st);
++    if (r69Debug()) log.info("[r69] begin slot={d} sent={} head_ids={}\n", .{ qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&gen.ctx)), sent, gen.ctx.stage_head_ids.ctx != null });
++    return .{ .st = st, .sent = sent, .prev_split = prev_split };
++}
++
++/// R69: the second half: receive (when the first half sent), accept, publish.
++fn splitRoundFinish(sch: *Scheduler, slot: *Slot, r: *SplitRound) !void {
++    const gen = &slot.legacy_gen.?;
++    defer gen.ctx.stage_split = r.prev_split;
++    defer r.st.deinit(slot.allocator);
++    if (r.sent) try gen.mtpRoundVerifyPost(&r.st);
++    if (r69Debug()) log.info("[r69] finish slot={d} sent={} head_ids={} head_flag={} rows={d}\n", .{ qwen4_forward.stageSlotOf(qwen4_forward.stageOwner(&gen.ctx)), r.sent, gen.ctx.stage_head_ids.ctx != null, gen.ctx.stage_verify_head, gen.ctx.stage_verify_rows });
++    const result = try gen.mtpRoundFinish(slot.allocator, &r.st);
++    publishMtpResult(sch, slot, gen, result);
++}
++
++/// May the holder decode alone this tick? Not while the planner owns it with a stale head hidden: only the planner's
++/// next prime or round refreshes it.
++fn stageHolderSolo(s: *const Slot) bool {
++    const g = if (s.legacy_gen) |*gg| gg else return true;
++    return !(Planner.enabled() and g.mtp_planner_owned and g.mtp_hidden_stale);
++}
++
++fn runDecodeTickShared(sch: *Scheduler, active: []*Slot) !void {
++    if (active.len == 0) return;
+ 
+     // Publish the in-flight generated-token aggregate for the gauge sampler.
+     // Runs after the whole tick (all decode work + any finishSlot calls) on
+@@ -7450,6 +8565,11 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+     var glm_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+     var glm_n: usize = 0;
+     for (active) |s| {
++        // R67: the stage holder decodes alone (through the 5090); the others group as usual, on the Mac
++        if (stageHolderIs(sch, s) and stageMultiStream(sch)) {
++            try runSingleDecodeTick(sch, s);
++            continue;
++        }
+         const why = sch.batchVerdict(s);
+         if (why == .ok and batchable_n < batchable_buf.len) {
+             batchable_buf[batchable_n] = s;
+@@ -7531,11 +8651,28 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+         var group = batchable_buf[start..end];
+         const row_cap = if (group[0].model.config) |c| batchGroupCap(c) else MAX_BATCH_GROUP;
+         if (group.len > row_cap) {
+-            for (group[row_cap..]) |s| {
+-                noteSerial(sch, s, .row_cap);
+-                try runSingleDecodeTick(sch, s);
++            const per_row = if (group[0].model.transformer) |t| t.supportsBatchedQwen4Rows() else false;
++            if (per_row) {
++                // R67 multi-stream: past the cap, further batched groups of balanced size (per-row attention pads
++                // nothing), not one solo round per slot
++                const k = (group.len + row_cap - 1) / row_cap;
++                const size = (group.len + k - 1) / k;
++                var c0: usize = size;
++                while (c0 < group.len) : (c0 += size) {
++                    const chunk = group[c0..@min(group.len, c0 + size)];
++                    if (chunk.len >= 2) {
++                        if (sch.metrics) |m| m.batched_group_size.set(chunk.len);
++                        try runBatchedDecodeTick(sch, chunk);
++                    } else try runSingleDecodeTick(sch, chunk[0]);
++                }
++                group = group[0..size];
++            } else {
++                for (group[row_cap..]) |s| {
++                    noteSerial(sch, s, .row_cap);
++                    try runSingleDecodeTick(sch, s);
++                }
++                group = group[0..row_cap];
+             }
+-            group = group[0..row_cap];
+         }
+         // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
+         const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
+@@ -7897,7 +9034,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
+         gen.dflash != null,
+     );
+     if (tick_mode == .mtp) {
+-        gen.mtp_group_cap = 0;
++        gen.mtp_group_cap = stageDraftCap(sch, slot); // R69: a stage slot's verify rows; 0 (no cap) elsewhere
+         const result = try gen.nextMtp(slot.allocator);
+         if (result == null) {
+             finishSlot(sch, slot, gen.finish_reason);
+@@ -8084,17 +9221,20 @@ test "the inference loop parks without holding the sleep-inhibition assertion" {
      const source = @embedFile("scheduler.zig");
      const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
      const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
@@ -4184,8 +5987,19 @@ index 8adeb60a..9c9a059f 100644
  }
  
  test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
+@@ -8661,7 +9801,9 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
+         const gen = &slot.legacy_gen.?;
+         slot.planner_plain_transition = gen.mtp_hist_stash != null or gen.mtp_pre_draft != null or prime;
+         if (gen.mtp != null) try gen.mtpDetachHead(slot.allocator, true);
+-        slot.mtp_plain_tick = execution.capture[row];
++        // R67/R69: a stage holder still with the planner (promoted from the Mac side) captures its head hidden on this
++        // plain tick, so it leaves for the stage at the next one (plain ticks alone never refresh it)
++        slot.mtp_plain_tick = execution.capture[row] or (stageMultiStream(sch) and stageOnStage(sch, slot));
+         plains[i] = slot;
+     }
+     for (execution.speculative[0..pn], 0..) |row, i| {
 diff --git a/src/server.zig b/src/server.zig
-index 979f298a..7d811111 100644
+index 979f298a..7c59f1b9 100644
 --- a/src/server.zig
 +++ b/src/server.zig
 @@ -1,4 +1,5 @@
@@ -4203,7 +6017,16 @@ index 979f298a..7d811111 100644
  
      // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
      //    requires the key (the OpenAI/Anthropic APIs AND the metrics feed) —
-@@ -6505,6 +6508,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+@@ -6223,6 +6226,8 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
+ /// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
+ fn ssmResidentCap(config: *const model_mod.ModelConfig) ?u64 {
+     if (!config.isQwen4() or !diskTierOn(config)) return null;
++    // texas-split R66: the request keeps every checkpoint (`scheduler.qwenCheckpointCapped`); bill them all.
++    if (prefix_cache_mod.hotKeepsAllCheckpoints()) return null;
+     return transformer_mod.SSM_RESIDENT_MAX;
+ }
+ 
+@@ -6505,6 +6510,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
              .message = if (context_refusal) |r| memoryContextRefusalMessage(buf, r) else PREFILL_NOFIT_MSG,
          },
          // Refused at submit, so every surface answers it the same way.
@@ -4218,7 +6041,7 @@ index 979f298a..7d811111 100644
          error.EmptyPrompt => .{
              .status_line = "400 Bad Request",
              .code = 400,
-@@ -9531,6 +9542,10 @@ fn handleChatCompletions(
+@@ -9531,6 +9544,10 @@ fn handleChatCompletions(
      defer allocator.free(prompt_ids);
      enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
  
@@ -4229,7 +6052,7 @@ index 979f298a..7d811111 100644
      // Enforce context size limit
      const effective_ctx = getEffectiveContextLength(config);
      if (prompt_ids.len > effective_ctx) {
-@@ -9789,6 +9804,10 @@ fn handleCompletions(
+@@ -9789,6 +9806,10 @@ fn handleCompletions(
      }
      enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
  
@@ -4403,7 +6226,7 @@ index 00000000..a2a64000
 +    try std.testing.expect(!restoreFits(128*gib,std.math.maxInt(u64)));
 +}
 diff --git a/src/transformer.zig b/src/transformer.zig
-index c90ff413..80f16f19 100644
+index c90ff413..98b12668 100644
 --- a/src/transformer.zig
 +++ b/src/transformer.zig
 @@ -12860,6 +12860,9 @@ pub const ForwardCtx = struct {
@@ -4416,7 +6239,7 @@ index c90ff413..80f16f19 100644
      /// qwen4_exp: receives the PRE-mixer hyper-connection stream `[B, L,
      /// hc*hidden]` (all positions) — what the MTP head consumes.
      capture_stream_all: ?*mlx.mlx_array = null,
-@@ -12891,6 +12894,15 @@ pub const ForwardCtx = struct {
+@@ -12891,6 +12894,24 @@ pub const ForwardCtx = struct {
      /// for the verify pass on a GDN model; the flag reaches the layers via
      /// `Transformer.spec_capture_ssm`.
      capture_ssm_seq: bool = false,
@@ -4429,10 +6252,19 @@ index c90ff413..80f16f19 100644
 +    stage_prefill: u8 = 0,
 +    /// Set by an async stage-prefill forward that returned early.
 +    stage_prefill_sent: bool = false,
++    /// texas-split R68: an M-RoPE request whose prefill rows are all text at one rotary offset (no image in the uncached
++    /// part) sends them through the stage's prefill with this offset; null = M-RoPE prefill stays on the Mac.
++    stage_prefill_delta: ?i32 = null,
++    /// texas-split R69 (interleaved stage slots): a split verify/decode forward sends its rows at the stage boundary and
++    /// returns (`stage_verify_sent`); `forwardWithCaptureAllResume` receives them and finishes the forward.
++    stage_async_verify: bool = false,
++    stage_verify_sent: bool = false,
++    stage_verify_head: bool = false,
++    stage_verify_rows: c_int = 0,
      /// MiMo spec verify: every row of this multi-row forward computes with its
      /// own decode tick's arithmetic (`mimoVerifyRowsAttn`), so greedy MTP is serial.
      verify_rows: bool = false,
-@@ -12954,6 +12966,14 @@ pub const ForwardCtx = struct {
+@@ -12954,6 +12975,14 @@ pub const ForwardCtx = struct {
      /// certified-below-the-winner elsewhere — exactly enough for an argmax,
      /// not for a tail distribution. Default false = dense path everywhere.
      argmax_only: bool = false,
@@ -4447,7 +6279,33 @@ index c90ff413..80f16f19 100644
      /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
      /// Non-null means: this forward runs at `batch == batch_slots.len`,
      /// `seq_len == 1`, and every per-slot KV cache lives on the slot ctxs
-@@ -16846,8 +16866,10 @@ pub const Transformer = struct {
+@@ -16116,6 +16145,25 @@ pub const Transformer = struct {
+         return self.forwardWith(ctx, token_ids);
+     }
+ 
++    /// texas-split R69: the second half of an async split forward (`ForwardCtx.stage_async_verify`): the stage's rows,
++    /// the hidden captures and the head, as the forward would have finished.
++    pub fn forwardWithCaptureAllResume(
++        self: *Transformer,
++        ctx: *ForwardCtx,
++        out_hidden: *mlx.mlx_array,
++        out_hidden_all: *mlx.mlx_array,
++    ) !mlx.mlx_array {
++        const saved = ctx.capture_hidden;
++        const saved_all = ctx.capture_hidden_all;
++        ctx.capture_hidden = out_hidden;
++        ctx.capture_hidden_all = out_hidden_all;
++        defer {
++            ctx.capture_hidden = saved;
++            ctx.capture_hidden_all = saved_all;
++        }
++        return @import("qwen4_forward.zig").forwardQwen4Resume(self, ctx);
++    }
++
+     // ── BERT encoder-only forward pass ──
+ 
+     // ── Standard forward pass (Gemma / Llama / Qwen3 / Gemma4) ──
+@@ -16846,8 +16894,10 @@ pub const Transformer = struct {
          const ids_c = try self.plePrepareIds(token_ids);
          defer _ = mlx.mlx_array_free(ids_c);
          var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
@@ -4458,7 +6316,7 @@ index c90ff413..80f16f19 100644
          return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
      }
  
-@@ -16909,11 +16931,14 @@ pub const Transformer = struct {
+@@ -16909,11 +16959,14 @@ pub const Transformer = struct {
          defer if (!raw_bf16) self.allocator.free(host);
          var gclk: ProfClock = if (diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
          const kv_len: u64 = @intCast(ctx.moe_seq_offset.*);
@@ -4473,7 +6331,7 @@ index c90ff413..80f16f19 100644
          if (diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
          if (!raw_bf16) {
              std.debug.assert(pk.len == host.len);
-@@ -25808,7 +25833,9 @@ const MTP_COARSE_PAIRS_SOURCE =
+@@ -25808,7 +25861,9 @@ const MTP_COARSE_PAIRS_SOURCE =
      \\}
  ;
  var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -4484,7 +6342,7 @@ index c90ff413..80f16f19 100644
  
  pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, gs: u32) !?mlx.mlx_array {
      if (!mlx.streamIsGpu(s) or !verifySharedHardware() or bits != 3 or gs != 64) return null;
-@@ -25818,7 +25845,11 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
+@@ -25818,7 +25873,11 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
      const ws = mlx.getShape(w);
      const ss = mlx.getShape(sc);
      if (xs.len != 3 or xs[0] < 2 or xs[0] > 8 or xs[1] != 1 or xs[2] != 2560) return null;
@@ -4497,7 +6355,7 @@ index c90ff413..80f16f19 100644
      const kernel = blk: {
          if (mtp_coarse_pairs_kernel) |value| break :blk value;
          const ins = [_][*:0]const u8{ "x", "w", "sc", "bi", "K_size", "N_size" };
-@@ -25833,17 +25864,18 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
+@@ -25833,17 +25892,18 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
          break :blk value;
      };
      const cfg = blk: {
@@ -4521,7 +6379,7 @@ index c90ff413..80f16f19 100644
      const iv = mlx.mlx_vector_array_new_data(&values, values.len);
      defer _ = mlx.mlx_vector_array_free(iv);
      var ov = mlx.mlx_vector_array_new();
-@@ -26215,6 +26247,66 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
+@@ -26215,6 +26275,66 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
      return result;
  }
  
@@ -4588,7 +6446,7 @@ index c90ff413..80f16f19 100644
  /// The dequant+GEMM prefill route (see the block comment above
  /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
  fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-@@ -26230,6 +26322,16 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
+@@ -26230,6 +26350,16 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
      const xd = mlx.mlx_array_dtype(x);
      if (xd != .bfloat16 and xd != .float16) return null;
  

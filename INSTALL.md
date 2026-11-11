@@ -118,6 +118,10 @@ variables override the file):
 | `TEXAS_SPLIT_DISPLAY_HOLD` | `boot` | hold the display awake around the GPU's cold boot (`always`: whole life) |
 | `TEXAS_SPLIT_VERIFY_PARKS` | 1 | re-read and byte-compare the stage state after every restore |
 | `TEXAS_SPLIT_SUSHI_ENV` | — | extra `SUSHI_*` variables for the engine (JSON object), for experiments |
+| `TEXAS_SPLIT_MAX_CONCURRENT` | 1 | requests generating at once, 1–16 (`bin/texas-split concurrency N` writes it); above 1, up to four decode through the 5090 on conversation slots and the rest run on the Mac |
+| `TEXAS_SPLIT_SLOTS` / `TEXAS_SPLIT_SLOT_ROWS` | 4 / an equal share | conversation slots on the 5090 (at most 4, and at most the concurrency) and rows per extra slot |
+| `TEXAS_SPLIT_STAGE_ENV` | — | extra `QD_*` / `QWEN_*` variables for the stage server (JSON object), for experiments |
+| `TEXAS_SPLIT_STAGE_BIN` / `TEXAS_SPLIT_SUSHI_BIN` | — | other stage / Sushi builds, for experiments (not pinned) |
 
 ## 11. Pins — `./install.sh pins`
 
@@ -131,6 +135,7 @@ bin/texas-split start        # installs ~/Library/LaunchAgents/com.texas-split.s
 bin/texas-split status       # JSON; "status": "ready", "mode": "split" when up
 host/tests/smoke.py          # chat, reasoning, tools, an image, a 35K-token prompt, queueing, cancellation
 bin/texas-split logs --follow
+bin/texas-split concurrency  # shows how many requests generate at once; `concurrency 4` + restart changes it
 bin/texas-split stop
 ```
 
