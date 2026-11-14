@@ -2,7 +2,7 @@
 """texas-split end-to-end smoke test against a running host (default http://127.0.0.1:$TEXAS_SPLIT_PORT, 8003).
 Exercises what a coding agent uses: model listing, streaming chat with reasoning, tool calls
 (streaming and not, then a tool-result turn), an image turn, a long prompt through the split
-prefill, and the queue: one generation at a time by default (a concurrent stream waits), several at
+prefill, a thinking budget reached mid-reply, and the queue: one generation at a time by default (a concurrent stream waits), several at
 once with `texas-split concurrency N` (a second stream starts while the first runs); a client that
 leaves is dropped; a stream cancelled mid-flight frees the engine for the next.
   smoke.py [BASE] [--only NAME,..]"""
@@ -221,6 +221,33 @@ def main():
         check('long_prompt', st == 200 and str(1234 * 7 % 101) in content,
               {'status': st, 'prompt_tokens': (usage or {}).get('prompt_tokens'), 'ttft_s': round(first or -1, 2),
                'total_s': round(total, 2), 'content': content[:80], 'expected': 1234 * 7 % 101})
+
+    if want('think_budget'):
+        # At a thinking budget the engine commits an early-stop line and the think closer through the model
+        # mid-reply. Until 2026-11-13 that forward gave the 5090 up, and the budget was then ignored (the reply was
+        # all thought). The check: the thought stops at the budget (plus the forced line), an answer follows, and
+        # the host is in the mode it was in before. Greedy, so the same reply every time on one build.
+        def host_mode():
+            c1 = conn(10)
+            c1.request('GET', '/health')
+            m = json.loads(c1.getresponse().read()).get('mode')
+            c1.close()
+            return m
+        budget = 48
+        before = host_mode()
+        st, evs, first, total = stream('/v1/chat/completions', {
+            'model': MODEL, 'max_tokens': 400, 'temperature': 0, 'reasoning_budget_tokens': budget,
+            'stream_options': {'include_usage': True},
+            'messages': [{'role': 'user', 'content': 'Six friends (Ana, Ben, Cy, Dee, Eli, Fay) sit in a row of six seats. Ana is not at '
+                          'either end. Ben sits immediately left of Cy. Dee is somewhere right of Fay. Eli is two seats from Ana. Fay is '
+                          'not next to Ben. List every seating that satisfies all of this, and say how many there are.'}]})
+        reasoning, content, tools, finish, usage = assemble(evs)
+        r_tok = ((usage or {}).get('completion_tokens_details') or {}).get('reasoning_tokens')
+        after = host_mode()
+        check('think_budget', st == 200 and bool(reasoning) and bool(content.strip()) and after == before and
+              (r_tok is None or budget <= r_tok <= budget + 40),
+              {'status': st, 'budget': budget, 'reasoning_tokens': r_tok, 'reasoning_chars': len(reasoning), 'content': content[:80],
+               'finish': finish, 'mode_before': before, 'mode_after': after, 'total_s': round(total, 2)})
 
     if want('queue'):
         order, lock = [], threading.Lock()

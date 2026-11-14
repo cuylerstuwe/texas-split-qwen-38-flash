@@ -32,6 +32,11 @@ LM head; prefill is pipelined between the two machines and limited by the Mac's 
 its 20 at ~5.6–6.3K tok/s). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/VALIDATION.md](docs/VALIDATION.md).
 
+**Update 2026-11-13, a fix:** a request whose thinking reached its budget (`reasoning_budget_tokens`, or a
+`reasoning_effort` that sets one) made the engine give the 5090 up and then ignore the budget. It dates from the
+first release and showed the first time a client used budgets. Existing installs: `git pull`,
+`./install.sh sushi pins`, `bin/texas-split restart`. See [CHANGELOG.md](CHANGELOG.md).
+
 **Updates 2026-11-11:** a fix for replies that failed after a 5090 failure in a long conversation; opt-in
 serving of several requests at once (up to four on the 5090 together); follow-up turns keep their place on the
 5090 instead of re-sending or re-prefilling state; warm turns of image sessions prefill through the 5090.

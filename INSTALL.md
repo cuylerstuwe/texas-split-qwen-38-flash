@@ -133,7 +133,7 @@ Records SHA-256 of the binaries and helpers in `runtime/PINS.json`; the host ref
 ```sh
 bin/texas-split start        # installs ~/Library/LaunchAgents/com.texas-split.server.plist and starts it
 bin/texas-split status       # JSON; "status": "ready", "mode": "split" when up
-host/tests/smoke.py          # chat, reasoning, tools, an image, a 35K-token prompt, queueing, cancellation
+host/tests/smoke.py          # chat, reasoning, tools, an image, a 35K-token prompt, a thinking budget, queueing, cancellation
 bin/texas-split logs --follow
 bin/texas-split concurrency  # shows how many requests generate at once; `concurrency 4` + restart changes it
 bin/texas-split stop

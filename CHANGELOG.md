@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-11-13: a reached thinking budget lost the 5090 (fixed)
+
+Existing installs: `git pull`, `./install.sh sushi pins`, `bin/texas-split restart` (Sushi changed; the stage server
+and the driver did not).
+
+A request with a thinking budget (`reasoning_budget_tokens`, or a `reasoning_effort` that maps to one) whose thought
+reached the budget made Sushi give the 5090 up. The host logged `split lost: Sushi gave up on the stage: split decode
+failed in the scheduler`, every request continued on the Mac, and the stack restarted when idle. The budget was then
+ignored for that request: its reply was thought up to `max_tokens`, with no answer. One such request was enough,
+with one request at a time too. It has been there since the first release; nothing had used a thinking budget until
+a client did, and the install this is developed on then lost the 5090 18 times in a day.
+
+- **Cause.** At the budget Sushi commits an early-stop line and the think closer through the model as one
+  multi-token forward (`Generator.commitForcedTokens`; loop recovery inside a thought uses it too). That forward does
+  not pass the decode entry points that route layers 28-47 to the stage, so a request whose state for those layers
+  lives on the 5090 failed the forward's check and the scheduler treated it as a stage failure. The bound had
+  already been marked as fired, so the re-run on the Mac never applied it.
+- **Fix** (`stageBringBack` in `sushi/src/scheduler.zig`). Before the forced commit the request's rows of layers
+  28-47 come back into Sushi's caches (the end-of-turn pull-back, stage op 9, ~22 ms). The forced forward runs on
+  the Mac, and the request's next forward seeds the stage again incrementally (13-15 ms, also at a 19K-token
+  context). The bound is marked fired only once the state is back, so a request that a real stage failure re-runs
+  on the Mac still meets its bound there. Requests without a budget execute nothing new.
+- **Unchanged**, and upstream Sushi's behaviour: after a reached budget the rest of that reply decodes without MTP
+  drafts (about 65-75 tok/s alone).
+- `smoke.py` has an eleventh case, `think_budget`: a greedy request with a 48-token budget must stop its thought at
+  the budget, answer, and leave the host in the mode it was in.
+
+### Validation
+
+On the previous build one request with a 64-token budget reproduces it: the split is lost and the reply is 465
+thinking tokens with no answer. On this build, with one request at a time 5 of 5 replies and with four at once 9 of
+9 (three budget requests on slots beside a plain one; a 19K-token prompt and its second turn) end with the thought
+closed at the budget and an answer, the host in split mode throughout; a greedy request repeated gives the same
+thought and answer. The parking suite is 8/8 exact with one request at a time and with four, smoke passes in both,
+and the greedy four-turn conversation is identical to the previous build's. On the installed service afterwards:
+the budget test 9 of 9, then 17 hours of ordinary use in which 9 more requests reached their budgets, no split
+lost to this; smoke 11/11 with the new case. Details in [docs/VALIDATION.md](docs/VALIDATION.md).
+
+### Known, not fixed here
+
+With several requests at once, a parked background request that resumes while a foreground request holds slot 0
+gives the 5090 up ("resumed background without slot 0"; its request re-runs on the Mac and the stack restarts when
+idle). Seen twice in three days of use.
+
 ## 2026-11-11, second update: several requests at once now pays off on long prompts (a correction)
 
 Existing installs: `git pull`, `./install.sh stage sushi pins`, `bin/texas-split restart` (the stage server and

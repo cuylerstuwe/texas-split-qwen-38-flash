@@ -65,6 +65,10 @@ after layer 47 with the stage's output (`src/qwen4_forward.zig`, `native/stage_s
   response is sent, the stage exports them and the recurrent states (~48 MB, ~25 ms) and Sushi imports them and
   takes a checkpoint at the reply's end, so the next turn resumes after the reply and the conversation's cache
   entry is whole and can go to SSD (§10).
+- **Forced tokens** — when a thought reaches its budget (or loops), Sushi commits an early-stop line and the think
+  closer as one multi-token forward. It has more rows than a stage slot verifies, so it runs on the Mac: the
+  request's rows of layers 28–47 are pulled back first, as at the end of a turn, and its next forward seeds the
+  stage again with the forced rows only ([sushi/FORK.md](../sushi/FORK.md) §15).
 - **Images and video** — vision tokens have 3-D M-RoPE positions, so a prompt with an image or video
   prefills entirely on the Mac; its decode rows are text and go to the stage with the request's rope delta
   (text after an image ropes at position + delta on all three axes). A later turn of such a session whose

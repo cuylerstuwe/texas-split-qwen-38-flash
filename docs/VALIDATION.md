@@ -316,6 +316,31 @@ is dropped; a cancelled stream frees the engine.
   smoke.py 10/10, `fault.py term`, `FAULT_NONCE=x fault.py prefill` and `fault.py long` (116 of 116 copied lines,
   83 after the fault) clean, the host restoring the split by itself after each.
 
+## 2026-11-13 update (see CHANGELOG.md)
+
+- **The bug, reproduced.** Previous build, one request at a time, one greedy request with thinking on and
+  `reasoning_budget_tokens: 64`: the engine logs `[stage] DEAD: split decode failed in the scheduler`, the host goes
+  to `ready` / `mac-only`, and the reply is 465 thinking tokens with no answer (the budget is not applied after the
+  re-run on the Mac).
+- **This build, one request at a time** (the same request; the same again; a second turn of that conversation; a
+  19K-token prompt with a budget and its second turn): 5 of 5 replies end with the thought closed and an answer,
+  87-88 reasoning tokens at a 64-token budget (the budget plus the forced line), the host in split mode after each.
+  The engine counts 5 budgets reached, 5 states brought back, no stage given up; the seeds after the forced forward
+  take 12.8-13.4 ms, including at 19K tokens. The repeated request gives the same thought and the same answer.
+- **Four at once**: the steps above plus three budget requests at once on slots (budgets 64, 80, 96: 87, 103, 120
+  reasoning tokens) beside a plain request: 9 of 9, 8 budgets reached and brought back, no stage given up.
+- **Qualification of this build:** priority suite 8/8 exact with SSD parking (6 pauses, no park errors) with one
+  request at a time and with four; smoke.py passes in both. The greedy four-turn conversation is identical to the
+  previous build's in four interleaved arms (previous, new, new, previous; a fresh host each). Timing of the first
+  pair: cold 23K-token first token 6.61 s (previous) against 6.69 s (new), warm turns 0.46-0.54 s in both, turn
+  totals within about 1%. The second pair ran 10-75% slower on both builds with the Mac at moderate thermal pressure
+  after 25 minutes of back-to-back test hosts, so it says nothing about the change; a clean repeat was not run
+  (the change adds no code to a request without a budget).
+- **On the installed service** (four at once): the budget test 9 of 9 with the split up; then 17 hours of ordinary
+  use: 17 budgets reached in all (8 in the test, 9 in use), every state brought back, no split lost to this;
+  smoke.py 11/11 with the new `think_budget` case (72 reasoning tokens at a 48-token budget, mode unchanged).
+- **Seen in that use, not fixed:** one split lost to "resumed background without slot 0" (CHANGELOG).
+
 ## Not covered
 
 Sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated by

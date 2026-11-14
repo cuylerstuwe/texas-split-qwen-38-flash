@@ -267,3 +267,19 @@ prompts side by side it lost time to running the same requests one after another
   slot; a move to slot 0 needs 256 tokens left to generate; the stage client reads the server's own time per op
   from a reply's bytes 8-12 (the shipped server leaves them zero; a measurement build filled them: transport =
   send-to-reply minus that, 16-27 us per forward, so polling the socket instead of sleeping has nothing to win).
+
+## 15. Forced tokens: a reached thinking budget no longer gives the stage up
+
+`Generator.commitForcedTokens` (a thinking budget's early-stop line and closer; loop recovery inside a thought) is
+one multi-token forward through `forwardWith` with `ctx.stage_split` unset: only `next()` and the MTP round functions
+set it. For a sequence resident on the stage the forward returned `error.StageSplitForward` (its resident check:
+Sushi's caches hold no state for layers [first, 48)) and the scheduler's handler gave the stage up; `tb.fired` was
+already set, so the request's re-run on the Mac never met its bound.
+
+`stageBringBack` (`src/scheduler.zig`), called in `thinkBoundTick` and `closeThoughtOnLoop` before anything is
+marked: `stagePullbackTurnEnd` (stage op 9: commits the last round's accepted rows and imports the rows Sushi lacks),
+`stageCachesWhole`, `stageSplitForget`. The forced forward then runs on the Mac and invalidates the client's view of
+the stage for that owner, so the next regular forward seeds, incrementally from the mirror. `tb.fired` is set once
+the state is back. If the state does not come back (the stage is gone) the error takes the path every stage failure
+takes, and the bound fires again on the Mac. Not through the stage: the forced forward has more rows (~24 with this
+pack) than a slot verifies (16; 9 or 4 with several slots).

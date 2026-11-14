@@ -9240,6 +9240,23 @@ fn loopRecoveryAction(tb: *generate_mod.ThinkBound, ids: []const u32, completion
     return .close_thought;
 }
 
+/// texas-split R73: the forced tokens of a thinking budget or of a loop recovery are one multi-token forward that
+/// does not go through the decode entry points that route to the stage (and has more rows than a stage slot
+/// verifies), so it runs on the Mac. A request whose layers [first, 48) live on the stage first gets them back into
+/// Sushi's caches (the end-of-turn pull-back, stage op 9). The stage keeps its rows, and the request's next regular
+/// forward seeds it again with the forced rows only. Until this, the forward failed its resident check and the
+/// scheduler gave the stage up: every thinking budget that was reached lost the split (18 times on 2026-11-13).
+/// An error: the state did not come back (the stage is gone, or holds this request under no valid sequence); the
+/// caller's error path re-runs the request from its tokens on the Mac, as any stage failure does.
+fn stageBringBack(slot: *Slot, gen: *Generator) !void {
+    if (!qwen4_forward.stageResident(&gen.ctx)) return;
+    const xf = slot.model.transformer orelse return error.StageSplitForward;
+    if (slot.ssm_entries) |ents| _ = qwen4_forward.stagePullbackTurnEnd(xf, &slot.cache, ents);
+    if (!qwen4_forward.stageCachesWhole(xf, &slot.cache)) return error.StageSplitForward;
+    qwen4_forward.stageSplitForget(&slot.cache);
+    log.info("[stage] forced tokens: the request's stage rows are back in Sushi's caches; the forced forward runs on the Mac\n", .{});
+}
+
 /// The thought a loop was convicted in is closed instead of the turn ending. The closing line
 /// is built here, not at request start: a request carrying a `think_bound` is refused DFlash2.
 /// True = the slot's tick is spent.
@@ -9252,6 +9269,7 @@ fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         break :blk &lazy.?;
     };
     if (loopRecoveryAction(tb, gen.generated_ids.items, gen.completion_tokens, gen.max_tokens, gen.think_closed_by_loop) == .cut) return false;
+    try stageBringBack(slot, gen); // R73: before anything is marked (a failure re-runs the request on the Mac, where the loop is met again)
     log.warn("[loop-recover] repetition loop inside the thought at {d} generated tokens; closing it\n", .{gen.generated_ids.items.len});
     tb.fired = true;
     gen.think_closed_by_loop = true;
@@ -9266,11 +9284,14 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
     tb.observe(gen.generated_ids.items);
     if (!tb.due()) return false;
-    tb.fired = true;
     if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tb.forced.len + 1)) {
+        tb.fired = true;
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
         return false;
     }
+    // R73: before the bound is marked fired, so a request that a stage failure re-runs on the Mac meets its bound there
+    try stageBringBack(slot, gen);
+    tb.fired = true;
     if (!try commitThoughtClose(sch, slot, gen, tb.forced)) {
         log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
     }
