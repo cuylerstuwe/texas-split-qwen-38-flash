@@ -12,6 +12,7 @@ Build (what `install.sh mlx sushi` does): the MLX runtime libraries from the v1.
 ```sh
 xcrun clang++ -std=c++20 -O2 -mmacosx-version-min=26.2 -Ilib/mlx-src -Ilib/mlxc-src -Inative -c native/stage_split.cpp -o native/stage_split.o
 xcrun clang++ -std=c++20 -O2 -mmacosx-version-min=26.2 -Ilib/mlx-src -Ilib/mlxc-src -Inative -c native/texas_checkpoint.cpp -o native/texas_checkpoint.o
+xcrun clang++ -std=c++20 -O2 -mmacosx-version-min=26.2 -fobjc-arc -Ilib/mlx-src -Ilib/mlxc-src -Inative -c native/lean_kernel.mm -o native/lean_kernel.o
 .zig-toolchain/zig build -Doptimize=ReleaseFast --prefix "$PWD/zig-out"
 ```
 
@@ -283,3 +284,95 @@ the stage for that owner, so the next regular forward seeds, incrementally from 
 the state is back. If the state does not come back (the stage is gone) the error takes the path every stage failure
 takes, and the bound fires again on the Mac. Not through the stage: the forced forward has more rows (~24 with this
 pack) than a slot verifies (16; 9 or 4 with several slots).
+
+## 16. Host-side time around the Mac's GPU work (all exact)
+
+The same operations on the same data; greedy and seeded replies are byte-identical with and without each switch. The
+host sets all of them; `'0'` turns each off.
+
+- `SUSHI_R74_LEAN_KERNELS=1` (`native/lean_kernel.mm`, routed in `src/mlx.zig`; built with `-fobjc-arc`, see the
+  build lines above): MLX rebuilds a custom kernel's whole source text for every application and hashes it for every
+  evaluation. After a kernel signature's first application through MLX, later ones create a primitive of the engine's
+  own that holds the compiled pipeline and only binds buffers and dispatches. An application is taken only when its
+  inputs are known to be row contiguous as the graph is built; the rest stay on MLX's path. 8-17% less CPU per decode
+  round on the inference thread.
+- `SUSHI_R74_IDS_EARLY=1`: a split verify asked for its draft ids only at the n-gram layer, behind layer 0; the ids'
+  two small operations are now queued at the forward's start, so the n-gram gather overlaps layer 0 (the idle before
+  each verify 0.92 -> 0.49 ms).
+- `SUSHI_R74_PLE_AHEAD=1`: the next prefill chunk's n-gram rows are read by private workers while the current chunk
+  runs (taken only when the row ids match). `SUSHI_R74_PCOPY=8`: a split prefill chunk's copies to and from the
+  stage's shared memory run on 8 cores. `SUSHI_R74_PF_KEEP_POOL=1`: MLX's buffer pool is no longer emptied after
+  every chunk while 28 GiB is reclaimable (`SUSHI_R74_PF_KEEP_POOL_MIN_GB`); it then holds ~5 GiB more until the
+  prefill ends.
+- Forced tokens after a background resume (section 15's second hole): a thinking budget that fell due at the boundary
+  where a background request had been parked found its stage half in the park file, not on the stage, so the
+  pull-back had nothing to read and the stage was given up. `stageBringBack` now restores the parked half first.
+  Test seam `SUSHI_R74_TEST_PARK=1` (`=2` reproduces the old failure).
+
+Measured on identical work: decode +4%, prefill about 3% less time.
+
+## 17. Agent turns, app calls and the acceptance rule
+
+Set by the host; `'0'` turns each off.
+
+- `SUSHI_R75_LOGPROBS_MTP=1`: a request that asks for logprobs keeps draft decoding. Each committed token's logprob
+  comes from the verify row that committed it (the first token's from the prefill's last row), one batched read per
+  round; not with penalties or a think penalty, and the stage head stays off for such requests (a top-20 row cannot
+  be normalised). Logprobs requests decode at 124-133 tok/s instead of 66; values within 0.007 nats of the serial
+  path's on average, top-5 order identical.
+- `SUSHI_R75_BUDGET_MTP=1`: after a reached thinking budget's forced close the answer re-enters the draft path through
+  the serial-block exit and the stage re-seeds, instead of decoding serially on the Mac (87-90 -> 144-155 tok/s).
+- Always on: a turn that ends with the next round's chain pre-drafted (most tool-call turns) truncates that chain's
+  head entries, so the end-of-turn checkpoint is no longer declined and the next turn resumes at the reply's end.
+- `SUSHI_R75_SYS_CP=2048`: the prefill also checkpoints where the prompt's first message (system and tools block)
+  ends, when that block is 2048 tokens or more: a new session with the same block reached its first token in 0.19 s
+  instead of 2.74 s (a 17.5K-token block in the test).
+- `SUSHI_R75_KEEP_SLOT0=16384`: while the stage's slot 0 holds a finished conversation of 16384 rows or more, a
+  shorter request takes an extra slot (regions above the kept rows), so the conversation's next turn seeds the stage
+  incrementally (12 ms / 49 MB instead of 143 ms / 645 MB over Thunderbolt at 104K). Off while a background request
+  exists anywhere (parked, prefilling, queued or decoding).
+- `SUSHI_R75_IDLE_MAX_GB=12` with `--prefix-cache-entries 16`: the SSD-first idle allowance grows above
+  `--prefix-cache-mem` out of the headroom over 28 GiB of reclaimable memory at each request's end (shrinking again
+  when apps take memory), so a long conversation stays in RAM while short calls come and go.
+- `SUSHI_R64_CPU_ACCEPT=1` + `SUSHI_R75_BLOCK_VERIFY=1` (`src/r75_block.zig`): MTP rounds accepted on the host by
+  block verification (Sun et al. 2024, arXiv 2403.10444; lossless, never fewer accepted drafts in expectation; the
+  file's tests check the emitted distribution statistically): +0.7% tokens per round at the thinking-mode sampler.
+- `SUSHI_R75_DRAFT_TEMP=1`: a sampled MTP draft is drawn at the request's own temperature instead of a fixed 1.0
+  (exact: acceptance min(1, p/q) reads q at the draw's temperature). The thinking-mode sampler (1.0) is unchanged; at
+  0.7, +11% accepted drafts per round. Requests at or below 0.5 keep argmax drafts (`=2`, sampling there too, lost).
+
+## 18. Short requests
+
+Short calls (tens of new prompt tokens, a few generated) spent most of their time in fixed costs: a 1-token call
+waited ~37 ms before the engine saw it (the host's priority handshake, below) and ~27 ms after its token was ready,
+and ran a draft round it could not use. Set by the host; `'0'` turns each off.
+
+- `SUSHI_R75_LAST_TOKEN=1`: when the next token is the last one `max_tokens` lets through, the MTP round emits it
+  without drafting or verifying (its accept was capped to 0, so the verify could only be discarded), and the
+  synchronous path (logprobs, penalties) returns it without forwarding it for a successor nobody takes. With no reply
+  row on the stage, the end-of-turn pull-back and checkpoint are skipped too. Exact.
+- `SUSHI_R75_EARLY_REPLY=1`: `finishSlot` publishes a foreground request's terminator before the end-of-turn work
+  (pull-back, checkpoint, cache commit) instead of after it, so streamed and non-streamed replies end ~27 ms sooner.
+  `Scheduler.complete` hands a slot still inside its finishing pass to the inference thread (`r75_deferred`, completed
+  between passes) instead of waiting, and the slot's decode time is charged up to the reply. Background requests keep
+  the old order: the host admits a background request only once the control page says none runs, which Sushi writes
+  at its next loop turn, so an early background reply let a back-to-back background request be refused.
+- `SUSHI_R75_EVICT_SMALL=4096`: the hot cache's count cap evicts entries under 4096 tokens first (plain LRU when there
+  is none). A conversation without its own workload key (no system message, `prompt_cache_key` or user id) shares key
+  0 with anonymous short calls, and a burst of them evicted it: its next turn restored from SSD instead of RAM.
+- Host (`host/texas_split.py`): a foreground request with no background request anywhere takes its priority ticket
+  without waiting for Sushi's drained acknowledgement, which Sushi's idle loop gave only when its 50 ms wait timed out
+  (15-66 ms per request; `TEXAS_SPLIT_FAST_FOREGROUND=0` restores the wait). The control page's accesses are
+  serialized against its close (a closed page is no longer dereferenced at shutdown).
+
+Measured on split hosts (replies, logprobs and cached counts identical with and without): at the thinking-mode
+sampler a 1-token call 240 -> 155 ms, a cached short call (31 new tokens, 9 generated, streamed) 297 -> 246 ms; with
+thinking off 1-token calls ~175 -> ~94 ms.
+
+## Diagnostics in this build (off unless set; measurement only)
+
+`SUSHI_R75_TEACHER` / `SUSHI_R75_TEACHER_OUT` (`src/r75_teacher.zig`: a teacher-forced fidelity panel through the
+production decode path), `SUSHI_R75_EXT` (stage-window extension statistics), `SUSHI_R75_PAD` (exact padding
+operations, to price one dependent GPU stage), `SUSHI_R75_BLOCK_SCREEN`, and two exact kernel variants that measured
+no end-to-end gain: `SUSHI_R75_QSA_SG=4` (more staging simdgroups in the sparse attention) and `SUSHI_R75_MOE_TAIL=1`
+(the gated shared expert folded into the MoE finish at verify widths).

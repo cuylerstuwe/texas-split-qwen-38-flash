@@ -9451,7 +9451,8 @@ fn handleChatCompletions(
     else
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
-    if (enable_mtp and logprobs_n > 0) {
+    // R75 1.1: with SUSHI_R75_LOGPROBS_MTP=1 the generator decides (`mtpRefusal`: penalties or a think penalty refuse).
+    if (enable_mtp and logprobs_n > 0 and !generate_mod.r75LogprobsMtp()) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
     }

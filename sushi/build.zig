@@ -324,6 +324,7 @@ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addObjectFile(b.path("native/texas_checkpoint.o"));
     // R60 pipeline split (isolated experiment): the RTX 5090 stage client.
     module.addObjectFile(b.path("native/stage_split.o"));
+    module.addObjectFile(b.path("native/lean_kernel.o")); // R74
     module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
     module.addLibraryPath(b.path("lib/mlx/lib"));
     // Prevent Homebrew's mlx-c.pc from overriding the staged libraries.

@@ -4358,8 +4358,35 @@ pub var qsa_attn_simdgroups_override: ?c_int = null;
 
 /// Simdgroups per QSA split-K threadgroup: a small grid stages each tile with loader simdgroups.
 pub fn qsaAttnSimdgroups(seq_len: c_int, h_kv: c_int, nsg: c_int, nsplit: c_int) c_int {
-    const fallback: c_int = if (seq_len * h_kv * nsplit <= 32) 16 else nsg;
+    const verify_sg = r75QsaVerifySg();
+    const fallback: c_int = if (seq_len * h_kv * nsplit <= 32) 16 else if (seq_len >= 2 and seq_len <= 16 and verify_sg > 0) verify_sg else nsg;
     return @max(nsg, @min(qsa_attn_simdgroups_override orelse fallback, 32));
+}
+
+/// R75 in-process A/B toggle for the forward meter's R75 arms (SUSHI_DECODE_FWD_UBENCH_R75_ARMS=1): null = each
+/// R75 switch follows its environment variable; true / false = every R75 switch on / off.
+pub var r75_alt_on: ?bool = null;
+
+/// R75 (SUSHI_R75_MOE_TAIL=1): verify rows fold the gated shared expert into the EXL3 finish reduce (exl3/root.zig
+/// rows_gated_tail); bit-identical, one dependent stage fewer per MoE layer.
+pub fn r75MoeTail() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("SUSHI_R75_MOE_TAIL")) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else false;
+    return r75_alt_on orelse S.v.?;
+}
+
+/// R75 (SUSHI_R75_QSA_SG=<n>): simdgroups per QSA split-K threadgroup at verify widths (2..16 rows); 0 = the
+/// computing simdgroups only, as before. Bit-identical at any count (the extra simdgroups only stage tiles). On the
+/// M5 Max at 4 rows, 28K keys: 4 simdgroups 120 us against 135 us per call (dependent chain, cold KV).
+pub fn r75QsaVerifySg() c_int {
+    const S = struct {
+        var v: ?c_int = null;
+    };
+    if (S.v == null) S.v = if (std.c.getenv("SUSHI_R75_QSA_SG")) |r| (std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch 0) else 0;
+    if (r75_alt_on) |on| return if (on) (if (S.v.? > 0) S.v.? else 4) else 0;
+    return S.v.?;
 }
 
 /// Widest query width the split-K kernel serves on a PACKED cache: past it the gathers win
@@ -13017,6 +13044,13 @@ pub const ForwardCtx = struct {
     /// still set reads zero rows.
     ple_defer: bool = false,
     ple_pending: ?PlePending = null,
+    /// R74: the ids of the prompt span a chunked prefill is working through, and how far its gathers have come; set
+    /// by the prefill loop for its duration, so each chunk's gather can start the next chunk's rows reading.
+    ple_ahead_ids: ?[]const i32 = null,
+    ple_ahead_next: usize = 0,
+    /// R74: a split verify's n-gram gather ids (`plePrepareIds` of the forward's tokens), already handed to the GPU
+    /// at the forward's start; the deferred leaf's fill takes them instead of building its own. Owned here until then.
+    ple_ids_early: ?mlx.mlx_array = null,
 };
 
 pub const PlePending = struct {
@@ -16891,7 +16925,11 @@ pub const Transformer = struct {
     /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
     /// flush sees already cleared).
     pub fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
-        const ids_c = try self.plePrepareIds(token_ids);
+        // R74: the ids a split verify queued at its start (the same operations on the same tokens)
+        const ids_c = if (ctx.ple_ids_early) |early| blk: {
+            ctx.ple_ids_early = null;
+            break :blk early;
+        } else try self.plePrepareIds(token_ids);
         defer _ = mlx.mlx_array_free(ids_c);
         var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
         const f0 = qwen4_mod.nowBootNs();
@@ -16901,9 +16939,35 @@ pub const Transformer = struct {
         return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
     }
 
+    /// R74: this gather was the chunk `ids` of the prefill whose prompt ids `ctx.ple_ahead_ids` holds; start reading
+    /// the rows that follow it. Anything unexpected (other ids, a short chunk) ends the read-ahead for this prefill.
+    fn pleAheadNext(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) void {
+        const plan = ctx.ple_ahead_ids orelse return;
+        const st = self.qwen4.?;
+        const ctx_len: usize = st.hash.ngram_size - 1;
+        const cur = ctx.ple_ahead_next;
+        const n = ids.len;
+        if (n < ctx_len or ctx_len > 8 or cur + n > plan.len) {
+            ctx.ple_ahead_ids = null;
+            return;
+        }
+        for (ids, plan[cur..][0..n]) |a, b| {
+            if (a != @as(u32, @bitCast(b))) {
+                ctx.ple_ahead_ids = null;
+                return;
+            }
+        }
+        ctx.ple_ahead_next = cur + n;
+        const left = plan.len - (cur + n);
+        if (left < qwen4_mod.PLE_AHEAD_MIN_TOKENS) return;
+        var prev: [8]u32 = undefined;
+        @memcpy(prev[0..ctx_len], ids[n - ctx_len ..]);
+        qwen4_mod.pleAheadPost(&st.table, &st.hash, prev[0..ctx_len], plan[cur + n ..][0..@min(left, qwen4_mod.PLE_AHEAD_MAX_TOKENS)]);
+    }
+
     /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
     /// row's ids together so the flush costs ONE host sync, not one per row.
-    fn plePrepareIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    pub fn plePrepareIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         var ids_i32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ids_i32);
         try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
@@ -16962,7 +17026,26 @@ pub const Transformer = struct {
         if (raw_bf16) qwen4_mod.notePleResidency(&st.table, rows);
         const g0 = qwen4_mod.nowBootNs();
         if (raw_bf16) {
-            try st.table.gatherBf16Checked(self.allocator, rows, pk, kv_len);
+            // R74: a prefill chunk's rows may have been read ahead while the previous chunk ran (qwen4_exp.PleAhead)
+            const ahead_mode = qwen4_mod.pleAheadMode();
+            const ahead = ahead_mode != 0 and ctx.batch_slots == null and !capture and n >= qwen4_mod.PLE_AHEAD_MIN_TOKENS;
+            const served: usize = if (ahead) qwen4_mod.pleAheadTake(&st.table, rows, pk) else 0;
+            if (served < rows.len) {
+                try st.table.gatherBf16Checked(self.allocator, rows[served..], pk[served * st.table.dim ..], kv_len);
+                if (ctx.batch_slots == null and n >= qwen4_mod.PLE_AHEAD_MIN_TOKENS) {
+                    qwen4_mod.ple_ahead_direct_n += 1;
+                    qwen4_mod.ple_ahead_direct_ns += qwen4_mod.nowBootNs() - g0;
+                }
+            }
+            if (ahead_mode == 2 and served > 0) {
+                const chk = try self.allocator.alloc(u16, served * st.table.dim);
+                defer self.allocator.free(chk);
+                try st.table.gatherBf16Checked(self.allocator, rows[0..served], chk, kv_len);
+                for (chk, pk[0..chk.len]) |a, b| {
+                    if (a != b) qwen4_mod.ple_ahead_verify_bad += 1;
+                }
+            }
+            if (ahead) self.pleAheadNext(ctx, ids);
         } else {
             try st.table.gatherChecked(rows, host, kv_len);
         }
@@ -19155,6 +19238,7 @@ pub const Transformer = struct {
         };
         const dec = self.config.expertDecode();
         if (shared) |value| {
+            sushi_exl3.rows_gated_tail = r75MoeTail();
             if (shared_gate) |logit| return sushi_exl3.moeWithGatedShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value, logit);
             return sushi_exl3.moeWithShared(self.s, expert_x, bank, inds, scores, dec, verify_rows, value);
         }

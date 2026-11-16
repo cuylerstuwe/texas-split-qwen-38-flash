@@ -42,10 +42,17 @@ pub fn moeWithShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.
 
 /// A decode row adds `sigmoid(gate) * down` (the shared expert, bf16) in the finish reduce, bit-identical to
 /// the Sigmoid, Multiply and Add ops it replaces; any other shape or dtype runs those ops.
+/// R75 (set per call by the caller from SUSHI_R75_MOE_TAIL): verify rows (2..DECODE_ROWS_MAX) fold the gated shared
+/// expert into the finish reduce as one decode row does, one gate logit per row; exact (the reduce rounds as the
+/// Sigmoid, Multiply and Add chain it replaces), one dependent stage fewer per MoE layer.
+pub var rows_gated_tail: bool = false;
+
 pub fn moeWithGatedShared(s: mlx.mlx_stream, x: mlx.mlx_array, bank: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, dec: format.Decode, verify_rows: bool, down: mlx.mlx_array, gate: mlx.mlx_array) !mlx.mlx_array {
     const xsh = mlx.getShape(x);
-    if (xsh[0] * xsh[1] == 1 and mlx.mlx_array_dtype(x) == .bfloat16 and mlx.mlx_array_dtype(down) == .bfloat16 and
-        mlx.mlx_array_dtype(gate) == .bfloat16 and mlx.mlx_array_size(down) == mlx.mlx_array_size(x) and mlx.mlx_array_size(gate) == 1 and
+    const rows = xsh[0] * xsh[1];
+    const rows_ok = rows == 1 or (rows_gated_tail and rows >= 2 and rows <= kernels.DECODE_ROWS_MAX);
+    if (rows_ok and mlx.mlx_array_dtype(x) == .bfloat16 and mlx.mlx_array_dtype(down) == .bfloat16 and
+        mlx.mlx_array_dtype(gate) == .bfloat16 and mlx.mlx_array_size(down) == mlx.mlx_array_size(x) and mlx.mlx_array_size(gate) == rows and
         mlx.getShape(bank.gate.trellis)[3] == mlx.getShape(bank.up.trellis)[3])
         return moeOutput(s, x, bank, inds, scores, dec, verify_rows, .bfloat16, down, gate);
     const routed = try moe(s, x, bank, inds, scores, dec, verify_rows);

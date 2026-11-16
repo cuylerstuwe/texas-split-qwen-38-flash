@@ -40,6 +40,7 @@ const mimo_forward = @import("mimo_forward.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const r75_teacher_mod = @import("r75_teacher.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const mtp_mod = @import("mtp.zig");
@@ -528,6 +529,11 @@ pub const Slot = struct {
     /// texas-split: the stage was given up while this request's layers [first, 48) lived there. It re-runs from its
     /// tokens on the Mac before its next tick (`stageRecoverMarked`); no decode tick takes it until then.
     stage_recover_pending: bool = false,
+    /// R75 2.2 (SUSHI_R75_EARLY_REPLY): `finishSlot` published the terminator before the end-of-turn work, so its
+    /// connection thread may `complete()` it while the pass that finished it still runs (see `Scheduler.complete`).
+    r75_replied_early: bool = false,
+    /// ... and charged this tick's time up to the reply into `decode_ns` (the tick's own charge skips the slot).
+    r75_decode_charged: bool = false,
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
@@ -1341,10 +1347,18 @@ pub const Scheduler = struct {
     /// R69 (several stage slots): the requests decoding on the stage's slots 1.. (index k = slot k + 1), interleaved
     /// with `stage_holder` (slot 0).
     stage_extra: [STAGE_EXTRA_MAX]?*Slot = @splat(null),
+    /// R75 (checklist 2.4, SUSHI_R75_KEEP_SLOT0): rows of the finished conversation the stage's slot 0 still holds
+    /// (its next turn seeds incrementally over them); 0 when slot 0 holds nothing worth keeping.
+    r75_slot0_rows: usize = 0,
     /// R69: extra slot k ended with nobody to pass it to: free it on the stage at the next tick (not inside a stage wait).
     stage_slot_drop: [STAGE_EXTRA_MAX]bool = @splat(false),
     /// R71: the decode tick in progress is hosted inside a prefill (between its chunks): a holder group runs one round.
     tick_hosted: bool = false,
+    /// R75 2.2: the running decode tick's stopwatch (inference thread), for `finishSlot`'s early charge.
+    r75_tick_sw: ?*io_util.Stopwatch = null,
+    /// R75 2.2: slots their connection thread completed while the pass that finished them still ran (queue_mu); the
+    /// inference thread completes them after the pass (`r75TakeDeferredLocked`).
+    r75_deferred: std.ArrayList(*Slot) = .empty,
     /// R71: extra slot k views rows [stage_extra_base[k], + stage_extra_rows[k]) of the stage's attention buffers. The
     /// stage starts with equal shares from the top (`stageRegionsInit`); with dynamic regions a claim re-points the
     /// slot to rows sized for its request (`stageExtraClaim`).
@@ -1575,6 +1589,11 @@ pub const Scheduler = struct {
         self.decoding.deinit(self.allocator);
         for (self.cleanup_queue.items) |slot| slot.deinit();
         self.cleanup_queue.deinit(self.allocator);
+        // A deferred slot is still in `decoding` until a cull or the take removes it: free only the ones it left.
+        for (self.r75_deferred.items) |slot| {
+            if (std.mem.indexOfScalar(*Slot, self.decoding.items, slot) == null) slot.deinit();
+        }
+        self.r75_deferred.deinit(self.allocator);
         destroyAbandoned(self.abandoned);
         for (self.orphan_vision[0..self.orphan_vision_n]) |ve| freeVisionArray(ve);
         self.prefilling.deinit(self.allocator);
@@ -1763,6 +1782,16 @@ pub const Scheduler = struct {
                 _ = self.pending.orderedRemove(i);
                 break;
             }
+        }
+        // R75 2.2: a slot that answered before its end-of-turn work is still in the pass that finished it (the
+        // commit). Hand it to the inference thread, which completes it once that pass is over, so the reply written
+        // after this call does not wait for the commit. It stays in `decoding` and counts in `in_flight` until then.
+        if (slot.r75_replied_early and slot.in_pass.load(.acquire) != 0) {
+            if (self.r75_deferred.append(self.allocator, slot)) |_| {
+                self.queue_cond.broadcast(self.io);
+                self.queue_mu.unlock(self.io);
+                return;
+            } else |_| {} // no memory for the list: wait as before
         }
         // No new pass can take it (cancelled); wait out the one that has it. It stays in `decoding`
         // meanwhile, so exclusive admission sees it until it reaches the cleanup queue.
@@ -4422,6 +4451,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // the coarse shortlist (on) as off, on, on, off passes; the heads load later, so it builds
             // its own coarse copy for the meter.
             const lm_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS");
+            // SUSHI_DECODE_FWD_UBENCH_R75_ARMS=1: every R75 switch off, on, on, off, off, on, on, off (transformer.r75_alt_on).
+            const r75_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_R75_ARMS");
             // SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS=1: MiMo global verify rows one dispatch each (off)
             // and in row groups sharing one page walk each (on) as off, on, on, off passes.
             const rows_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS");
@@ -4441,8 +4472,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const abba: []const ?bool = &.{ false, true, true, false };
             const abba2: []const ?bool = &.{ false, true, true, false, false, true, true, false };
             const no_arms: []const ?bool = &.{null};
-            for (if (qkv_arms) abba2 else if (gdn_arms or fold_arms or lm_arms or rows_arms) abba else no_arms) |gdn_arm| {
-            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms or lm_arms or rows_arms) null else gdn_arm;
+            for (if (qkv_arms or r75_arms) abba2 else if (gdn_arms or fold_arms or lm_arms or rows_arms) abba else no_arms) |gdn_arm| {
+            // R75: every R75 switch on / off together, A-B-B-A twice in this process (thermal-proof).
+            transformer_mod.r75_alt_on = if (r75_arms) gdn_arm else null;
+            defer transformer_mod.r75_alt_on = null;
+            if (r75_arms) {
+                if (gdn_arm) |on| log.info("[fwd-ubench] r75 arm: {s}\n", .{if (on) "on" else "off"});
+            }
+            transformer_mod.gdn_decode_recur_override = if (fold_arms) true else if (qkv_arms or lm_arms or rows_arms or r75_arms) null else gdn_arm;
             mimo_forward.mimo_global_rows_override = if (rows_arms) gdn_arm else null;
             if (lm_arms) transformer_mod.lmhead_shortlist_override = gdn_arm;
             transformer_mod.gdn_verify_fold_override = if (fold_arms) gdn_arm else null;
@@ -5130,6 +5167,30 @@ const TeardownTake = struct {
     unload: ?*UnloadRequest,
 };
 
+/// R75 2.2: complete the slots `Scheduler.complete` deferred, once no pass holds them (what `complete` does after its
+/// wait). Caller holds `queue_mu`; inference thread, between passes.
+fn r75TakeDeferredLocked(sch: *Scheduler) void {
+    var i: usize = 0;
+    var freed = false;
+    while (i < sch.r75_deferred.items.len) {
+        const slot = sch.r75_deferred.items[i];
+        if (slot.in_pass.load(.acquire) != 0) {
+            i += 1;
+            continue;
+        }
+        // An allocation failure keeps it deferred for the next turn of the loop.
+        sch.cleanup_queue.append(sch.allocator, slot) catch {
+            i += 1;
+            continue;
+        };
+        if (std.mem.indexOfScalar(*Slot, sch.decoding.items, slot)) |j| _ = sch.decoding.orderedRemove(j);
+        _ = sch.r75_deferred.swapRemove(i);
+        if (sch.in_flight > 0) sch.in_flight -= 1;
+        freed = true;
+    }
+    if (freed) sch.submit_cond.broadcast(sch.io);
+}
+
 /// Caller holds `queue_mu`.
 fn takeTeardownLocked(sch: *Scheduler, batch: []*Slot) TeardownTake {
     var n: usize = 0;
@@ -5558,6 +5619,7 @@ fn inferenceTick(sch: *Scheduler, state: *InferenceTickState) bool {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
+            r75TakeDeferredLocked(sch);
             const teardown = takeTeardownLocked(sch, &cleanup_batch);
             cleanup_n = teardown.cleanup_n;
             abandoned = teardown.abandoned;
@@ -5824,6 +5886,8 @@ fn inferenceTick(sch: *Scheduler, state: *InferenceTickState) bool {
             // texas-split: requests a tick hosted inside a prefill left marked after a stage failure re-run first
             stageRecoverMarked(sch, active.items);
             var decode_sw = io_util.Stopwatch.init(sch.io);
+            sch.r75_tick_sw = &decode_sw;
+            defer sch.r75_tick_sw = null;
             runDecodeTick(sch, active.items) catch |err| {
                 if (isStageSplitError(err)) {
                     stage_split_give_up("split decode failed in the scheduler");
@@ -5836,7 +5900,9 @@ fn inferenceTick(sch: *Scheduler, state: *InferenceTickState) bool {
                 }
             };
             const tick_ns = decode_sw.read();
-            for (active.items) |s| s.decode_ns +|= tick_ns;
+            for (active.items) |s| if (!s.r75_decode_charged) {
+                s.decode_ns +|= tick_ns;
+            };
         }
         state.worked = n_prefill > 0 or active.items.len > 0;
 
@@ -6796,6 +6862,16 @@ fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
+/// SUSHI_R75_EARLY_REPLY=1: `finishSlot` answers before the end-of-turn work.
+fn r75EarlyReply() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    S.v = if (std.c.getenv("SUSHI_R75_EARLY_REPLY")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    return S.v.?;
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -6813,6 +6889,25 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
+    // R75 2.2 (SUSHI_R75_EARLY_REPLY=1): answer before the end-of-turn work (pull-back, checkpoint, cache commit:
+    // ~30 ms on every request) instead of after it. The connection thread may then `complete()` the slot, which
+    // marks it cancelled, waits out the inference pass that holds it (this one: every caller runs inside a pass
+    // holding `in_pass`) and queues it for deinit on this thread, so the slot outlives the commit; the commit reads
+    // no `cancelled`. The next request is admitted only after this pass, so it still finds this turn's entry.
+    // Foreground only: Texas's host admits a background request only while Sushi's page says none is running, which
+    // it says again at the next loop turn; a background reply before that made a back-to-back background request 429
+    // (priority suite, `rules`). Background requests are not latency-critical.
+    const early_reply = r75EarlyReply() and latched == null and !slot.background;
+    if (early_reply) {
+        // The tick's own charge comes after this pass, too late for a reply written now: charge up to here.
+        if (sch.r75_tick_sw) |sw| {
+            slot.decode_ns +|= sw.read();
+            slot.r75_decode_charged = true;
+        }
+        slot.r75_replied_early = true;
+        recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+        publishSlotTerminator(slot, reason, latched);
+    }
     commitSlotIfApplicable(sch, slot);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
@@ -6832,8 +6927,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Record per-request metrics while slot fields are still live (before markFinished broadcasts:
     // the conn thread may complete()+free the slot immediately after). real_ttft = first_token_ns
     // (queue+prefill, captured at prefill completion); recordRequest derives e2e = first_token_ns + decode_ns.
-    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
-    publishSlotTerminator(slot, reason, latched);
+    if (!early_reply) {
+        recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+        publishSlotTerminator(slot, reason, latched);
+    }
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
             hc.flushPendingDisk(s);
@@ -7260,6 +7357,9 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     var sw = io_util.Stopwatch.init(sch.io);
     sch.tick_hosted = true; // R71: one round per hosted tick (the prefill around it keeps its cadence)
     defer sch.tick_hosted = false;
+    const prev_tick_sw = sch.r75_tick_sw;
+    sch.r75_tick_sw = &sw;
+    defer sch.r75_tick_sw = prev_tick_sw;
     runDecodeTick(sch, buf[0..n]) catch |err| {
         if (isStageSplitError(err)) {
             // texas-split: the stage failed under a tick hosted inside a prefill. Its requests re-run on the Mac at the
@@ -7273,7 +7373,9 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
         }
     };
     const tick_ns = sw.read();
-    for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+    for (buf[0..n]) |s| if (!s.r75_decode_charged) {
+        s.decode_ns +|= tick_ns;
+    };
     return tick_ns;
 }
 
@@ -7854,6 +7956,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
             .logprobs_n = slot.logprobs_n,
+            // R75 (debug, SUSHI_R75_TEACHER): a fidelity-panel prompt runs teacher-forced
+            .r75_teacher = r75_teacher_mod.match(slot.full_prompt),
+            // R75 2.1 (SUSHI_R75_SYS_CP): where the first message ends
+            .r75_cp_boundary = r75FirstMessageEnd(slot),
         },
     );
     slot.cache.ring_marks = &.{};
@@ -7967,7 +8073,19 @@ fn stageHolderClaim(sch: *Scheduler, slot: *Slot) bool {
         return stageHolderIs(sch, slot);
     }
     if (sch.stage_holder == null) {
+        // R75 (checklist 2.4): a short request leaves a long finished conversation's rows on slot 0 (its next turn
+        // seeds incrementally over them, not whole) and decodes on an extra slot, while no background request could
+        // want slot 0.
+        if (r75KeepSlot0Min()) |min| {
+            if (sch.r75_slot0_rows >= min and slot.full_prompt.len < min and !r75AnyBackground(sch) and
+                stageExtraClaim(sch, slot, slot.full_prompt.len, slot.max_tokens))
+            {
+                log.info("[stage] R75: a {d}-token request takes an extra slot; slot 0 keeps a {d}-row conversation\n", .{ slot.full_prompt.len, sch.r75_slot0_rows });
+                return true;
+            }
+        }
         sch.stage_holder = slot;
+        sch.r75_slot0_rows = 0;
         // R69: slot 0 stops below the occupied extra slots: a request too long for that takes their rows
         stageMakeRoomForSlot0(sch, stageSlotNeed(slot), "a longer request takes slot 0");
     }
@@ -8045,7 +8163,10 @@ fn stageRegionFind(sch: *Scheduler, rows: usize, skip: ?usize, reserve0: usize) 
         const made: usize = if (h0.legacy_gen) |*g| g.generated_ids.items.len else 0;
         const left: usize = if (h0.max_tokens > made) h0.max_tokens - made else 0;
         break :blk std.mem.alignForward(usize, stageSlotNeed(h0) + @min(left, reserve0), 4);
-    } else 0;
+    } else if (r75KeepSlot0Min() != null and sch.r75_slot0_rows > 0)
+        std.mem.alignForward(usize, sch.r75_slot0_rows + STAGE_SLOT_MARGIN, 4)
+    else
+        0;
     if (top >= floor + rows) return top - rows;
     return null;
 }
@@ -8055,7 +8176,8 @@ fn stageRegionSet(sch: *Scheduler, k: usize, base: usize, rows: usize) bool {
     stageRegionsInit(sch);
     if (sch.stage_extra_base[k] == base and sch.stage_extra_rows[k] == rows) return true;
     // slot 0's request holds at most `floor0` rows: more on the stage's slot 0 are a finished conversation's
-    const floor0: usize = if (sch.stage_holder) |h0| stageSlotNeed(h0) else 0;
+    // R75 2.4: with no request on slot 0, the finished conversation it keeps (`r75_slot0_rows`) stays
+    const floor0: usize = if (sch.stage_holder) |h0| stageSlotNeed(h0) else if (r75KeepSlot0Min() != null) sch.r75_slot0_rows else 0;
     if (!qwen4_forward.stageSlotView(k + 1, base, rows, false, floor0)) {
         log.warn("[stage] slot {d}: could not take rows [{d}, +{d})\n", .{ k + 1, base, rows });
         return false;
@@ -8320,6 +8442,8 @@ fn stageHolderRelease(sch: *Scheduler, slot: *Slot) void {
     }
     if (!stageHolderIs(sch, slot)) return;
     sch.stage_holder = null;
+    // R75 2.4: what slot 0 keeps of this request (its prompt and reply)
+    sch.r75_slot0_rows = stageSlotNeed(slot) -| STAGE_SLOT_MARGIN;
     if (!stageMultiStream(sch)) return;
     sch.stage_promote_pending = true;
     var best: ?*Slot = null;
@@ -9161,6 +9285,14 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
     // it incrementally so streaming, cancellation, EOS and usage all observe
     // the same per-token boundary. The generator-side cap guarantees max_tokens
     // cannot land before the returned block ends.
+    // R75 1.1: a logprobs request on the draft path publishes each token with the logprob the round read for it; any
+    // the loop does not hand over (cancel, stop, length) are freed here.
+    const lps = gen.round_logprobs.items;
+    var lp_next: usize = 0;
+    defer {
+        for (lps[lp_next..]) |lp| slot.allocator.free(lp.top_logprobs);
+        gen.round_logprobs.clearRetainingCapacity();
+    }
     for (tokens, 0..) |t, i| {
         if (slot.cancelled.load(.acquire)) {
             if (gen.mtp != null) log.debug("[mtp-publish] cancelled after round: discarded={d}\n", .{tokens.len - i});
@@ -9170,7 +9302,10 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
             finishSlot(sch, slot, "stop");
             return;
         }
-        slot.pushToken(t);
+        if (slot.logprobs_n > 0 and i < lps.len) {
+            lp_next = i + 1;
+            slot.pushTokenWithLogprob(t, lps[i]);
+        } else slot.pushToken(t);
         slot.completion_tokens += 1;
         if (t != 0) slot.was_pad_only = false;
         if (slot.completion_tokens >= slot.max_tokens) {
@@ -9251,7 +9386,20 @@ fn loopRecoveryAction(tb: *generate_mod.ThinkBound, ids: []const u32, completion
 fn stageBringBack(slot: *Slot, gen: *Generator) !void {
     if (!qwen4_forward.stageResident(&gen.ctx)) return;
     const xf = slot.model.transformer orelse return error.StageSplitForward;
-    if (slot.ssm_entries) |ents| _ = qwen4_forward.stagePullbackTurnEnd(xf, &slot.cache, ents);
+    if (qwen4_forward.stageTestPark()) { // test seam, off in production
+        nativeStagePark(slot, &gen.ctx);
+        qwen4_forward.stageTestDisown(&gen.ctx);
+    }
+    if (slot.ssm_entries) |ents| {
+        const back = qwen4_forward.stagePullbackTurnEnd(xf, &slot.cache, ents);
+        // R74: a background request that resumed from its park still has its stage half in the park file (the next
+        // stage call restores it), so there was nothing to pull back and the stage was given up (2026-11-14 14:09: a
+        // 2,000-token budget reached at the boundary the request was parked on). Restore it, then pull back.
+        if (back == null and !qwen4_forward.stageCachesWhole(xf, &slot.cache) and qwen4_forward.stageUnparkCommitted(xf, &gen.ctx)) {
+            _ = qwen4_forward.stagePullbackTurnEnd(xf, &slot.cache, ents);
+            log.info("[stage] forced tokens: the request's parked stage rows were restored first\n", .{});
+        }
+    }
     if (!qwen4_forward.stageCachesWhole(xf, &slot.cache)) return error.StageSplitForward;
     qwen4_forward.stageSplitForget(&slot.cache);
     log.info("[stage] forced tokens: the request's stage rows are back in Sushi's caches; the forced forward runs on the Mac\n", .{});
@@ -9313,12 +9461,74 @@ fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []c
         finishSlot(sch, slot, gen.finish_reason);
         return true;
     }
+    if (r75BudgetMtp() and gen.mtp != null and !gen.spec_disabled_runtime and slot.logprobs_n == 0) {
+        // R75 (checklist 1.3): the answer drafts again. The forced line left the generator shim-seeded (its last token
+        // in the cache, logits pending), which is the state a serial block ends from: the drain emits that token and
+        // samples its successor, the capture tick forwards it with the hidden the head needs, and the next split forward
+        // re-seeds the stage the forced forward left (R73 brought its rows back). The head's history skips the forced
+        // line, as it skips any serial block.
+        gen.mtp_serial_exit = .drain;
+        gen.r75_budget_rearmed = true;
+        log.info("[think-bound] the answer drafts again after the forced close\n", .{});
+        return false;
+    }
     gen.spec_disabled_runtime = true;
     gen.spec_disable_reason = .think_bound;
     return false;
 }
 
+/// R75 (checklist 2.4): SUSHI_R75_KEEP_SLOT0=<rows>: a finished conversation of at least that many rows keeps slot 0
+/// from requests shorter than that (they take an extra stage slot), so its next turn seeds the stage incrementally.
+fn r75KeepSlot0Min() ?usize {
+    const S = struct {
+        var v: ?usize = null;
+        var read = false;
+    };
+    if (!S.read) {
+        S.read = true;
+        if (std.c.getenv("SUSHI_R75_KEEP_SLOT0")) |r| S.v = std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch null;
+        if (S.v != null and S.v.? == 0) S.v = null;
+    }
+    return S.v;
+}
+
+/// R75 2.4: a background request anywhere (queued, prefilling, decoding, or parked while foregrounds run nested
+/// inside its tick): it takes slot 0 only while no extra slot is in use, and a parked one reclaims slot 0 on resume.
+fn r75AnyBackground(sch: *const Scheduler) bool {
+    if (texas_priority.nested) return true;
+    for (sch.pending.items) |s| if (s.background) return true;
+    for (sch.prefilling.items) |s| if (s.background) return true;
+    for (sch.decoding.items) |s| if (s.background) return true;
+    return false;
+}
+
+/// R75 (checklist 2.1): the absolute position just past the prompt's first `<|im_end|>` and its newline (the system and
+/// tools block, or the first user turn when there is no system message), when SUSHI_R75_SYS_CP is on and that block is
+/// at least its minimum length.
+fn r75FirstMessageEnd(slot: *const Slot) ?usize {
+    const min = generate_mod.r75SysCpMin() orelse return null;
+    const tok = slot.model.tokenizer orelse return null;
+    const im_end = tok.specialTokenId("<|im_end|>") orelse return null;
+    const p = slot.full_prompt;
+    const i = std.mem.indexOfScalar(u32, p, im_end) orelse return null;
+    const b = i + 2;
+    if (b < min or b >= p.len) return null;
+    return b;
+}
+
+/// R75 (checklist 1.3): SUSHI_R75_BUDGET_MTP=1 lets the answer after a reached thinking budget draft again.
+fn r75BudgetMtp() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("SUSHI_R75_BUDGET_MTP");
+    S.v = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else false;
+    return S.v.?;
+}
+
 fn thinkBoundFired(gen: *const Generator) bool {
+    if (gen.r75_budget_rearmed) return false;
     if (gen.think_closed_by_loop) return true;
     const tb = gen.sampling.think_bound orelse return false;
     return tb.fired;

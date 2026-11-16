@@ -15,6 +15,10 @@
 // the scheduler re-runs it from its tokens). Parking (op 7) writes the stage's committed state of
 // the owner to an SSD file; its next stage call restores it (op 8) instead of re-seeding.
 #include <mlx/c/mlx.h>
+#include <mlx/allocator.h>
+#include <mlx/array.h>
+#include <mlx/c/private/array.h>
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -128,6 +132,29 @@ int iseed_trace() {
   return v;
 }
 #define MIRROR_TRACE(...) do { if (iseed_trace()) fprintf(stderr, __VA_ARGS__); } while (0)
+// R74: the prefill chunk copies into and out of shm (84 MB each at 4,096 rows) on several cores. The engine sets the
+// thread count per prefill (SUSHI_R74_PCOPY, stage_split_set_pcopy); 0 or 1 is one memcpy, as before. Same bytes.
+int g_pcopy = 0;
+struct PCopy {
+  uint8_t* dst;
+  const uint8_t* src;
+  size_t n, part;
+};
+void pcopy_part(void* ctx, size_t i) {
+  const PCopy* p = static_cast<const PCopy*>(ctx);
+  const size_t a = i * p->part;
+  if (a >= p->n) return;
+  memcpy(p->dst + a, p->src + a, (p->n - a < p->part) ? p->n - a : p->part);
+}
+void pcopy(void* dst, const void* src, size_t n) {
+  if (g_pcopy < 2 || n < (size_t(8) << 20)) {
+    memcpy(dst, src, n);
+    return;
+  }
+  const size_t parts = size_t(g_pcopy > 16 ? 16 : g_pcopy);
+  PCopy p{static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src), n, ((n / parts) + 16383) & ~size_t(16383)};
+  dispatch_apply_f(parts, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &p, pcopy_part);
+}
 int g_timeout_ms = -1;
 uint64_t g_reply_arg = 0;  // the last reply's arg word
 uint64_t g_resident[16] = {};
@@ -448,6 +475,7 @@ uint64_t fnv64(const uint8_t* p, size_t n) {
 extern "C" {
 // R65 GPU warm-up switch, for the trace windows: mode (0 off, 1 on, 2 alternating), the current arm, its setter
 // and the ticks committed so far.
+void stage_split_set_pcopy(int n) { g_pcopy = n; }
 int stage_split_warm_mode(void) { return warm_mode(); }
 int stage_split_warm_get(void) { return g_warm_on; }
 void stage_split_warm_set(int on) { g_warm_on = on ? 1 : 0; }
@@ -1067,7 +1095,7 @@ int stage_split_prefill_send(mlx_array h, uint64_t position, int32_t rope_delta,
     g_pullback = !(v && strcmp(v, "0") == 0);
   }
   const uint32_t aux = uint32_t(g_pullback) | (uint32_t(g_cur) << 3) | ((uint32_t(rope_delta) & 0xFFFFFFu) << 8);
-  memcpy(g_shm + off, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
+  pcopy(g_shm + off, mlx_array_data_bfloat16(c), size_t(rows) * kF * 2);
   mlx_array_free(c);
   uint8_t m[32] = {};
   const uint32_t op = 6, r = uint32_t(rows);
@@ -1107,7 +1135,16 @@ int stage_split_prefill_recv(mlx_array* out, mlx_dtype dt, mlx_stream s) {
   memcpy(&g_pf_export_len, m + 24, 8);
   g_pf_export_slot = slot;
   int oshape[3] = {1, int(rows), kF};
-  mlx_array ob = mlx_array_new_data(g_shm + kSlotBase + uint64_t(slot) * kSlotStride, oshape, 3, MLX_BFLOAT16);
+  mlx_array ob;
+  if (g_pcopy >= 2) {
+    // R74: the same copy into a fresh MLX buffer, on several cores
+    const size_t nb = size_t(rows) * kF * 2;
+    mlx::core::allocator::Buffer buf = mlx::core::allocator::malloc(nb);
+    pcopy(buf.raw_ptr(), g_shm + kSlotBase + uint64_t(slot) * kSlotStride, nb);
+    ob = mlx_array_new_(mlx::core::array(buf, mlx::core::Shape{1, int(rows), kF}, mlx::core::bfloat16));
+  } else {
+    ob = mlx_array_new_data(g_shm + kSlotBase + uint64_t(slot) * kSlotStride, oshape, 3, MLX_BFLOAT16);
+  }
   if (dt != MLX_BFLOAT16) {
     if (mlx_astype(out, ob, dt, s)) return -1;
     mlx_array_free(ob);

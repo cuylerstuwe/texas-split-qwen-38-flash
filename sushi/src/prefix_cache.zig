@@ -92,6 +92,13 @@ pub const MissKind = enum {
 /// match among them. The filter's `continue`s destroy both, which is why a
 /// hybrid miss could not name itself.
 pub const MatchProbe = struct { candidates: usize = 0, best_raw: usize = 0 };
+/// R75: a whole number of GiB from the environment (`def` when unset or malformed).
+fn r75EnvGb(name: [:0]const u8, def: u64) u64 {
+    const raw = std.c.getenv(name.ptr) orelse return def;
+    return std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch def;
+}
+/// R75: the prefill size from which a lookup logs where the prompt left the cache (`[cache-gap]`).
+const R75_GAP_MIN: usize = 20000;
 
 pub fn missKind(candidates: usize, best_raw: usize) MissKind {
     if (candidates == 0) return .cold;
@@ -665,6 +672,22 @@ pub const HotPrefixCache = struct {
     pending_disk: ?PendingDiskFlush = null,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
+
+    /// SUSHI_R75_EVICT_SMALL=<tokens>: the count cap evicts entries under <tokens> first (`retainNewEntry`).
+    fn r75EvictSmall() ?usize {
+        const S = struct {
+            var v: ?usize = null;
+            var read = false;
+        };
+        if (!S.read) {
+            S.read = true;
+            if (std.c.getenv("SUSHI_R75_EVICT_SMALL")) |r| S.v = std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch null;
+            if (S.v) |v| if (v == 0) {
+                S.v = null;
+            };
+        }
+        return S.v;
+    }
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -1477,7 +1500,36 @@ pub const HotPrefixCache = struct {
         skip: bool,
     ) !LookupResult {
         const rec: Recurrent = if (target_ssm_entries) |e| .{ .ssm = e } else .none;
-        return self.lookupImpl(target_cache, target_moe_seq_offset, rec, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, mtp_target, slot_id, skip);
+        const r = try self.lookupImpl(target_cache, target_moe_seq_offset, rec, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, mtp_target, slot_id, skip);
+        if (!skip and prompt_ids.len >= r.matched + R75_GAP_MIN) self.r75LogGap(prompt_ids, has_tools, r.matched);
+        return r;
+    }
+
+    /// R75 (checklist 1.6): a prefill of R75_GAP_MIN tokens or more says where the prompt left the cache: for each
+    /// RAM entry of the same tools class, newest first, how far its tokens match the prompt and its length. A client
+    /// that varies the top of its prompt (a thinking flag, an effort level, a timestamp) shows as a few-token match
+    /// against the conversation's own entry. Numbers only.
+    fn r75LogGap(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, restored: usize) void {
+        var order: [8]usize = undefined;
+        var n: usize = 0;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.has_tools != has_tools or n == order.len) continue;
+            var j = n;
+            while (j > 0 and self.entries.items[order[j - 1]].last_used < e.last_used) : (j -= 1) order[j] = order[j - 1];
+            order[j] = i;
+            n += 1;
+        }
+        var buf: [256]u8 = undefined;
+        var w: usize = 0;
+        for (order[0..n]) |i| {
+            const e = &self.entries.items[i];
+            const max_shared = @min(e.tokens.len, prompt_ids.len);
+            var shared: usize = 0;
+            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
+            const t = std.fmt.bufPrint(buf[w..], " {d}/{d}", .{ shared, e.tokens.len }) catch break;
+            w += t.len;
+        }
+        log.info("  [cache-gap] prompt={d} restored={d} prefill={d}; RAM entries newest first (match/length):{s}\n", .{ prompt_ids.len, restored, prompt_ids.len - restored, buf[0..w] });
     }
 
     /// A GLM request restores its KDA state from the entry's checkpoints and its MLA rows from `Entry.glm`.
@@ -2787,6 +2839,13 @@ pub const HotPrefixCache = struct {
         var incoming = entry;
         errdefer freeEntryOwnedState(self.allocator, &incoming);
         while (self.entries.items.len >= self.max_entries) {
+            // R75 2.2 (SUSHI_R75_EVICT_SMALL=<tokens>): the count cap counts a 19-token call like a 35K-token agent
+            // conversation, so a burst of short calls pushed the conversation out of RAM (to an SSD restore or a cold
+            // prefill on its next turn). Evict the least recently used entry under <tokens> first, cheap to rebuild;
+            // plain LRU when there is none. The byte budget below still evicts by LRU.
+            if (r75EvictSmall()) |cut| {
+                if (self.evictSmallLru(cut, incoming.cache_key)) continue;
+            }
             if (!self.evictOneLruProgress("count cap", incoming.cache_key)) break;
         }
         if (self.max_kv_bytes > 0) {
@@ -2998,6 +3057,21 @@ pub const HotPrefixCache = struct {
         };
     }
 
+    /// R75 (checklist 1.4): SUSHI_R75_IDLE_MAX_GB=<n> lets the idle allowance grow above `--prefix-cache-mem` out of the
+    /// headroom over SUSHI_R75_IDLE_RESERVE_GB (default 28) of reclaimable memory at this request's end, up to n GiB: idle
+    /// entries kept now plus the reclaimable rest, minus the reserve. A later request's prefill transient then still
+    /// leaves well above the host's 12 GiB guard, and an allowance that grew shrinks again at the next request's end
+    /// when other apps take memory. A failed reading counts as no headroom.
+    fn r75IdleCap(self: *const HotPrefixCache, idle_bytes: u64) u64 {
+        const max_gb = r75EnvGb("SUSHI_R75_IDLE_MAX_GB", 0);
+        if (max_gb == 0) return self.ssd_idle_mem;
+        const reserve: u64 = r75EnvGb("SUSHI_R75_IDLE_RESERVE_GB", 28) << 30;
+        const avail = @import("texas_priority.zig").texas_available();
+        const want = (idle_bytes +| avail) -| reserve;
+        const hi = @max(self.ssd_idle_mem, max_gb << 30);
+        return std.math.clamp(want, self.ssd_idle_mem, hi);
+    }
+
     /// At the end of a request every idle entry is written to the SSD tier, and RAM is trimmed
     /// back to the active session plus the idle allowance. Writing is unconditional; the
     /// allowance is a hard cap shed in two tiers: entries with a proven durable copy first,
@@ -3064,9 +3138,11 @@ pub const HotPrefixCache = struct {
             spilled += 1;
         }
 
+        // R75 (checklist 1.4): the allowance this pass enforces (the configured one, or more out of spare memory).
+        const cap = self.r75IdleCap(idle_bytes);
         // Pass 2: evict the durable, oldest first, down to the allowance.
         var evicted: usize = 0;
-        while (idle_bytes > self.ssd_idle_mem) {
+        while (idle_bytes > cap) {
             const idx = self.oldestIdleIndex(newest_used, true) orelse break;
             idle_bytes -|= self.entries.items[idx].kv_bytes;
             self.evictAt(idx, "SSD-first idle spill");
@@ -3074,7 +3150,7 @@ pub const HotPrefixCache = struct {
         }
 
         // Pass 3: still over. Entries with no durable copy go too, oldest first, naming why.
-        while (idle_bytes > self.ssd_idle_mem) {
+        while (idle_bytes > cap) {
             const idx = self.oldestIdleIndex(newest_used, false) orelse break;
             const e = &self.entries.items[idx];
             log.info("  [hot-cache] idle allowance exceeded: dropped unpersistable entry ({s}) {d} tokens, {d:.1} MB\n", .{
@@ -3089,7 +3165,7 @@ pub const HotPrefixCache = struct {
 
         if (spilled > 0 or evicted > 0) {
             log.info("  [hot-cache] SSD-first: wrote {d} idle entries to disk, evicted {d}; RAM holds the active session + {d} MB idle allowance\n", .{
-                spilled, evicted, self.ssd_idle_mem >> 20,
+                spilled, evicted, cap >> 20,
             });
         }
     }
@@ -3924,6 +4000,24 @@ pub const HotPrefixCache = struct {
         }
         self.shedCheckpointsToFit();
         self.logResident();
+    }
+
+    /// R75 2.2: evict the least recently used entry shorter than `cut` tokens (not checked out, not the incoming
+    /// key's only entry); false when there is none.
+    fn evictSmallLru(self: *HotPrefixCache, cut: usize, incoming_key: ?u64) bool {
+        _ = incoming_key;
+        var best: ?usize = null;
+        var best_used: u64 = std.math.maxInt(u64);
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.checked_out_by != null or e.tokens.len >= cut) continue;
+            if (e.last_used < best_used) {
+                best_used = e.last_used;
+                best = i;
+            }
+        }
+        const idx = best orelse return false;
+        self.evictAt(idx, "count cap, short entry first");
+        return true;
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {

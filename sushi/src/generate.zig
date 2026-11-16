@@ -99,6 +99,8 @@ const token_mask = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
+const r75_teacher = @import("r75_teacher.zig");
+const r75_block = @import("r75_block.zig");
 const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
@@ -1070,6 +1072,182 @@ pub const SamplingParams = struct {
     think_penalty: ThinkPenalty = .{},
 };
 
+/// R75 (checklist 2.1): SUSHI_R75_SYS_CP=<min tokens> turns the first-message checkpoint on for first messages at
+/// least that long (2048: agent system-and-tools blocks; a short app prompt pays a whole extra forward per cold call).
+pub fn r75SysCpMin() ?usize {
+    const S = struct {
+        var v: ?usize = null;
+        var read = false;
+    };
+    if (!S.read) {
+        S.read = true;
+        if (std.c.getenv("SUSHI_R75_SYS_CP")) |r| S.v = std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch null;
+        if (S.v != null and S.v.? == 0) S.v = null;
+    }
+    return S.v;
+}
+
+/// R75: SUSHI_R75_BLOCK_VERIFY=1 accepts host-side rounds (SUSHI_R64_CPU_ACCEPT=1 with the stage head) by block
+/// verification (src/r75_block.zig) instead of token by token. Lossless; MTP rounds only (copy rounds keep theirs).
+fn r75BlockVerify() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    S.v = if (std.c.getenv("SUSHI_R75_BLOCK_VERIFY")) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else false;
+    return S.v.?;
+}
+pub var r75_block_rounds: u64 = 0;
+
+/// R75 3.3: SUSHI_R75_EXT=1 extends a split round's draft chain by 1 + m steps while the stage runs the verify (R64
+/// step A's window) and scores the extension against what later rounds commit (`[r75-ext]`). Diagnostic: nothing is
+/// adopted, so greedy output is unchanged (sampled extension steps take PRNG draws, so seeded sampled text moves).
+/// SUSHI_R75_EXT=2 builds no extension and only counts the per-depth acceptance probabilities.
+fn r75ExtLevel() u8 {
+    const S = struct {
+        var v: ?u8 = null;
+    };
+    if (S.v) |v| return v;
+    S.v = if (std.c.getenv("SUSHI_R75_EXT")) |r| (std.fmt.parseInt(u8, std.mem.sliceTo(r, 0), 10) catch 0) else 0;
+    return S.v.?;
+}
+fn r75ExtMode() bool {
+    return r75ExtLevel() == 1;
+}
+/// Chain capacity past m_hi for the extension: the bonus draft plus up to MAX_DEPTH more.
+const R75_EXT_EXTRA: u32 = mtp_mod.MAX_DEPTH + 1;
+
+/// R75 screen: SUSHI_R75_BLOCK_SCREEN=1 logs each host-accepted round's expected accepted drafts under token and block
+/// verification (needs SUSHI_R64_CPU_ACCEPT=1 and the stage head; debug only).
+fn r75BlockScreen() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    S.v = std.c.getenv("SUSHI_R75_BLOCK_SCREEN") != null;
+    return S.v.?;
+}
+
+/// R75 (checklist 1.1): SUSHI_R75_LOGPROBS_MTP=1 lets a request that asks for logprobs keep draft decoding.
+pub fn r75LogprobsMtp() bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("SUSHI_R75_LOGPROBS_MTP");
+    S.v = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else false;
+    return S.v.?;
+}
+
+/// R75 (checklist 1.1): the logprobs of `tokens[r]` from row r (r < tokens.len) of a `[1, S, V]` verify output, the
+/// same values as `computeLogprobs` row by row (f32 log-softmax of the raw row; top-n by value, ties on the lower id)
+/// with one GPU sync for the whole round. Caller owns each result's `top_logprobs`.
+fn r75RoundLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, tokens: []const u32, top_n: u32, out: []LogprobResult, s: mlx.mlx_stream) !void {
+    const R: c_int = @intCast(tokens.len);
+    const shape = mlx.getShape(logits);
+    const v: c_int = shape[shape.len - 1];
+    const vocab: usize = @intCast(v);
+    const rows_total: c_int = @intCast(@divExact(mlx.mlx_array_size(logits), vocab));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, logits, &[_]c_int{ rows_total, v }, 2, s));
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_slice(&rows, flat, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ R, v }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    var x32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x32);
+    try mlx.check(mlx.mlx_astype(&x32, rows, .float32, s));
+    var lse = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lse);
+    try mlx.check(mlx.mlx_logsumexp_axis(&lse, x32, -1, true, s));
+    var lp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lp);
+    try mlx.check(mlx.mlx_subtract(&lp, x32, lse, s));
+    var ids_buf: [Generator.MTP_GROUP_ROWS_MAX]i32 = undefined;
+    for (tokens, 0..) |t, i| ids_buf[i] = @intCast(@min(t, @as(u32, @intCast(vocab - 1))));
+    const ids_arr = mlx.mlx_array_new_data(&ids_buf, &[_]c_int{ R, 1 }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+    var chosen = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chosen);
+    try mlx.check(mlx.mlx_take_along_axis(&chosen, lp, ids_arr, -1, s));
+    const k: usize = @min(@as(usize, @min(top_n, 20)), vocab);
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, lp, s));
+    var part = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(part);
+    try mlx.check(mlx.mlx_argpartition_axis(&part, neg, @intCast(if (k == 0) 0 else k - 1), -1, s));
+    var idx_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx_k);
+    try mlx.check(mlx.mlx_slice(&idx_k, part, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ R, @intCast(@max(k, 1)) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    var vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals);
+    try mlx.check(mlx.mlx_take_along_axis(&vals, lp, idx_k, -1, s));
+    var ids_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_k);
+    try mlx.check(mlx.mlx_astype(&ids_k, idx_k, .int32, s));
+    {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, chosen);
+        _ = mlx.mlx_vector_array_append_value(vec, vals);
+        _ = mlx.mlx_vector_array_append_value(vec, ids_k);
+        try mlx.check(mlx.mlx_eval(vec));
+    }
+    const cp = mlx.mlx_array_data_float32(chosen) orelse return error.MlxArrayDataNull;
+    const vp = mlx.mlx_array_data_float32(vals) orelse return error.MlxArrayDataNull;
+    const ip = mlx.mlx_array_data_int32(ids_k) orelse return error.MlxArrayDataNull;
+    const kk: usize = @max(k, 1);
+    var done: usize = 0;
+    errdefer for (out[0..done]) |o| allocator.free(o.top_logprobs);
+    for (0..tokens.len) |r| {
+        var top = try allocator.alloc(TokenLogprob, k);
+        var filled: usize = 0;
+        for (0..k) |i| {
+            const tid = ip[r * kk + i];
+            if (tid < 0 or @as(usize, @intCast(tid)) >= vocab) continue;
+            top[filled] = .{ .token_id = @intCast(tid), .logprob = vp[r * kk + i] };
+            filled += 1;
+        }
+        std.mem.sort(TokenLogprob, top[0..filled], {}, struct {
+            fn lt(_: void, a: TokenLogprob, b: TokenLogprob) bool {
+                if (a.logprob != b.logprob) return a.logprob > b.logprob;
+                return a.token_id < b.token_id;
+            }
+        }.lt);
+        if (filled < top.len) top = allocator.realloc(top, filled) catch top;
+        out[r] = .{ .token_logprob = if (tokens[r] < vocab) cp[r] else -100.0, .top_logprobs = top };
+        done += 1;
+    }
+}
+
+/// R75 (checklist 1.1): the logprobs of `chosen` from row `row` of a `[1, S, V]` verify output.
+fn r75RowLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, row: usize, chosen: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
+    const shape = mlx.getShape(logits);
+    const v: c_int = shape[shape.len - 1];
+    const rows_total: c_int = @intCast(@divExact(mlx.mlx_array_size(logits), @as(usize, @intCast(v))));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, logits, &[_]c_int{ rows_total, v }, 2, s));
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    const r: c_int = @intCast(row);
+    try mlx.check(mlx.mlx_slice(&one, flat, &[_]c_int{ r, 0 }, 2, &[_]c_int{ r + 1, v }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    return computeLogprobs(allocator, one, chosen, top_n, s);
+}
+
+/// R75: the draft head's row cut (SUSHI_MTP_DRAFT_HEAD_ROWS; production 98304), for the `[spec-pos]` high-id counts.
+fn r75HiCut() u32 {
+    const S = struct {
+        var v: ?u32 = null;
+    };
+    if (S.v) |v| return v;
+    const raw = std.c.getenv("SUSHI_MTP_DRAFT_HEAD_ROWS");
+    const v: u32 = if (raw) |r| std.fmt.parseInt(u32, std.mem.sliceTo(r, 0), 10) catch 98304 else 98304;
+    S.v = if (v == 0) 98304 else v;
+    return S.v.?;
+}
+
 /// Whether a request consumes only each position's argmax: greedy (or top-1), no logit-moving
 /// penalty, no logprobs, no grammar or forced call choosing among ids. Only then may a
 /// forward serve pruned or shortlisted logits.
@@ -1255,7 +1433,11 @@ pub fn mtpUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
 
 /// Why a request runs without MTP, for the log; null when MTP may run.
 pub fn mtpRefusal(sampling: SamplingParams, logprobs_n: u32) ?[]const u8 {
-    if (logprobs_n != 0) return "logprobs requested";
+    // R75 (checklist 1.1, SUSHI_R75_LOGPROBS_MTP=1): a verify row holds the target's logits for every token it commits,
+    // so per-token logprobs come from the row that committed each token. Not when penalties or a think penalty shift
+    // the verify rows (the serial path reports the raw distribution).
+    if (logprobs_n != 0 and !(r75LogprobsMtp() and !penaltyActive(sampling) and !sampling.think_penalty.active()))
+        return "logprobs requested";
     if (sampling.constraint != null) return "grammar-constrained output";
     if (sampling.call_force != null) return "forced tool call";
     return null;
@@ -2161,6 +2343,49 @@ pub const Generator = struct {
     mtp_lookup_rounds: u64 = 0,
     mtp_lookup_drafted: u64 = 0,
     mtp_lookup_accepted: u64 = 0,
+    /// R75 (checklist 1.5): draft-head rounds by depth, drafts tested/accepted by chain position, and partial rounds
+    /// that ended on a token at or above the draft head's row cut (SUSHI_MTP_DRAFT_HEAD_ROWS): a token the head cannot
+    /// propose. Numbers only, printed as `[spec-pos]` beside `[spec-stats]`.
+    r75_depth_rounds: [9]u32 = @splat(0),
+    r75_pos_tested: [8]u32 = @splat(0),
+    r75_pos_accepted: [8]u32 = @splat(0),
+    r75_partial: u32 = 0,
+    r75_hi_reject: u32 = 0,
+    /// R75 (checklist 0.2): the teacher-forced panel's logits dump for this request (debug, SUSHI_R75_TEACHER).
+    r75_dump: ?r75_teacher.Dump = null,
+    /// R75 (checklist 1.1): the logprobs of the tokens the last draft-path step returned, one per token in order; the
+    /// scheduler's publisher takes them with the tokens.
+    round_logprobs: std.ArrayList(LogprobResult) = .empty,
+    /// R75 (checklist 1.3): a reached thinking budget re-armed the draft path (SUSHI_R75_BUDGET_MTP); the tick
+    /// dispatchers then stop treating the request as budget-fired.
+    r75_budget_rearmed: bool = false,
+    /// R75 3.3 (SUSHI_R75_EXT=1, diagnostic): after a hit round (every draft accepted and the committed bonus equal to
+    /// the extension's first draft) `r75_ext_pred` holds the extension's later drafts, compared with what the following
+    /// rounds commit from generated position `r75_ext_pos` on; the round right after a hit scores its own fresh drafts
+    /// on the same positions (`r75_fresh_*`). `r75_ext_p0`: summed bonus-test probability min(1, p/q) of the
+    /// extension's first draft over every-draft-accepted rounds (host acceptance); `r75_ext_p1` / `r75_fresh_p1`: the
+    /// first position's acceptance probability for the extension's draft and the fresh draft in the same row.
+    r75_ext_pred: [16]u32 = undefined,
+    r75_ext_q1: f32 = 0,
+    r75_ext_n: u32 = 0,
+    r75_ext_pos: usize = 0,
+    r75_ext_done: u32 = 0,
+    r75_ext_fresh: u32 = 0,
+    r75_ext_windows: u32 = 0,
+    r75_ext_allacc: u32 = 0,
+    r75_ext_hit: u32 = 0,
+    r75_ext_p0: f64 = 0,
+    r75_ext_tested: [8]u32 = @splat(0),
+    r75_ext_acc: [8]u32 = @splat(0),
+    r75_fresh_tested: [8]u32 = @splat(0),
+    r75_fresh_acc: [8]u32 = @splat(0),
+    r75_ext_p1: f64 = 0,
+    r75_fresh_p1: f64 = 0,
+    r75_ext_p1_n: u32 = 0,
+    /// R75 3.3: realized acceptance probability min(1, p/q) per chain depth, summed over rounds whose accepted
+    /// prefix reached that depth (host acceptance rounds only), and the count.
+    r75_depth_psum: [8]f64 = @splat(0),
+    r75_depth_pn: [8]u32 = @splat(0),
     /// Prompt + committed output, indexed up to `mtp_lookup_gen` generated tokens.
     mtp_lookup_idx: ?mtp_lookup.Index = null,
     mtp_lookup_gen: usize = 0,
@@ -2462,6 +2687,41 @@ pub const Generator = struct {
                     stalls_txt,
                 },
             );
+            {
+                var hi_tokens: u32 = 0;
+                const cut = r75HiCut();
+                for (self.generated_ids.items) |id| hi_tokens += @intFromBool(id >= cut);
+                const d = self.r75_depth_rounds;
+                const t = self.r75_pos_tested;
+                const a = self.r75_pos_accepted;
+                log.info("  [spec-pos] depth_rounds={d}/{d}/{d}/{d}/{d}/{d}/{d}/{d} pos_acc={d}/{d},{d}/{d},{d}/{d},{d}/{d},{d}/{d},{d}/{d} hi_tokens={d}/{d} hi_reject={d}/{d}\n", .{
+                    d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
+                    a[0], t[0], a[1], t[1], a[2], t[2], a[3], t[3], a[4], t[4], a[5], t[5],
+                    hi_tokens, self.generated_ids.items.len, self.r75_hi_reject, self.r75_partial,
+                });
+            }
+            if (r75ExtLevel() != 0) {
+                const et = self.r75_ext_tested;
+                const ea = self.r75_ext_acc;
+                const ft = self.r75_fresh_tested;
+                const fa = self.r75_fresh_acc;
+                const dp = self.r75_depth_psum;
+                const dn = self.r75_depth_pn;
+                log.info("  [r75-ext] windows={d} allacc={d} hit={d} p0={d:.3} ext={d}/{d},{d}/{d},{d}/{d},{d}/{d},{d}/{d},{d}/{d} fresh={d}/{d},{d}/{d},{d}/{d},{d}/{d},{d}/{d},{d}/{d} p1={d:.3}/{d:.3}/{d}\n", .{
+                    self.r75_ext_windows, self.r75_ext_allacc, self.r75_ext_hit, self.r75_ext_p0,
+                    ea[0],                et[0],               ea[1],            et[1],
+                    ea[2],                et[2],               ea[3],            et[3],
+                    ea[4],                et[4],               ea[5],            et[5],
+                    fa[0],                ft[0],               fa[1],            ft[1],
+                    fa[2],                ft[2],               fa[3],            ft[3],
+                    fa[4],                ft[4],               fa[5],            ft[5],
+                    self.r75_ext_p1,      self.r75_fresh_p1,   self.r75_ext_p1_n,
+                });
+                log.info("  [r75-depthp] {d:.3}/{d},{d:.3}/{d},{d:.3}/{d},{d:.3}/{d},{d:.3}/{d},{d:.3}/{d},{d:.3}/{d},{d:.3}/{d}\n", .{
+                    dp[0], dn[0], dp[1], dn[1], dp[2], dn[2], dp[3], dn[3],
+                    dp[4], dn[4], dp[5], dn[5], dp[6], dn[6], dp[7], dn[7],
+                });
+            }
             if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] lookup_table={s}:{s}\n", .{
                 round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                 self.xfm.round_cost.formatLookupBucket(table_bucket, &lookup_buf),
@@ -2686,6 +2946,11 @@ pub const Generator = struct {
         /// consumes nothing but the argmax — a logprobs request reads the
         /// full logit row, which the pruned head does not produce.
         logprobs_n: u32 = 0,
+        /// R75 (checklist 0.2): a panel prompt this request must follow token for token (SUSHI_R75_TEACHER; debug).
+        r75_teacher: ?*r75_teacher.Entry = null,
+        /// R75 (checklist 2.1): absolute position where the prompt's first message (the system and tools block) ends;
+        /// with SUSHI_R75_SYS_CP the prefill also ends a chunk and takes a checkpoint there.
+        r75_cp_boundary: ?usize = null,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -2799,7 +3064,7 @@ pub const Generator = struct {
         // lm_head gate: the certified prune and MiMo's coarse shortlist serve
         // the ARGMAX, not the tail distribution, so they engage only when this
         // request consumes nothing else (`argmaxOnlyRequest`).
-        ctx.argmax_only = argmaxOnlyRequest(sampling, options.logprobs_n);
+        ctx.argmax_only = argmaxOnlyRequest(sampling, options.logprobs_n) and options.r75_teacher == null;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -3033,6 +3298,19 @@ pub const Generator = struct {
                 ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
             final_start = loop_end;
+            // R75 (checklist 2.1): a checkpoint where the first message ends, so a later request that shares only the
+            // system and tools block restores there instead of at the 8,192-token grid below it (or not at all). The
+            // end-of-prompt snapshot does not serve that request even when it is close: it lies inside the user
+            // message, past where another session diverges. Not when the restore already passed the boundary, a grid
+            // checkpoint lands on it, or it is the loop's end (the end-of-prompt snapshot is then that checkpoint).
+            const r75_b: ?usize = blk: {
+                const b = options.r75_cp_boundary orelse break :blk null;
+                if (!want_ssm_cp or ssm_cp_stride == 0 or glm_request != null) break :blk null;
+                if (b <= ssm_cp_offset) break :blk null;
+                if (b - ssm_cp_offset >= loop_end) break :blk null;
+                if (b % ssm_cp_stride == 0) break :blk null;
+                break :blk b;
+            };
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
@@ -3088,6 +3366,14 @@ pub const Generator = struct {
 
             var pos: usize = 0;
             if (options.prefill_expected) |e| e.store(@intCast(loop_end), .monotonic);
+            // R74: the chunks' n-gram rows are read one chunk ahead (qwen4_exp.PleAhead)
+            const r74_arm_on = @import("qwen4_exp.zig").r74PrefillArm(loop_end);
+            qwen4_forward.stageSetPcopy(@import("qwen4_exp.zig").r74Pcopy());
+            @import("qwen4_exp.zig").r74TlStart();
+            if (xfm.qwen4 != null and r74_arm_on and @import("qwen4_exp.zig").pleAheadMode() != 0) {
+                ctx.ple_ahead_ids = ids_i32[0..loop_end];
+                ctx.ple_ahead_next = 0;
+            }
             while (pos < loop_end) {
                 // Abandoned-request abort: the client disconnected and the
                 // conn thread flagged the slot. Bail before the next chunk —
@@ -3136,10 +3422,12 @@ pub const Generator = struct {
                 else
                     nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (split_first_pos == std.math.maxInt(usize)) split_first_pos = pos;
-                const end = if (split_prefill and glm_request == null)
+                const end_shaped = if (split_prefill and glm_request == null)
                     splitChunkEndFull(pos, end_base, loop_end, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, splitFragRows(), splitLastRows(), split_first_pos, cur_chunk, split_prev_rows)
                 else
                     end_base;
+                // R75 2.1: the first message's end is a chunk boundary too (the shaping above may have planned past it).
+                const end = if (r75_b) |b| (if (pos < b - ssm_cp_offset and b - ssm_cp_offset < end_shaped) b - ssm_cp_offset else end_shaped) else end_shaped;
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -3168,6 +3456,7 @@ pub const Generator = struct {
                     if (!ctx.stage_prefill_sent) return error.StageSplitPrefill;
                     ctx.stage_prefill_sent = false;
                 }
+                @import("qwen4_exp.zig").r74Tl(.fwd);
                 if (dflash_active) {
                     ctx.capture_layers = null;
                     try dflash_mod.appendContext(options.dflash.?, &dflash_ctx.?, dfl_out_buf, ssm_cp_offset + pos);
@@ -3257,8 +3546,11 @@ pub const Generator = struct {
                     };
                     _ = mlx.mlx_eval(eval_vec);
                 }
+                @import("qwen4_exp.zig").r74Tl(.end_eval);
                 // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
-                _ = mlx.mlx_clear_cache();
+                // R74 (SUSHI_R74_PF_KEEP_POOL=1): kept across this prefill's chunks, emptied once after the loop.
+                if (!@import("qwen4_exp.zig").r74KeepPool()) _ = mlx.mlx_clear_cache();
+                @import("qwen4_exp.zig").r74Tl(.clear);
 
                 if (trace_enabled) {
                     const eval_dt = prefill_sw.read() - eval_start_ns;
@@ -3278,7 +3570,9 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) split_cp: {
+                const r75_at_b = if (r75_b) |b| abs_end_for_cp2 == b else false;
+                if (want_ssm_cp and ssm_cp_stride > 0 and (abs_end_for_cp2 % ssm_cp_stride == 0 or r75_at_b) and restorableCheckpoint(glm_request, abs_end_for_cp2)) split_cp: {
+                    if (r75_at_b) log.info("  [hot-cache] R75: checkpoint where the first message ends ({d})\n", .{abs_end_for_cp2});
                     if (split_prefill) {
                         // layers [0, first) are final here; the rest arrive with this chunk's stage output
                         split_cp_new = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2);
@@ -3323,6 +3617,7 @@ pub const Generator = struct {
                     split_cp_new = null;
                     split_prev_rows = end - pos;
                 }
+                @import("qwen4_exp.zig").r74Tl(.complete);
                 if (vision_chunked) {
                     vision_rows_consumed += countSpliceRows(
                         ids_i32[pos..end],
@@ -3377,6 +3672,7 @@ pub const Generator = struct {
                 if (pos < loop_end) {
                     if (options.interleave_hook) |hk| hk.call(hk.ctx);
                 }
+                @import("qwen4_exp.zig").r74Tl(.hooks);
                 // The tick allocated for co-tenant slots; re-price the widen against what is left.
                 if (pending_widen != 0) {
                     if (widen_confirm) |cf| {
@@ -3388,6 +3684,11 @@ pub const Generator = struct {
                     }
                 }
             }
+            if (@import("qwen4_exp.zig").r74KeepPoolEnabled()) _ = mlx.mlx_clear_cache();
+            // R74: the loop is over; nothing may read the prompt ids through the context any more
+            if (ctx.ple_ahead_ids != null or ctx.ple_ahead_next != 0) @import("qwen4_exp.zig").pleAheadReport();
+            ctx.ple_ahead_ids = null;
+            ctx.ple_ahead_next = 0;
             try mlx.checkError();
             // One line per request when the width moved.
             if (adapt_state.transitions > 0) {
@@ -3418,6 +3719,7 @@ pub const Generator = struct {
                 }
                 split_pending = null;
             };
+            @import("qwen4_exp.zig").r74Tl(.drain);
             if (want_ssm_cp and loop_end > 0) {
                 // The snapshot sits at the chunk loop's end — snapshot_backoff
                 // tokens BEFORE the prompt end, where the next turn's prefix
@@ -3512,6 +3814,8 @@ pub const Generator = struct {
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
         ctx.stage_prefill = 0;
+        @import("qwen4_exp.zig").r74Tl(.tail);
+        @import("qwen4_exp.zig").r74TlReport(prompt_ids.len);
         // History entries for the held-back span: (hidden[j], token[j+1]) for
         // j in [final_start, prefix_len) — same pairing as the chunk loop.
         // The last row's pair (hidden[last], t1) is appended by the first
@@ -3665,11 +3969,28 @@ pub const Generator = struct {
         // every verify forward.
         if (sampling.call_force == null and (mtp_active or dflash_active)) {
             const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
-            _ = mlx.mlx_array_free(logits);
+            // R75 teacher: the prefill's last row is the panel's first scored position; keep it for the dump. A
+            // logprobs request on the draft path (R75 1.1) reads t1's distribution from it too.
+            const r75_keep_logits = options.r75_teacher != null or options.logprobs_n > 0;
+            if (!r75_keep_logits) _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
+            var r75_dump: ?r75_teacher.Dump = null;
+            if (options.r75_teacher) |entry| {
+                r75_dump = r75_teacher.Dump.open(entry);
+                if (r75_dump) |*d| {
+                    if (d.token(0)) |t| first_val = @intCast(t);
+                    const v: usize = @intCast(mlx.getShape(logits)[mlx.getShape(logits).len - 1]);
+                    d.writeRow(logits, mlx.mlx_array_size(logits) / v - 1, 0, @intCast(first_val), s);
+                }
+            }
+            const r75_first_lp: ?LogprobResult = if (options.logprobs_n > 0)
+                try firstTokenLogprobs(allocator, logits, @intCast(first_val), options.logprobs_n, s)
+            else
+                null;
+            if (r75_keep_logits) _ = mlx.mlx_array_free(logits);
 
             if (glm_dflash_native) try reserveGlmDflash(&xfm.config, ctx, &dflash_ctx.?, max_tokens, s);
             var glm_window: ?GlmSpecWindow = if (glm_dflash_native and want_ssm_cp) .{ .snapshot = try dflash_ctx.?.cache.snapshot(), .base_pos = dflash_ctx.?.base_pos } else null;
@@ -3731,6 +4052,8 @@ pub const Generator = struct {
                 // the cheap depth is the safe default (1.11x on cold/creative
                 // content), and hot workloads promote within ~8 rounds.
                 .mtp_depth_current = depth_bounds.floorFor(depth_bounds.active, mtp_cap),
+                .r75_dump = r75_dump,
+                .pending_logprob = r75_first_lp,
             };
             mtp_cache = null; // ownership transferred to the Generator
             dflash_ctx = null; // ownership transferred to the Generator
@@ -4023,6 +4346,10 @@ pub const Generator = struct {
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         self.sampling.think_penalty.deinitPrepared();
+        if (self.r75_dump) |*d| d.close();
+        self.r75_dump = null;
+        for (self.round_logprobs.items) |lp| allocator.free(lp.top_logprobs);
+        self.round_logprobs.deinit(allocator);
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -5302,13 +5629,15 @@ pub const Generator = struct {
     fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
         const consider_ext = plan.m_hi > plan.m_lo;
         const sharp_drafts = !isGreedyTemperature(self.mtpDraftSampling(0).temperature);
-        const drafts = try allocator.alloc(u32, plan.m_hi);
+        // R75 3.3: room for the stage-window extension (SUSHI_R75_EXT=1).
+        const cap_n: u32 = plan.m_hi + if (r75ExtMode()) R75_EXT_EXTRA else 0;
+        const drafts = try allocator.alloc(u32, cap_n);
         errdefer allocator.free(drafts);
-        const draft_arrs = try allocator.alloc(mlx.mlx_array, plan.m_hi);
+        const draft_arrs = try allocator.alloc(mlx.mlx_array, cap_n);
         errdefer allocator.free(draft_arrs);
         const conf_arrs: ?[]mlx.mlx_array = if (consider_ext) try allocator.alloc(mlx.mlx_array, plan.m_lo) else null;
         errdefer if (conf_arrs) |slots| allocator.free(slots);
-        const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
+        const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, cap_n) else null;
         const t1_i32: i32 = @intCast(t1);
         const t1_shape = [_]c_int{1};
         return .{
@@ -5324,9 +5653,9 @@ pub const Generator = struct {
             .n_conf = 0,
             .q_probs = q_probs,
             .n_qp = 0,
-            .q_cands = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null,
-            .q_small = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null,
-            .q_kind = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(u8, plan.m_hi) else null,
+            .q_cands = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, cap_n) else null,
+            .q_small = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(mlx.mlx_array, cap_n) else null,
+            .q_kind = if (q_probs != null and r64CpuAcceptPlanned()) try allocator.alloc(u8, cap_n) else null,
             .h_chain = null,
             .m = plan.m_lo,
         };
@@ -5406,6 +5735,12 @@ pub const Generator = struct {
             self.mtp_lookup_accepted += accepted;
             self.mtp_lookup_ema = mtp_lookup.emaStep(self.mtp_lookup_ema, accepted);
         } else {
+            self.r75_depth_rounds[@min(drafted, 8)] += 1;
+            var k: u32 = 0;
+            while (k < drafted and k < 8) : (k += 1) {
+                if (k <= accepted) self.r75_pos_tested[k] += 1;
+                if (k < accepted) self.r75_pos_accepted[k] += 1;
+            }
             self.mtp_accepted_tokens += accepted;
             self.mtp_round_ema = mtp_lookup.emaStep(self.mtp_round_ema, accepted);
             self.mtp_round_drafted_ema = mtp_lookup.emaStep(self.mtp_round_drafted_ema, drafted);
@@ -6665,7 +7000,10 @@ pub const Generator = struct {
     /// stash so the head history is complete up to the block. Idempotent.
     pub fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
         if (self.mtp_pre_draft) |*pd| {
-            if (self.mtp_planner_owned) try self.mtp_cache.?.truncate(self.mtpCommittedHistoryLen(), self.xfm.s);
+            // R75: truncate outside the planner too. A dropped pre-draft's entries past its off0 are next-round drafts,
+            // never committed history; left in the head cache they made the head's history end past the trunk, so the
+            // end-of-turn checkpoint was declined on about half of tool-call turns ("the MTP head ends at N+3").
+            try self.mtp_cache.?.truncate(self.mtpCommittedHistoryLen(), self.xfm.s);
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
         }
@@ -6819,6 +7157,10 @@ pub const Generator = struct {
                 },
                 .drained => |tok| {
                     self.mtp_serial_exit = .capture;
+                    if (self.logprobs_n > 0) if (self.last_logprob) |lp| {
+                        try self.round_logprobs.append(allocator, lp);
+                        self.last_logprob = null;
+                    };
                     return try mtpSerialOneToken(allocator, tok);
                 },
             }
@@ -6829,6 +7171,10 @@ pub const Generator = struct {
             self.mtp_serial_left -= 1;
             if (self.mtp_serial_left == 0) self.mtp_serial_exit = .drain;
         }
+        if (self.logprobs_n > 0) if (self.last_logprob) |lp| {
+            try self.round_logprobs.append(allocator, lp);
+            self.last_logprob = null;
+        };
         return try mtpSerialOneToken(allocator, tok);
     }
 
@@ -6868,6 +7214,14 @@ pub const Generator = struct {
             break :blk v;
         };
         self.next_token_id = @intCast(val);
+        if (self.logprobs_n > 0) {
+            // R75 1.1: `token` returns now (its logprob was read when it was chosen); `val` is the new pending token.
+            if (self.pending_logprob) |lp| {
+                try self.round_logprobs.append(allocator, lp);
+                self.pending_logprob = null;
+            }
+            self.pending_logprob = try firstTokenLogprobs(allocator, logits, @intCast(val), self.logprobs_n, self.xfm.s);
+        }
 
         self.mtp_serial_exit = .none;
         self.mtp_serial_clock = null;
@@ -7061,6 +7415,25 @@ pub const Generator = struct {
 
         if (try self.checkStop()) return .{ .done = null }; // t1 is this block's first emit: stop before drafting
 
+        // R75 2.2 (SUSHI_R75_LAST_TOKEN=1): t1 is the last token the budget lets through, so this round's drafts and
+        // verify could only be discarded (its accept is capped at max_tokens - completion - 1 = 0): emit t1 without
+        // them. Exact: t1 was sampled before the round. With no verify forward no reply row reaches the stage, so the
+        // end-of-turn pull-back and checkpoint are skipped as well (the entry keeps its prompt checkpoints; one past the
+        // prompt end could not be matched by a repeat of the prompt). A pre-drafted chain takes the normal round.
+        if (r75LastTokenEnabled() and self.max_tokens -| self.completion_tokens == 1 and self.mtp_pre_draft == null) {
+            const t1 = self.next_token_id;
+            try self.generated_ids.append(allocator, t1);
+            if (self.logprobs_n > 0) if (self.pending_logprob) |lp| {
+                try self.round_logprobs.append(allocator, lp);
+                self.pending_logprob = null;
+            };
+            self.advanceStep(1);
+            self.done = true;
+            self.finish_reason = "length";
+            log.info("  [r75-last-token] emitted the budget's last token without a round\n", .{});
+            return .{ .done = try mtpSerialOneToken(allocator, t1) };
+        }
+
         const head = self.mtp.?;
         // Cross-request EV seed: inherit the head's last healthy acceptance
         // surface so the controller plans from round 1 instead of re-warming
@@ -7209,10 +7582,13 @@ pub const Generator = struct {
             }
         }
         const m: u32 = chain.m;
-        // Chain complete — release the chain hidden (only chunk B needed it).
-        if (chain.h_chain) |h| {
-            _ = mlx.mlx_array_free(h);
-            chain.h_chain = null;
+        // Chain complete — release the chain hidden (only chunk B needed it; the R75 stage-window extension resumes
+        // from it, so it stays while SUSHI_R75_EXT is on and the chain deinit frees it).
+        if (!r75ExtMode()) {
+            if (chain.h_chain) |h| {
+                _ = mlx.mlx_array_free(h);
+                chain.h_chain = null;
+            }
         }
         const draft_arrs = chain.draft_arrs;
 
@@ -7274,7 +7650,148 @@ pub const Generator = struct {
 
     /// Phase 3 of a solo round: the trunk verify forward over `[t1, drafts…]`.
     /// A batched group replaces this with one forward for every slot (`mtpGroupVerify`).
+    /// R75 3.3: may this solo split round extend its chain in the stage window?
+    fn r75ExtEligible(self: *const Generator, st: *const MtpRoundState) bool {
+        const ch = &st.chain;
+        return self.ctx.stage_split and !ch.lookup and self.mtp_group_cap == 0 and ch.h_chain != null and
+            ch.m >= 1 and ch.n_drafted == ch.m and ch.draft_arrs.len >= 2 * ch.m + 1 and st.verify_len == 1 + ch.m;
+    }
+
+    /// R75 3.3: the stage-window work: 1 + m more chain steps (the bonus position's draft, then m more), built and
+    /// dispatched while the 5090 runs the verify's layers. Head-cache entries past the round's drafts are truncated by
+    /// the next consume, as a rejected draft's are.
+    fn r75ExtWindow(self: *Generator, st: *MtpRoundState) void {
+        const ch = &st.chain;
+        const from = ch.n_drafted;
+        const to = @min(@as(u32, @intCast(ch.draft_arrs.len)), from + 1 + ch.m);
+        if (to < from + 2) return;
+        self.mtpChainBuild(ch, from, to) catch return;
+        mtpChainDispatch(ch, from, to) catch {};
+        self.r75_ext_windows += 1;
+    }
+
+    /// R75 3.3: a host-accepted round's target rows (top-k sampling distributions) and its drafts' p and q.
+    const R75HostRows = struct {
+        p: *const [17][20]f32,
+        ids: [*]const i32,
+        kk: usize,
+        acc_p: *const [16]f32,
+        acc_q: *const [16]f32,
+    };
+
+    fn r75ReadId(arr: mlx.mlx_array) !u32 {
+        try mlx.check(mlx.mlx_array_eval(arr));
+        var v: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&v, arr));
+        return @intCast(v);
+    }
+
+    /// The proposal density of `token` at chain depth k (k may lie in the extension, whose host ids and small q arrays
+    /// the round's own reads did not cover).
+    fn r75ExtQ(chain: *MtpPreDraft, qs: []mlx.mlx_array, k: usize, token: u32) !f32 {
+        chain.drafts[k] = try r75ReadId(chain.draft_arrs[k]);
+        if (chain.q_small) |small| if (k < chain.n_qs and chain.q_kind.?[k] == 1) {
+            try mlx.check(mlx.mlx_array_eval(small[k]));
+            try mlx.check(mlx.mlx_array_eval(chain.q_cands.?[k]));
+        };
+        return r64HostQ(chain, qs, k, token);
+    }
+
+    /// R75 3.3: one round of the stage-window extension diagnostic. Positions: this round's t1 lands at generated
+    /// index g0, its accepted drafts after it, and `next_pending` (final now) at g0 + 1 + accepted.
+    fn r75ExtScore(self: *Generator, chain: *MtpPreDraft, m: u32, accepted: u32, next_pending: u32, host: ?R75HostRows) !void {
+        const g0 = self.generated_ids.items.len;
+        const last = g0 + 1 + accepted;
+        // realized acceptance probability by depth over the depths this round's accepted prefix reached
+        if (host) |h| if (!chain.lookup) {
+            for (0..@min(m, 8)) |k| {
+                if (k > accepted) break;
+                self.r75_depth_psum[k] += @min(1.0, @as(f64, h.acc_p[k]) / @max(@as(f64, h.acc_q[k]), 1e-30));
+                self.r75_depth_pn[k] += 1;
+            }
+        };
+        // the round right after a hit: its fresh drafts on the extension's positions
+        if (self.r75_ext_fresh > 0) {
+            const n = @min(self.r75_ext_fresh, 8);
+            self.r75_ext_fresh = 0;
+            if (!chain.lookup) {
+                for (0..@min(m, n)) |j| {
+                    if (j <= accepted) self.r75_fresh_tested[j] += 1;
+                    if (j < accepted) self.r75_fresh_acc[j] += 1;
+                }
+                // first position, same target row: the extension's draft against the fresh one
+                if (host) |h| if (m >= 1 and self.r75_ext_n > 0 and self.r75_ext_done == 0 and self.r75_ext_pos == g0 + 1) {
+                    var p: f64 = 0;
+                    const e1 = self.r75_ext_pred[0];
+                    for (0..h.kk) |j| {
+                        if (h.ids[j] == @as(i32, @intCast(e1))) p = h.p[0][j];
+                    }
+                    self.r75_ext_p1 += @min(1.0, p / @max(@as(f64, self.r75_ext_q1), 1e-30));
+                    self.r75_fresh_p1 += @min(1.0, @as(f64, h.acc_p[0]) / @max(@as(f64, h.acc_q[0]), 1e-30));
+                    self.r75_ext_p1_n += 1;
+                };
+            }
+        }
+        // the pending extension prediction against every token that is final now
+        if (self.r75_ext_n > 0) {
+            var stop = false;
+            while (!stop and self.r75_ext_done < self.r75_ext_n) {
+                const idx = self.r75_ext_pos + self.r75_ext_done;
+                if (idx > last) break;
+                const tok: u32 = if (idx < g0) self.generated_ids.items[idx] else if (idx == g0) chain.t1 else if (idx < last) chain.drafts[idx - g0 - 1] else next_pending;
+                const j = self.r75_ext_done;
+                if (j < 8) self.r75_ext_tested[j] += 1;
+                if (tok == self.r75_ext_pred[j]) {
+                    if (j < 8) self.r75_ext_acc[j] += 1;
+                    self.r75_ext_done += 1;
+                } else stop = true;
+            }
+            if (stop or self.r75_ext_done >= self.r75_ext_n) {
+                self.r75_ext_n = 0;
+                self.r75_ext_done = 0;
+            }
+        }
+        // a new prediction: every draft accepted, with the extension built behind them
+        if (!chain.lookup and m >= 1 and chain.n_drafted >= 2 * m + 1 and accepted == m) {
+            self.r75_ext_allacc += 1;
+            const ext0 = try r75ReadId(chain.draft_arrs[m]);
+            if (host) |h| {
+                // the bonus test's probability for the extension's first draft: min(1, p_m(d) / q_m(d))
+                var p: f64 = 0;
+                for (0..h.kk) |j| {
+                    if (h.ids[m * 20 + j] == @as(i32, @intCast(ext0))) p = h.p[m][j];
+                }
+                const q: f64 = if (chain.q_probs) |qs| try r75ExtQ(chain, qs, m, ext0) else 1.0;
+                self.r75_ext_p0 += @min(1.0, p / @max(q, 1e-30));
+            }
+            if (next_pending == ext0) {
+                self.r75_ext_hit += 1;
+                if (self.r75_ext_n == 0) {
+                    const n: u32 = @min(chain.n_drafted - (m + 1), 16);
+                    for (0..n) |j| self.r75_ext_pred[j] = try r75ReadId(chain.draft_arrs[m + 1 + j]);
+                    self.r75_ext_n = n;
+                    self.r75_ext_pos = last + 1;
+                    self.r75_ext_done = 0;
+                    self.r75_ext_fresh = n;
+                    self.r75_ext_q1 = if (n == 0) 1.0 else if (chain.q_probs) |qs| try r75ExtQ(chain, qs, m + 1, self.r75_ext_pred[0]) else 1.0;
+                }
+            }
+        }
+    }
+
     pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
+        if (r75ExtMode() and self.r75ExtEligible(st)) {
+            // R75 3.3: the verify in its R69 halves with the extension between the send and the receive.
+            if (try self.mtpRoundVerifyPre(st)) {
+                self.r75ExtWindow(st);
+                try self.mtpRoundVerifyPost(st);
+            }
+            if (st.tracing) {
+                self.mtp_trace.add(.verify, st.ph.read());
+                st.ph.reset();
+            }
+            return;
+        }
         const xfm = self.xfm;
         const tracing = st.tracing;
         var new_hidden = mlx.mlx_array_new();
@@ -7318,7 +7835,8 @@ pub const Generator = struct {
         // first, no penalties or think shifts); a suppressed id in the top 20 falls back to the Mac's head.
         self.ctx.stage_head = self.ctx.stage_split and r64EnvOn(&r64_stage_head_env, "SUSHI_R64_STAGE_HEAD") and
             !penaltyActive(self.sampling) and !self.sampling.think_penalty.active() and self.sampling.call_force == null and
-            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20));
+            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20)) and
+            self.logprobs_n == 0;
         defer self.ctx.stage_head = false;
         var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
@@ -7366,7 +7884,8 @@ pub const Generator = struct {
         self.ctx.capture_settle = !r64EnvOn(&r64_nosettle_env, "SUSHI_R64_VERIFY_NOSETTLE");
         self.ctx.stage_head = self.ctx.stage_split and r64EnvOn(&r64_stage_head_env, "SUSHI_R64_STAGE_HEAD") and
             !penaltyActive(self.sampling) and !self.sampling.think_penalty.active() and self.sampling.call_force == null and
-            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20));
+            (isGreedyTemperature(self.sampling.temperature) or (self.sampling.top_k >= 1 and self.sampling.top_k <= 20)) and
+            self.logprobs_n == 0;
         self.ctx.stage_async_verify = true;
         var new_hidden = mlx.mlx_array_new();
         var verify_hidden_all = mlx.mlx_array_new();
@@ -7645,6 +8164,15 @@ pub const Generator = struct {
         var verify_logits = st.verify_logits;
         st.verify_logits = .{ .ctx = null };
         errdefer _ = mlx.mlx_array_free(verify_logits);
+        // R75 teacher: a second handle on the verify rows, released at the end of the round.
+        var r75_rows: mlx.mlx_array = .{ .ctx = null };
+        defer if (r75_rows.ctx != null) {
+            _ = mlx.mlx_array_free(r75_rows);
+        };
+        if (self.r75_dump != null or self.logprobs_n > 0) {
+            r75_rows = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&r75_rows, verify_logits));
+        }
         var new_hidden = st.new_hidden;
         st.new_hidden = .{ .ctx = null };
         errdefer _ = mlx.mlx_array_free(new_hidden);
@@ -7804,6 +8332,11 @@ pub const Generator = struct {
 
         var accepted: u32 = 0;
         var greedy_next_pending: u32 = 0;
+        // R75 block verification: the target row's scale in the correction token's residual (1 otherwise)
+        var r75_blk_scale: f32 = 1;
+        // R75 3.3: the host acceptance's per-draft target probability and proposal density, kept for the diagnostic
+        var r75_accp: [16]f32 = undefined;
+        var r75_accq: [16]f32 = undefined;
         // R64i host acceptance state (rows <= 17, top-20 each)
         var ca_p: [17][20]f32 = undefined;
         var ca_kk: usize = 20;
@@ -7853,8 +8386,85 @@ pub const Generator = struct {
                 if (q_probs) |qs| {
                     acc_q[k] = try r64HostQ(chain, qs, k, drafts[k]);
                 }
+                r75_accp[k] = acc_p[k];
+                r75_accq[k] = if (q_probs != null) acc_q[k] else 1.0;
             }
-            accepted = self.acceptPrefixFor(chain.lookup)(acc_p[0..m], if (q_probs != null) acc_q[0..m] else null, null, &self.prng);
+            if (r75BlockScreen() and !chain.lookup and m > 0) {
+                // R75 screen (SUSHI_R75_BLOCK_SCREEN=1): the expected accepted drafts of this round under token
+                // verification and under block verification (Sun et al. 2024, arXiv 2403.10444, Algorithm 2), both
+                // from this round's drafts, target rows and proposal densities. Changes nothing; numbers only.
+                var e_tok: f64 = 0;
+                var run: f64 = 1;
+                var pcum: [17]f64 = undefined;
+                var h: [17]f64 = undefined;
+                var pp: f64 = 1;
+                for (0..m) |k| {
+                    const qk: f64 = if (q_probs != null) acc_q[k] else 1.0;
+                    const ratio: f64 = @as(f64, acc_p[k]) / @max(qk, 1e-30);
+                    run *= @min(1.0, ratio);
+                    e_tok += run;
+                    pp = @min(1.0, pp * ratio);
+                    pcum[k] = pp;
+                }
+                for (1..m) |i| {
+                    const p_i = pcum[i - 1];
+                    var sum_res: f64 = 0;
+                    for (0..ca_kk) |j| {
+                        const id_i = ca_ids[i * 20 + j];
+                        if (id_i < 0) continue;
+                        const id: u32 = @intCast(id_i);
+                        const mb: f64 = ca_p[i][j];
+                        const ms: f64 = if (q_probs) |qs| try r64HostQ(chain, qs, i, id) else (if (id == drafts[i]) 1.0 else 0.0);
+                        sum_res += @max(p_i * mb - ms, 0);
+                    }
+                    const den = sum_res + 1 - p_i;
+                    h[i - 1] = if (den <= 1e-12) 1 else sum_res / den;
+                }
+                h[m - 1] = pcum[m - 1];
+                var e_blk: f64 = 0;
+                for (0..m) |k| {
+                    var none: f64 = 1;
+                    for (k..m) |i| none *= 1 - h[i];
+                    e_blk += 1 - none;
+                }
+                log.info("  [r75-blk] m={d} tok={d:.4} blk={d:.4}\n", .{ m, e_tok, e_blk });
+            }
+            if (r75BlockVerify() and !chain.lookup and m > 0 and m <= r75_block.MAX_DEPTH and ca_kk <= r75_block.MAX_CANDS) {
+                // R75: block verification (src/r75_block.zig; lossless, at least as many accepted drafts in expectation
+                // as the token rule below). Rows are the target's top-k sampling distributions, depths the drafter's
+                // proposal densities on those rows' candidates.
+                var pbuf: [17][20]f64 = undefined;
+                var idbuf: [17][20]u32 = undefined;
+                var qbuf: [16][20]f64 = undefined;
+                var brows: [17]r75_block.Row = undefined;
+                var qrows: [16][]const f64 = undefined;
+                var bp: [16]f64 = undefined;
+                var bq: [16]f64 = undefined;
+                var eta: [16]f64 = undefined;
+                for (0..m + 1) |r| {
+                    for (0..ca_kk) |j| {
+                        const idv = ca_ids[r * 20 + j];
+                        idbuf[r][j] = if (idv < 0) 0 else @intCast(idv);
+                        pbuf[r][j] = if (idv < 0) 0 else ca_p[r][j];
+                    }
+                    brows[r] = .{ .ids = idbuf[r][0..ca_kk], .p = pbuf[r][0..ca_kk] };
+                    if (r < m) {
+                        for (0..ca_kk) |j| {
+                            qbuf[r][j] = if (q_probs) |qs| try r64HostQ(chain, qs, r, idbuf[r][j]) else (if (idbuf[r][j] == drafts[r]) 1.0 else 0.0);
+                        }
+                        qrows[r] = qbuf[r][0..ca_kk];
+                        bp[r] = acc_p[r];
+                        bq[r] = if (q_probs != null) acc_q[r] else 1.0;
+                        eta[r] = self.prng.random().float(f64);
+                    }
+                }
+                const d = r75_block.decide(m, bp[0..m], bq[0..m], brows[0 .. m + 1], qrows[0..m], eta[0..m]);
+                accepted = @intCast(d.tau);
+                r75_blk_scale = @floatCast(d.scale);
+                r75_block_rounds += 1;
+            } else {
+                accepted = self.acceptPrefixFor(chain.lookup)(acc_p[0..m], if (q_probs != null) acc_q[0..m] else null, null, &self.prng);
+            }
             accepted = capAcceptedForTokenBudget(
                 accepted,
                 self.completion_tokens,
@@ -7888,6 +8498,17 @@ pub const Generator = struct {
                 self.completion_tokens,
                 self.max_tokens,
             );
+        } else if (self.r75_dump) |*dump| {
+            // R75 teacher: the teacher's ids stand where the verify argmax would (row k predicts generated position
+            // g0 + 1 + k; t1 is position g0), and each committed row goes to the dump.
+            const am_real = try verify_argmax.ids(st.verify_len);
+            var am_buf: [MTP_GROUP_ROWS_MAX]i32 = undefined;
+            const g0 = self.generated_ids.items.len;
+            for (0..st.verify_len) |k| am_buf[k] = if (dump.token(g0 + 1 + k)) |t| @intCast(t) else am_real[k];
+            const verdict = mtpGreedyVerdict(am_buf[0..st.verify_len], drafts[0..m], self.completion_tokens, self.max_tokens);
+            accepted = verdict.accepted;
+            greedy_next_pending = verdict.next_pending;
+            for (0..accepted + 1) |k| dump.writeRow(r75_rows, k, g0 + 1 + k, @intCast(am_buf[k]), s);
         } else {
             const verdict = try mtpAcceptRowGreedy(verify_argmax, st.verify_len, drafts[0..m], self.completion_tokens, self.max_tokens);
             accepted = verdict.accepted;
@@ -7910,7 +8531,7 @@ pub const Generator = struct {
                     if (a < m) {
                         qv = if (q_probs) |qs| try r64HostQ(chain, qs, a, @intCast(id)) else if (id == @as(i32, @intCast(drafts[a]))) 1 else 0;
                     }
-                    w[j] = @max(ca_p[a][j] - qv, 0);
+                    w[j] = @max(r75_blk_scale * ca_p[a][j] - qv, 0);
                     tot += w[j];
                 }
                 if (!(tot > 0)) {
@@ -7940,6 +8561,30 @@ pub const Generator = struct {
                 break :blk greedy_next_pending;
             }
         };
+        if (!chain.lookup and accepted < m) {
+            self.r75_partial += 1;
+            if (next_pending >= r75HiCut()) self.r75_hi_reject += 1;
+        }
+        if (r75ExtLevel() != 0) {
+            const r75_host: ?R75HostRows = if (stochastic and cpu_acc) .{ .p = &ca_p, .ids = ca_ids, .kk = ca_kk, .acc_p = &r75_accp, .acc_q = &r75_accq } else null;
+            try self.r75ExtScore(chain, m, accepted, next_pending, r75_host);
+        }
+        if (self.logprobs_n > 0 and r75_rows.ctx != null) {
+            // R75 1.1: this step returns [t1, drafts[0..accepted]]: t1's logprob was read when it was chosen; draft k's
+            // comes from verify row k, and the next pending token's from row `accepted`.
+            std.debug.assert(self.round_logprobs.items.len == 0);
+            if (self.pending_logprob) |lp| {
+                try self.round_logprobs.append(allocator, lp);
+                self.pending_logprob = null;
+            }
+            var toks: [MTP_GROUP_ROWS_MAX]u32 = undefined;
+            for (0..accepted) |k| toks[k] = drafts[k];
+            toks[accepted] = next_pending;
+            var lps: [MTP_GROUP_ROWS_MAX]LogprobResult = undefined;
+            try r75RoundLogprobs(allocator, r75_rows, toks[0 .. accepted + 1], self.logprobs_n, lps[0 .. accepted + 1], s);
+            for (lps[0..accepted]) |lp| try self.round_logprobs.append(allocator, lp);
+            self.pending_logprob = lps[accepted];
+        }
 
         if (defer_caps) {
             const cv = mlx.mlx_vector_array_new();
@@ -8205,7 +8850,33 @@ pub const Generator = struct {
     /// A greedy target keeps the argmax proposal (the temp-0 identity contract); a sampled
     /// target proposes from the draft sampler, where `min(1, p[argmax])` collapses on a flat row.
     pub fn mtpDraftGreedyFor(target: SamplingParams) bool {
+        // R75 3.1 (SUSHI_R75_DRAFT_TEMP=2): a sampled target at or below the threshold drafts by sampling at its own
+        // temperature instead of the argmax (exact either way: acceptance is min(1, p/q) for the q actually used).
+        if (r75DraftTempMode() == 2 and !isGreedyTemperature(target.temperature)) return target.top_k == 1;
         return target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1;
+    }
+
+    /// R75 3.1: SUSHI_R75_DRAFT_TEMP=1 drafts a sampled target at the request's own temperature (in place of the
+    /// family's fixed draft temperature, 1.0 for Flash Next); =2 also samples (at that temperature) for targets at or
+    /// below MTP_SAMPLED_PROPOSAL_MIN_TEMP, which draft by argmax otherwise. 0 = as before. The thinking sampler
+    /// (temperature 1.0) drafts the same either way.
+    /// SUSHI_R75_LAST_TOKEN=1: see `mtpRoundBegin` (a round whose only keepable token is t1 is not run).
+    pub fn r75LastTokenEnabled() bool {
+        const S = struct {
+            var v: ?bool = null;
+        };
+        if (S.v) |v| return v;
+        S.v = if (std.c.getenv("SUSHI_R75_LAST_TOKEN")) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+        return S.v.?;
+    }
+
+    pub fn r75DraftTempMode() u8 {
+        const S = struct {
+            var v: ?u8 = null;
+        };
+        if (S.v) |v| return v;
+        S.v = if (std.c.getenv("SUSHI_R75_DRAFT_TEMP")) |r| (std.fmt.parseInt(u8, std.mem.sliceTo(r, 0), 10) catch 0) else 0;
+        return S.v.?;
     }
 
     // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
@@ -8242,7 +8913,7 @@ pub const Generator = struct {
             d.temperature = 0.0;
             return d;
         }
-        d.temperature = draft_temp;
+        d.temperature = if (r75DraftTempMode() != 0) target.temperature else draft_temp;
         d.top_p = MTP_DRAFT_TOP_P;
         d.top_k = MTP_DRAFT_TOP_K;
         return d;
@@ -10312,6 +10983,8 @@ pub const Generator = struct {
             if (q4.ple_fl_n > 0) log.info("  [r64-ple-flush] {d} flushes: start {d:.3} ms into the verify, ids wait {d:.3} ms\n", .{ q4.ple_fl_n, @as(f64, @floatFromInt(q4.ple_fl_at_ns)) / @as(f64, @floatFromInt(q4.ple_fl_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_fl_wait_ns)) / @as(f64, @floatFromInt(q4.ple_fl_n)) / 1e6 });
             if (q4.ple_g_n > 0) log.info("  [r64-ple] decode gathers {d}: mean {d:.3} ms, max {d:.2} ms, >1 ms {d}, >5 ms {d}; keep-alive reads {d}; resident {d}/{d}\n", .{ q4.ple_g_n, @as(f64, @floatFromInt(q4.ple_g_ns)) / @as(f64, @floatFromInt(q4.ple_g_n)) / 1e6, @as(f64, @floatFromInt(q4.ple_g_max_ns)) / 1e6, q4.ple_g_over1, q4.ple_g_over5, q4.ple_keepalive_reads.load(.monotonic), q4.ple_res_resident, q4.ple_res_rows });
         }
+        @import("qwen4_exp.zig").r74LeanReport();
+        @import("qwen4_exp.zig").r74DecWindowEnd();
         t.reset();
     }
 
@@ -10438,6 +11111,18 @@ pub const Generator = struct {
         const token = self.next_token_id;
         self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
+
+        // R75 2.2 (SUSHI_R75_LAST_TOKEN=1): the synchronous path (logprobs, penalties) forwards the token it returns to
+        // sample a successor; for the budget's last token nothing would ever take that successor. Return the token (and
+        // its logprob, read when it was chosen) without the forward. Exact; as on the draft path, no reply row reaches
+        // the stage, so the end-of-turn pull-back and checkpoint are skipped too.
+        if (r75LastTokenEnabled() and self.samplesSync() and !self.has_pending_logits and self.step >= self.max_tokens) {
+            if (self.last_logprob) |*lp| allocator.free(lp.top_logprobs);
+            self.last_logprob = self.pending_logprob;
+            self.pending_logprob = null;
+            log.info("  [r75-last-token] returned the budget's last token without a forward\n", .{});
+            return token;
+        }
 
         const step_logits = if (self.has_pending_logits) blk: {
             const logits = self.pending_logits;

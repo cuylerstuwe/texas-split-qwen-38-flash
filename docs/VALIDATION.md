@@ -341,6 +341,41 @@ is dropped; a cancelled stream frees the engine.
   smoke.py 11/11 with the new `think_budget` case (72 reasoning tokens at a 48-token budget, mode unchanged).
 - **Seen in that use, not fixed:** one split lost to "resumed background without slot 0" (CHANGELOG).
 
+## 2026-11-15 update (see CHANGELOG.md)
+
+- **Exactness of each change.** Decode-side changes (lean kernel path, early n-gram ids, prefill read-ahead and
+  copies, the kept buffer pool, the last-token and early-reply paths, the eviction rule): greedy replies and replies
+  at the thinking sampler with fixed seeds byte-identical with and without, over agentic session replays and short
+  requests; logprobs identical where returned. Block verification: the emitted distribution checked statistically
+  in `sushi/src/r75_block.zig`'s tests (prefix-dependent targets and drafters included), then +0.7% tokens per round
+  on real rounds. Drafts at the request's temperature: exact by construction (the acceptance reads the draft's
+  density at the temperature it was drawn at); measured as accepted drafts per round at temperatures 0.3 and 0.7.
+- **Qualification of each build** (decode +4% build, logprobs and budget build, agent-session build, draft-temperature
+  build, short-request build): parking suite 8/8 exact with SSD parking (6 pauses, no park errors) with one request at
+  a time and with four; smoke.py 11/11 in both; the greedy four-turn conversation identical to the previous build's;
+  from the logprobs build on, logprobs on the draft path (one entry per token, streamed and not) and drafting after a
+  reached budget; thinking budgets 5/5 and 9/9 with the split kept; image turns byte-identical to the previous build; the stage killed during a
+  split prefill (the request finishes on the Mac).
+- **Caught by qualification:** with the early reply applied to background requests too, the parking suite's
+  admission case got 429 for a background request sent right after another one's reply (the engine's page still said
+  a background request ran for ~30 ms). Background replies keep the old order; the second run passed.
+- **Short requests, timed** (split test hosts, OFF ON ON OFF, nominal thermal pressure, no other GPU load, fixed seeds,
+  replies/logprobs/cached tokens identical between arms; medians of 10 requests each):
+
+  | request | before | after |
+  |---|---|---|
+  | time before the engine sees a request (all shapes) | 27-43 ms | 2-5 ms |
+  | 1 token, thinking sampler (59-token prompt, 28 new) | 236-244 ms | 155-157 ms |
+  | the same, streamed | 234-249 ms | 153-155 ms |
+  | cached short call, thinking sampler (515-token prompt, 31 new, 9 out, streamed) | 296-298 ms | 242-250 ms |
+  | 515-token prompt, 28 cached, 9 out, thinking sampler | 575-577 ms | 476-478 ms |
+  | 1 token, thinking off (19-token prompt, 1 new), with or without logprobs | 166-184 ms | 89-99 ms |
+  | cold 479-token prompt, thinking off | 457-473 ms | 400-405 ms |
+
+- **The eviction rule**: a 43.6K-token conversation without a system message, then 20 short calls, then its next
+  turn: without the rule the count cap evicted the conversation and the turn restored it from SSD (641 ms); with it,
+  RAM (574 ms). With its own system prompt the conversation already stayed in RAM either way.
+
 ## Not covered
 
 Sustained multi-hour load, sleep/wake with the stage running, a physically disconnected card (simulated by

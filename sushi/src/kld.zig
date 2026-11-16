@@ -1165,6 +1165,9 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         defer generated.deinit(allocator);
 
         var ctx = l.xfm.defaultCtx();
+        // R75: the stage still holds the previous prompt's rows for this cache (its owner); forget them, or the
+        // next prompt's Mac prefill meets a resident stage sequence (StageSplitForward since R67's residency check).
+        if (qwen4_forward.stageDecodeEnabled()) qwen4_forward.stageSplitForget(ctx.cache);
         var logits = try forwardPromptCapture(allocator, l, &ctx, ids, hidden);
         defer _ = mlx.mlx_array_free(logits);
         // R60 pipeline split: the prompt prefills on the Mac; with a stage configured, every

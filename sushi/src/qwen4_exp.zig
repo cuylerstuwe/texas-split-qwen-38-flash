@@ -532,6 +532,7 @@ pub const NgramTable = struct {
     }
 
     pub fn close(self: *NgramTable) void {
+        pleAheadCancel(self); // R74: no read-ahead worker may outlive the table
         if (self.bf16) |*store| {
             if (self.pool) |pool| pool.destroy();
             self.pool = null;
@@ -963,6 +964,327 @@ const LeanPool = struct {
         self.work();
         while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
         return self.failed.load(.acquire) == 0;
+    }
+};
+
+// ── R74: gather-ahead for prefill chunks ──
+// A prefill chunk's n-gram rows (16 per token: ~65K random 320-byte reads per 4,096 tokens, from a table far larger
+// than its share of the page cache) were read on the inference thread at the chunk's layer 1 with the GPU idle:
+// ~45 ms per chunk with every row cached, more with cold rows. The prompt's ids are all known, so the NEXT chunk's
+// rows are read by a private worker set while the current chunk runs on the GPU. The consumer takes them only when
+// its own row ids equal the job's (the same rows of the same table, so the same bytes); anything else gathers as
+// before. SUSHI_R74_PLE_AHEAD=1 on; =2 verify (take, then also gather directly and compare every word).
+var ple_ahead_mode: ?u8 = null;
+pub fn pleAheadMode() u8 {
+    if (ple_ahead_mode == null) ple_ahead_mode = if (std.c.getenv("SUSHI_R74_PLE_AHEAD")) |v| v[0] -% '0' else 0;
+    return ple_ahead_mode.?;
+}
+// R74 prefill experiments share one switchboard. SUSHI_R74_ALT=1 alternates them per chunked prefill inside one
+// process (on, off, off, on, ...; a line names each arm), so a timing comparison needs no second launch.
+var r74_alt: ?bool = null;
+var r74_keep_pool: ?bool = null;
+pub var r74_pf_count: u64 = 0;
+/// The current prefill's arm (set by `r74PrefillArm`; the inference thread runs one prefill at a time).
+pub var r74_pf_on: bool = true;
+fn r74Env(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return v[0] == '1';
+}
+pub fn r74PrefillArm(tokens: usize) bool {
+    if (r74_alt == null) r74_alt = r74Env("SUSHI_R74_ALT");
+    r74_pf_on = true;
+    if (!r74_alt.? or tokens < 2048) return true;
+    r74_pf_count += 1;
+    // on, off, off, on, ...: a drift across the run weighs on both arms alike
+    r74_pf_on = switch (r74_pf_count % 4) {
+        1, 0 => true,
+        else => false,
+    };
+    log.info("[r74-pf] prefill {d} ({d} tokens): R74 prefill changes {s}\n", .{ r74_pf_count, tokens, if (r74_pf_on) "on" else "off" });
+    return r74_pf_on;
+}
+/// SUSHI_R74_PF_KEEP_POOL=1: a chunked prefill keeps MLX's buffer pool between its chunks (cleared once at its end)
+/// instead of emptying it after every chunk, which made each chunk allocate and register its temporaries again.
+pub fn r74KeepPoolEnabled() bool {
+    if (r74_keep_pool == null) r74_keep_pool = r74Env("SUSHI_R74_PF_KEEP_POOL");
+    return r74_keep_pool.? and r74_pf_on;
+}
+/// Asked at each chunk end: keep the pool only while the machine has room for it (it holds ~5 GiB more than a
+/// freshly emptied one at 4,096-row chunks); below SUSHI_R74_PF_KEEP_POOL_MIN_GB (default 28) of reclaimable
+/// memory the pool is emptied as before.
+var r74_keep_pool_min: ?u64 = null;
+pub fn r74KeepPool() bool {
+    if (!r74KeepPoolEnabled()) return false;
+    if (r74_keep_pool_min == null) {
+        const gb: u64 = if (std.c.getenv("SUSHI_R74_PF_KEEP_POOL_MIN_GB")) |v| (std.fmt.parseInt(u64, std.mem.sliceTo(v, 0), 10) catch 28) else 28;
+        r74_keep_pool_min = gb << 30;
+    }
+    return @import("texas_priority.zig").texas_available() >= r74_keep_pool_min.?;
+}
+/// SUSHI_R74_PF_TL=1: where a chunked prefill's wall time goes on the inference thread, one line per prefill.
+pub const PfLap = enum(u8) { fwd, end_eval, clear, complete, hooks, drain, tail };
+var r74_tl: ?bool = null;
+var r74_tl_last: u64 = 0;
+var r74_tl_t0: u64 = 0;
+var r74_tl_ns: [7]u64 = @splat(0);
+var r74_tl_chunks: u32 = 0;
+var r74_tl_pool_max: usize = 0;
+var r74_tl_active_max: usize = 0;
+fn r74TlMem() void {
+    var v: usize = 0;
+    const m = @import("mlx.zig");
+    if (m.mlx_get_cache_memory(&v) == 0 and v > r74_tl_pool_max) r74_tl_pool_max = v;
+    if (m.mlx_get_active_memory(&v) == 0 and v > r74_tl_active_max) r74_tl_active_max = v;
+}
+pub fn r74TlStart() void {
+    pleAheadReset();
+    if (r74_tl == null) r74_tl = r74Env("SUSHI_R74_PF_TL");
+    if (!r74_tl.?) return;
+    r74_tl_last = nowBootNs();
+    r74_tl_t0 = r74_tl_last;
+    r74_tl_ns = @splat(0);
+    r74_tl_chunks = 0;
+    r74_tl_pool_max = 0;
+    r74_tl_active_max = 0;
+}
+pub fn r74Tl(cat: PfLap) void {
+    if (!(r74_tl orelse false) or r74_tl_t0 == 0) return;
+    const now = nowBootNs();
+    r74_tl_ns[@intFromEnum(cat)] += now - r74_tl_last;
+    r74_tl_last = now;
+    if (cat == .fwd) r74_tl_chunks += 1;
+    if (cat == .end_eval) r74TlMem(); // before the pool is emptied: the chunk's high-water mark
+}
+pub fn r74TlReport(tokens: usize) void {
+    if (!(r74_tl orelse false) or r74_tl_t0 == 0) return;
+    const ms = struct {
+        fn f(n: u64) f64 {
+            return @as(f64, @floatFromInt(n)) / 1e6;
+        }
+    }.f;
+    log.info("[r74-pf-tl] {s} {d} tokens, {d} chunks, {d:.0} ms from the first chunk: forward {d:.0} (rows read directly {d:.0}, waited for read-ahead {d:.1}), chunk-end eval {d:.0}, pool clear {d:.0}, checkpoint + previous chunk's stage output {d:.0}, hooks {d:.0}, last chunk's stage output {d:.0}, tail forward {d:.0}; at chunk ends MLX's pool held at most {d:.2} GiB beside {d:.2} GiB in use\n", .{
+        if (r74_pf_on) "on" else "off",                              tokens,                                                      r74_tl_chunks,
+        ms(nowBootNs() - r74_tl_t0),                                  ms(r74_tl_ns[0]),                                            ms(ple_ahead_direct_ns),
+        ms(ple_ahead_wait_ns),                                        ms(r74_tl_ns[1]),                                            ms(r74_tl_ns[2]),
+        ms(r74_tl_ns[3]),                                             ms(r74_tl_ns[4]),                                            ms(r74_tl_ns[5]),
+        ms(r74_tl_ns[6]),                                             @as(f64, @floatFromInt(r74_tl_pool_max)) / 1073741824.0,     @as(f64, @floatFromInt(r74_tl_active_max)) / 1073741824.0,
+    });
+    r74_tl_t0 = 0;
+}
+/// SUSHI_R74_PCOPY=<threads>: a split prefill chunk's copies into and out of the stage's shared memory (84 MB each
+/// at 4,096 rows) run on that many cores (native/stage_split.cpp). 0 or 1: one memcpy, as before.
+var r74_pcopy: ?c_int = null;
+pub fn r74Pcopy() c_int {
+    if (r74_pcopy == null) r74_pcopy = if (std.c.getenv("SUSHI_R74_PCOPY")) |v| (std.fmt.parseInt(c_int, std.mem.sliceTo(v, 0), 10) catch 0) else 0;
+    return if (r74_pf_on) r74_pcopy.? else 0;
+}
+// R74 decode experiments. SUSHI_R74_DEC_ALT=1 alternates them per MTP trace window (32 rounds, SUSHI_MTP_TRACE=1);
+// the line after each window's trace line names the arm that window ran.
+var r74_dec_alt: ?bool = null;
+pub var r74_dec_on: bool = true;
+extern "c" fn clock_gettime_nsec_np(clock_id: c_uint) u64;
+extern "c" fn gpu_warm_mark(tag: c_int) void; // lib/gpu_warm.m
+var r74_dec_cpu_last: u64 = 0;
+pub fn r74DecWindowEnd() void {
+    if (r74_dec_alt == null) r74_dec_alt = r74Env("SUSHI_R74_DEC_ALT");
+    if (!r74_dec_alt.?) return;
+    // the inference thread's own CPU time over the window (CLOCK_THREAD_CPUTIME_ID), per round of its 32
+    const cpu = clock_gettime_nsec_np(16);
+    const per_round_ms = if (r74_dec_cpu_last != 0) @as(f64, @floatFromInt(cpu - r74_dec_cpu_last)) / 32e6 else 0;
+    r74_dec_cpu_last = cpu;
+    log.info("  [r74-dec] window on={d} cpu_ms={d:.3}\n", .{ @intFromBool(r74_dec_on), per_round_ms });
+    r74_dec_on = !r74_dec_on;
+    gpu_warm_mark(@intFromBool(r74_dec_on)); // the next window's arm, visible in a GPU trace
+    const m = @import("mlx.zig");
+    if (m.sushi_lean_kernel_mode() == 2) m.sushi_lean_kernel_set(@intFromBool(r74_dec_on));
+}
+/// One line on the lean kernel path's use (SUSHI_R74_LEAN_KERNELS), at each MTP trace window.
+pub fn r74LeanReport() void {
+    const m = @import("mlx.zig");
+    if (m.sushi_lean_kernel_mode() == 0) return;
+    var v: [5]u64 = undefined;
+    m.sushi_lean_kernel_stats(&v);
+    log.info("  [r74-lean] kernel applications: {d} lean, {d} first of a signature, {d} of signatures left to MLX, {d} waiting for MLX's compile, {d} with an input not known to be contiguous\n", .{ v[0], v[1], v[2], v[4], v[3] });
+}
+/// SUSHI_R74_IDS_EARLY=1: a split verify computes its n-gram gather ids behind the draft chain, ahead of layer 0.
+/// The verify hands layer 0 to the GPU as soon as it is built (R64's ladder) and only then, at the n-gram layer,
+/// asked for the draft ids: that small readback was queued behind layer 0, so the engine waited through layer 0's
+/// ~0.5 ms for it and the rows were gathered afterwards with the GPU idle (~0.9 ms per round before every verify).
+/// Queued first, the ids arrive when the chain ends and the gather runs while layer 0 does. The same operations on
+/// the same ids, earlier.
+var r74_ids_early: ?bool = null;
+pub fn r74IdsEarly() bool {
+    if (r74_ids_early == null) r74_ids_early = r74Env("SUSHI_R74_IDS_EARLY");
+    return r74_ids_early.? and r74_dec_on;
+}
+/// Tokens read ahead at most (a shaped split chunk never exceeds 6,144 rows), and the smallest gather worth it.
+pub const PLE_AHEAD_MAX_TOKENS: usize = 6144;
+pub const PLE_AHEAD_MIN_TOKENS: usize = 128;
+pub var ple_ahead_posts: u64 = 0;
+pub var ple_ahead_served_n: u64 = 0;
+pub var ple_ahead_served_rows: u64 = 0;
+pub var ple_ahead_wait_ns: u64 = 0;
+pub var ple_ahead_missed: u64 = 0;
+pub var ple_ahead_direct_n: u64 = 0;
+pub var ple_ahead_direct_ns: u64 = 0;
+pub var ple_ahead_verify_bad: u64 = 0;
+var ple_ahead: ?*PleAhead = null;
+var ple_ahead_failed = false;
+fn pleAheadGet() ?*PleAhead {
+    if (ple_ahead == null and !ple_ahead_failed) ple_ahead = PleAhead.create() catch blk: {
+        ple_ahead_failed = true;
+        break :blk null;
+    };
+    return ple_ahead;
+}
+/// Inference thread. The job in flight holds `rows`' leading rows: they are copied to `out` and counted (0: no job,
+/// another table, or other rows). One consumer per job.
+pub fn pleAheadTake(table: *const NgramTable, rows: []const i64, out: []u16) usize {
+    const a = ple_ahead orelse return 0;
+    const t0 = nowBootNs();
+    const k = a.take(table, rows, out);
+    if (k > 0) {
+        ple_ahead_served_n += 1;
+        ple_ahead_served_rows += k;
+        ple_ahead_wait_ns += nowBootNs() - t0;
+    }
+    return k;
+}
+/// Inference thread. Start reading the rows of `ids`, which follow the tokens `prev` (ngram_size - 1 of them).
+pub fn pleAheadPost(table: *const NgramTable, hash: *const NgramHash, prev: []const u32, ids: []const i32) void {
+    if (table.bits != 16 or table.bf16 != null or table.fd < 0 or ids.len == 0) return;
+    const a = pleAheadGet() orelse return;
+    if (a.post(table, hash, prev, ids)) ple_ahead_posts += 1;
+}
+/// Before a table goes away: no worker may still read it.
+pub fn pleAheadCancel(table: *const NgramTable) void {
+    const a = ple_ahead orelse return;
+    if (a.table == table) {
+        a.settle(0);
+        a.n_rows = 0;
+        a.table = null;
+    }
+}
+pub fn pleAheadReport() void {
+    if (pleAheadMode() == 0 or ple_ahead_posts + ple_ahead_direct_n == 0) return;
+    log.info("[r74-ple-ahead] read ahead {d} times; {d} gathers served ({d} rows, {d:.2} ms waited in all), {d} read directly ({d:.1} ms in all), {d} jobs unused, {d} words differed in verify mode\n", .{
+        ple_ahead_posts,                                                    ple_ahead_served_n,
+        ple_ahead_served_rows,                                              @as(f64, @floatFromInt(ple_ahead_wait_ns)) / 1e6,
+        ple_ahead_direct_n,                                                 @as(f64, @floatFromInt(ple_ahead_direct_ns)) / 1e6,
+        ple_ahead_missed,                                                   ple_ahead_verify_bad,
+    });
+}
+/// A prefill begins: its gather counters start at zero.
+pub fn pleAheadReset() void {
+    ple_ahead_posts = 0;
+    ple_ahead_served_n = 0;
+    ple_ahead_served_rows = 0;
+    ple_ahead_wait_ns = 0;
+    ple_ahead_missed = 0;
+    ple_ahead_direct_n = 0;
+    ple_ahead_direct_ns = 0;
+}
+
+const PleAhead = struct {
+    const N = 12;
+    gen: u32 = 0,
+    next: std.atomic.Value(u32) = .init(0),
+    /// Rows at or past this index are not started (lowered to stop a job early).
+    limit: std.atomic.Value(u32) = .init(0),
+    pending: std.atomic.Value(u32) = .init(0),
+    failed: std.atomic.Value(u32) = .init(0),
+    table: ?*const NgramTable = null,
+    /// The job: `n_rows` row ids and their words (0: no job). The buffers keep their capacity between jobs and are
+    /// only replaced while no worker runs.
+    n_rows: usize = 0,
+    rows: []i64 = &.{},
+    out: []u16 = &.{},
+    ids: []u32 = &.{},
+
+    fn create() !*PleAhead {
+        const p = try std.heap.page_allocator.create(PleAhead);
+        p.* = .{};
+        for (0..N) |_| {
+            const t = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, worker, .{p});
+            t.detach();
+        }
+        return p;
+    }
+
+    fn work(self: *PleAhead) void {
+        const table = self.table orelse return;
+        const dim: usize = table.dim;
+        const need = dim * 2;
+        while (true) {
+            const i = self.next.fetchAdd(1, .acq_rel);
+            if (i >= self.limit.load(.acquire)) return;
+            // the pooled gather's bytes: one pread of the row, little-endian words
+            const dst = std.mem.sliceAsBytes(self.out[@as(usize, i) * dim ..][0..dim]);
+            const off = table.w_off + @as(usize, @intCast(self.rows[i])) * need;
+            if (std.c.pread(table.fd, dst.ptr, need, @intCast(off)) != @as(isize, @intCast(need))) _ = self.failed.fetchAdd(1, .release);
+        }
+    }
+
+    fn worker(self: *PleAhead) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seen: u32 = 0;
+        while (true) {
+            while (@atomicLoad(u32, &self.gen, .acquire) == seen) io.futexWaitUncancelable(u32, &self.gen, seen);
+            seen = @atomicLoad(u32, &self.gen, .acquire);
+            self.work();
+            _ = self.pending.fetchSub(1, .acq_rel);
+        }
+    }
+
+    /// Rows below `keep` are completed, later ones not started; returns once no worker runs. The caller helps.
+    fn settle(self: *PleAhead, keep: u32) void {
+        if (keep < self.limit.load(.acquire)) self.limit.store(keep, .release);
+        if (self.pending.load(.acquire) == 0) return;
+        self.work();
+        while (self.pending.load(.acquire) != 0) std.atomic.spinLoopHint();
+    }
+
+    fn grow(comptime T: type, buf: *[]T, n: usize) bool {
+        if (buf.len >= n) return true;
+        if (buf.len > 0) std.heap.page_allocator.free(buf.*);
+        buf.* = std.heap.page_allocator.alloc(T, n) catch {
+            buf.* = &.{};
+            return false;
+        };
+        return true;
+    }
+
+    fn post(self: *PleAhead, table: *const NgramTable, hash: *const NgramHash, prev: []const u32, ids: []const i32) bool {
+        if (@import("builtin").cpu.arch.endian() != .little) return false;
+        self.settle(0);
+        if (self.n_rows != 0) ple_ahead_missed += 1;
+        self.n_rows = 0;
+        const n = ids.len;
+        const n_rows = n * hash.n_heads;
+        if (!grow(u32, &self.ids, n) or !grow(i64, &self.rows, n_rows) or !grow(u16, &self.out, n_rows * table.dim)) return false;
+        for (ids, 0..) |v, i| self.ids[i] = @bitCast(v);
+        hash.rowIds(prev, self.ids[0..n], self.rows[0..n_rows]);
+        self.table = table;
+        self.n_rows = n_rows;
+        self.next.store(0, .release);
+        self.failed.store(0, .release);
+        self.limit.store(@intCast(n_rows), .release);
+        self.pending.store(N, .release);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        _ = @atomicRmw(u32, &self.gen, .Add, 1, .release);
+        io.futexWake(u32, &self.gen, N);
+        return true;
+    }
+
+    fn take(self: *PleAhead, table: *const NgramTable, rows: []const i64, out: []u16) usize {
+        if (self.n_rows == 0 or self.table != table) return 0;
+        const k = @min(rows.len, self.n_rows);
+        if (!std.mem.eql(i64, rows[0..k], self.rows[0..k])) return 0; // not this job's rows: the job stays for post() to count
+        self.settle(@intCast(k));
+        self.n_rows = 0;
+        if (self.failed.load(.acquire) != 0) return 0;
+        @memcpy(out[0 .. k * table.dim], self.out[0 .. k * table.dim]);
+        return k;
     }
 };
 

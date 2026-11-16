@@ -184,6 +184,7 @@ step_sushi() {
   cxx="xcrun clang++ -std=c++20 -O2 -mmacosx-version-min=26.2 -Isushi/lib/mlx-src -Isushi/lib/mlxc-src -Isushi/native"
   $cxx -c sushi/native/stage_split.cpp -o sushi/native/stage_split.o
   $cxx -c sushi/native/texas_checkpoint.cpp -o sushi/native/texas_checkpoint.o
+  $cxx -fobjc-arc -c sushi/native/lean_kernel.mm -o sushi/native/lean_kernel.o
   ( cd sushi && .zig-toolchain/zig build -Doptimize=ReleaseFast --prefix "$ROOT/sushi/zig-out" )
   ok "sushi/zig-out/bin/sushi"
 }

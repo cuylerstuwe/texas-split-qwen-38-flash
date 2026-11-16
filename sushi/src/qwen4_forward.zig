@@ -11,6 +11,15 @@ extern "c" fn stage_split_seed_recurrent(conv: mlx.mlx_array, ssm: mlx.mlx_array
 extern "c" fn stage_split_seed_attention(keys: mlx.mlx_array, ks: mlx.mlx_array, kb: mlx.mlx_array, values: mlx.mlx_array, vs: mlx.mlx_array, vb: mlx.mlx_array, pooled: mlx.mlx_array, raw: mlx.mlx_array, len: u64, s: mlx.mlx_stream) c_int;
 extern "c" fn stage_split_seed_end(position: u64) c_int;
 var r64_vladder: ?u32 = null;
+fn r75PadStages() usize {
+    const S = struct {
+        var v: ?usize = null;
+    };
+    if (S.v) |v| return v;
+    S.v = if (std.c.getenv("SUSHI_R75_PAD")) |r| (std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0) else 0;
+    return S.v.?;
+}
+
 fn r64VerifyLadder() u32 {
     if (r64_vladder == null) {
         const raw = std.c.getenv("SUSHI_R64_VERIFY_LADDER");
@@ -415,6 +424,36 @@ pub fn stageCommittedPosition(self: *const Transformer, ctx: *const ForwardCtx) 
         return @intCast(kv.offset);
     }
     return null;
+}
+/// R74: a request resumed from a background park has its layers [first, 48) in its park file until its next stage
+/// call. Restore them into the stage now (stage op 8, what that call would do), so a pull-back can read them.
+/// True: restored at the sequence's committed length.
+pub fn stageUnparkCommitted(self: *const Transformer, ctx: *const ForwardCtx) bool {
+    if (stageSplitFirst() == null or stageTestParkMode() == 2) return false;
+    const position = stageCommittedPosition(self, ctx) orelse return false;
+    return stage_split_unpark(stageOwner(ctx), @intCast(position)) == 1;
+}
+/// R74 test seam (SUSHI_R74_TEST_PARK=1, never set in production): put the sequence into the state a resumed
+/// background request is in, its stage half parked and the slot no longer its own, before forced tokens.
+/// =2: the same without the restore (the behaviour before R74: the stage is given up), to show the seam
+/// reproduces the failure.
+var r74_test_park_env: ?u8 = null;
+fn stageTestParkMode() u8 {
+    if (r74_test_park_env == null) r74_test_park_env = if (std.c.getenv("SUSHI_R74_TEST_PARK")) |e| e[0] -% '0' else 0;
+    return r74_test_park_env.?;
+}
+pub fn stageTestPark() bool {
+    const m = stageTestParkMode();
+    return m == 1 or m == 2;
+}
+/// The other half of the seam, after the park: the stage's slot is not this sequence's any more.
+pub fn stageTestDisown(ctx: *const ForwardCtx) void {
+    stage_split_invalidate_owner(stageOwner(ctx));
+}
+extern "c" fn stage_split_set_pcopy(n: c_int) void;
+/// R74: threads for the prefill chunk copies in and out of the stage's shared memory (0: one memcpy).
+pub fn stageSetPcopy(n: c_int) void {
+    stage_split_set_pcopy(n);
 }
 /// The slot's sequence ended or re-runs from its tokens: drop its parked stage state and residency.
 pub fn stageSplitForget(cache: *const anyopaque) void {
@@ -2482,6 +2521,20 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     // R64: verify ladder for split MTP verify forwards (rows 2..16), SUSHI_R64_VERIFY_LADDER=<stride>.
     const vladder: u32 = if (seq_len > 1 and seq_len <= 16 and stage_first != null and ctx.stage_prefill == 0 and
         ctx.batch_slots == null and !prof.timing and !dt.on) r64VerifyLadder() else 0;
+    // R74: with the ladder, layer 0 goes to the GPU before the n-gram layer asks for the draft ids; queue the ids'
+    // own small operations first, so their readback does not wait behind layer 0 (qwen4_exp.r74IdsEarly).
+    defer if (ctx.ple_ids_early) |early| {
+        _ = mlx.mlx_array_free(early);
+        ctx.ple_ids_early = null;
+    };
+    if (vladder != 0 and ctx.ple_defer and !ctx.skip_ple and ctx.ple_ids_early == null and @import("qwen4_exp.zig").r74IdsEarly()) {
+        const ids_c = try self.plePrepareIds(token_ids);
+        ctx.ple_ids_early = ids_c;
+        const one = [_]mlx.mlx_array{ids_c};
+        const vec = mlx.mlx_vector_array_new_data(&one, one.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_async_eval(vec);
+    }
     var layer_idx: usize = 0;
     // R64 stage head: the stage's top-20 rows when it ran the head for this forward.
     var head_buf: [16 * 40]u32 = undefined;
@@ -2627,6 +2680,21 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
             }
         }
         try prof.lap(mlp_out, .mlp);
+        // R75 fusion calibration (SUSHI_R75_PAD=K, test only): K dependent `x + 0` kernels on the MLP output per layer,
+        // each a barrier-separated stage of its own; values unchanged (bf16 x + 0 = x). Prices one dependent stage.
+        if (r75PadStages() > 0 and seq_len <= 16) {
+            const zero = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var zb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zb);
+            try mlx.check(mlx.mlx_astype(&zb, zero, mlx.mlx_array_dtype(mlp_out), self.s));
+            for (0..r75PadStages()) |_| {
+                var padded = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&padded, mlp_out, zb, self.s));
+                _ = mlx.mlx_array_free(mlp_out);
+                mlp_out = padded;
+            }
+        }
         if (layer_idx == 0) if (Transformer.qwen4_trace) |tr| {
             Qwen4Trace.set(&tr.mixed_mlp, pre2.mixed);
             Qwen4Trace.set(&tr.inj_mlp, pre2.inj);

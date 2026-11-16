@@ -79,8 +79,9 @@ headers.
 
 ## 7. Sushi — `./install.sh sushi`
 
-Fetches Zig, compiles the two native objects (`sushi/native/stage_split.cpp`, the 5090 stage client, and
-`texas_checkpoint.cpp`, the SSD parking helper) with `clang++ -std=c++20`, then
+Fetches Zig, compiles the three native objects (`sushi/native/stage_split.cpp`, the 5090 stage client,
+`texas_checkpoint.cpp`, the SSD parking helper, and `lean_kernel.mm`, the lean custom-kernel path, with
+`-fobjc-arc`) with `clang++ -std=c++20`, then
 `zig build -Doptimize=ReleaseFast` → `sushi/zig-out/bin/sushi`.
 
 ## 8. Host helpers — `./install.sh host`
@@ -117,6 +118,7 @@ variables override the file):
 | `TEXAS_SPLIT_STAGE_TIMEOUT_MS` | 20000 | a stage call slower than this counts as a failure |
 | `TEXAS_SPLIT_DISPLAY_HOLD` | `boot` | hold the display awake around the GPU's cold boot (`always`: whole life) |
 | `TEXAS_SPLIT_VERIFY_PARKS` | 1 | re-read and byte-compare the stage state after every restore |
+| `TEXAS_SPLIT_FAST_FOREGROUND` | 1 | a foreground request with no background request anywhere skips the wait for the engine's drained acknowledgement (`0`: always wait) |
 | `TEXAS_SPLIT_SUSHI_ENV` | — | extra `SUSHI_*` variables for the engine (JSON object), for experiments |
 | `TEXAS_SPLIT_MAX_CONCURRENT` | 1 | requests generating at once, 1–16 (`bin/texas-split concurrency N` writes it); above 1, up to four run through the 5090 on conversation slots (prefill and decode) and the rest run on the Mac |
 | `TEXAS_SPLIT_SLOTS` / `TEXAS_SPLIT_SLOT_ROWS` | 4 / an equal share | conversation slots on the 5090 (at most 4, and at most the concurrency) and the rows each extra slot starts with (Sushi then sizes a slot's rows for each request; `SUSHI_STAGE_SLOT_DYNAMIC=0` in `TEXAS_SPLIT_SUSHI_ENV` keeps the starting share) |

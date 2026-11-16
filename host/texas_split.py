@@ -123,6 +123,9 @@ def cfg_int(key, default):
 # through the 5090 at once, interleaved (each one's 5090 half runs while the Mac works on the others'), and any
 # further ones run every layer on the Mac beside them (Sushi's continuous batching).
 MAX_CONCURRENT = max(1, min(16, cfg_int('TEXAS_SPLIT_MAX_CONCURRENT', 1)))
+# A foreground request while no background request exists takes its priority ticket without waiting for the engine's
+# drained acknowledgement (there is nothing to park). TEXAS_SPLIT_FAST_FOREGROUND=0 restores the wait.
+FAST_FOREGROUND = CFG.get('TEXAS_SPLIT_FAST_FOREGROUND', '1') != '0'
 MAX_SLOTS = max(MAX_SLOTS, MAX_CONCURRENT + 8)
 # Conversation slots on the 5090 stage: 1 when one request runs at a time, else up to 4 (TEXAS_SPLIT_SLOTS). Slot 0
 # is the stage's whole state as before; extra slot k holds STAGE_SLOT_ROWS rows carved from the top of slot 0's
@@ -291,12 +294,58 @@ class ClientGone(Exception):
     pass
 
 
+class SafeIPC(IPC):
+    """The control page with its accesses serialized against `close`: a request thread or `/health` that reaches the
+    page while the host shuts down gets 0 / a no-op instead of dereferencing the closed page (`IPC.close` sets it to
+    None, which the C library dereferences; a host crashed that way at shutdown)."""
+    def __init__(self, path):
+        self._io = threading.Lock()
+        super().__init__(path)
+
+    def get(self, field):
+        with self._io:
+            return super().get(field) if self.page else 0
+
+    def set(self, field, value):
+        with self._io:
+            if self.page:
+                super().set(field, value)
+
+    def close(self):
+        with self._io:
+            if self.page:
+                super().close()
+
+
 class SplitController(Controller):
-    """The leased-hold controller (priority_control.py); only the reported backend differs."""
+    """The leased-hold controller (priority_control.py); the reported backend differs, and (FAST_FOREGROUND) a
+    foreground request with no background request anywhere does not wait for the engine's drained acknowledgement."""
     def snapshot(self):
         value = super().snapshot()
         value['backend'] = BACKEND
         return value
+
+    def enter(self, mode):
+        # A foreground ticket publishes the hold, then waits until Sushi acknowledges it at a boundary with any
+        # background parked. Sushi acknowledges from its idle loop only when its 50 ms wait times out, so a
+        # foreground request with nothing to park waited 15-66 ms. With no background ticket and Sushi reporting no
+        # background (state 0) there is nothing to drain: take the ticket and publish the hold as before, without the
+        # wait. A background request admitted later sees the hold at its first boundary. Leased holds (`control`) and
+        # every case with a background running, parking, parked or restoring wait as before.
+        if not (FAST_FOREGROUND and mode == 'foreground'):
+            return super().enter(mode)
+        ticket = os.urandom(16).hex()
+        with self.condition:
+            live = 'background' in self.tickets.values() or self.ipc.get('state') != 0
+            self.tickets[ticket] = mode
+            seq = self.publish(force=True)
+        if live:
+            try:
+                self.wait_drained(seq)
+            except BaseException:
+                self.leave(ticket)
+                raise
+        return ticket
 
 
 # --- the memory/thermal guard -----------------------------------------------------------------------------
@@ -417,7 +466,7 @@ class Host:
         os.chmod(self.checkpoint_dir / '.owner.lock', 0o600)
         fcntl.flock(self.checkpoint_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.clean_checkpoints()
-        self.ipc = IPC(self.run_dir / 'control.ipc')
+        self.ipc = SafeIPC(self.run_dir / 'control.ipc')
         self.controller = SplitController(self.ipc)
         self.standin = threading.Thread(target=self.stand_in, name='ipc-stand-in', daemon=True)
         self.standin.start()
@@ -716,6 +765,24 @@ class Host:
         # - keep the Mac GPU's clocks up while a decode forward waits for the 5090: a tiny kernel on a Metal queue
         #   of its own every 0.5 ms (touches only its own buffer; outputs unchanged; sushi/FORK.md section 8).
         env.update(SUSHI_R65_GPU_WARM='1')
+        # - host-side time around the Mac's GPU work, all exact (sushi/FORK.md section 16): custom kernels after their
+        #   first application bypass MLX's per-application source rebuild; a split verify queues its n-gram ids ahead
+        #   of layer 0; the next prefill chunk's n-gram rows are read while the current chunk runs; the stage copies
+        #   run on 8 cores; MLX's buffer pool survives chunk boundaries while >= 28 GiB is reclaimable.
+        #   Decode +4%, prefill about 3% less time.
+        env.update(SUSHI_R74_LEAN_KERNELS='1', SUSHI_R74_IDS_EARLY='1', SUSHI_R74_PLE_AHEAD='1', SUSHI_R74_PCOPY='8',
+                   SUSHI_R74_PF_KEEP_POOL='1')
+        # - agent turns and app calls (section 17): logprobs requests keep draft decoding; the answer after a reached
+        #   thinking budget drafts again; a checkpoint where the prompt's first message ends (2048 tokens or more);
+        #   slot 0 kept for a long finished conversation (16384 rows or more) while shorter requests take extra
+        #   slots; an idle allowance that grows with free memory (up to 12 GiB); host-side acceptance by block
+        #   verification (lossless); sampled drafts at the request's own temperature.
+        env.update(SUSHI_R75_LOGPROBS_MTP='1', SUSHI_R75_BUDGET_MTP='1', SUSHI_R75_SYS_CP='2048',
+                   SUSHI_R75_KEEP_SLOT0='16384', SUSHI_R75_IDLE_MAX_GB='12', SUSHI_R64_CPU_ACCEPT='1',
+                   SUSHI_R75_BLOCK_VERIFY='1', SUSHI_R75_DRAFT_TEMP='1')
+        # - short requests (section 18): the budget's last token without a draft round or forward; a foreground reply
+        #   before the end-of-turn work; the cache's count cap evicts entries under 4096 tokens first.
+        env.update(SUSHI_R75_LAST_TOKEN='1', SUSHI_R75_EARLY_REPLY='1', SUSHI_R75_EVICT_SMALL='4096')
         if stage_env:
             # On the split, the windowed MTP depth controller (depth 3, stepped down only on a cold window) instead of
             # the adaptive planner: the planner's measured round-cost table cannot resolve the split's costs, and it
@@ -764,7 +831,7 @@ class Host:
                '--max-resident-models', '1', '--max-resident-mem', '108GB',
                # the split's idle allowance is 2 GB (1 GB Mac-only): its entries also carry their checkpoints (~110 MB
                # each), and an idle conversation that overflows the allowance cannot spill to SSD, it is dropped
-               '--max-concurrent', str(MAX_CONCURRENT if stage_env else 1), '--prefix-cache-entries', '4',
+               '--max-concurrent', str(MAX_CONCURRENT if stage_env else 1), '--prefix-cache-entries', '16',  # was 4 (FORK.md section 17)
                '--prefix-cache-mem', '2GB' if stage_env else '1GB',
                '--prefix-cache-disk', '20GB', '--metrics', '--no-update-check',
                '--log-file', str(self.run_dir / 'sushi-native.log')]

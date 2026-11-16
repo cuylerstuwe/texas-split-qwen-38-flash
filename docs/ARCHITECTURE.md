@@ -180,3 +180,9 @@ does not count while the idle engine has released its wiring: about a minute aft
 macOS unwires its Metal memory, and compressing those pages is the engine giving memory back), holds the display
 awake around the GPU's cold boot, keeps the Mac awake while running, and pins every binary it runs by
 SHA-256.
+
+Priority handshake: a foreground request takes a ticket and publishes the hold on the control page; when a background
+request exists it then waits until the engine acknowledges the hold with that request parked at a boundary. With no
+background request anywhere (no background ticket, the engine reporting none) there is nothing to park and the
+request goes on at once (`TEXAS_SPLIT_FAST_FOREGROUND`; the engine's idle loop acknowledged only every 50 ms, which
+had cost every request 15-66 ms). Control-page accesses are serialized against its close at shutdown.

@@ -2753,8 +2753,9 @@ pub const REDUCE_SHARED_SOURCE: [:0]const u8 = blk: {
     ++ REDUCE_SOURCE[at + stores.len ..];
 };
 
-/// `shared` is the shared expert's raw down projection and `gate[0]` its gate logit, both T = bf16. The gate and the
-/// product round to T at each step MLX's bf16 Sigmoid and Multiply do, so the sum equals the three-op chain's.
+/// `shared` is the shared expert's raw down projection and `gate[row]` that row's gate logit, both T = bf16. The gate
+/// and the product round to T at each step MLX's bf16 Sigmoid and Multiply do, so the sum equals the three-op chain's.
+/// (R75: indexed by row, so verify rows can take it too; one decode row reads gate[0] as before.)
 pub const REDUCE_GATED_SHARED_SOURCE: [:0]const u8 = blk: {
     const stores =
         \\  y[yb + lane] = T(a0);
@@ -2764,7 +2765,7 @@ pub const REDUCE_GATED_SHARED_SOURCE: [:0]const u8 = blk: {
     ;
     const at = std.mem.indexOf(u8, REDUCE_SOURCE, stores).?;
     break :blk REDUCE_SOURCE[0..at] ++
-        \\  const T lg = gate[0];
+        \\  const T lg = gate[row];
         \\  const T ex = T(metal::precise::exp(float(metal::abs(lg))));
         \\  const T rc = T(1.0f / float(T(1.0f + float(ex))));
         \\  const float sig = float(lg < T(0.0f) ? rc : T(1.0f - float(rc)));

@@ -32,6 +32,13 @@ LM head; prefill is pipelined between the two machines and limited by the Mac's 
 its 20 at ~5.6–6.3K tok/s). Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/VALIDATION.md](docs/VALIDATION.md).
 
+**Update 2026-11-15:** decode about 4% faster and prefill about 3% less time on identical work; logprobs requests
+keep MTP drafting (66 -> 124-133 tok/s); short requests much sooner (a 1-token call 240 -> 155 ms at the thinking
+sampler; a cached short call 297 -> 246 ms); faster first turns for new sessions sharing a long system prompt; block
+verification for accepting drafts (lossless). Outputs unchanged throughout. The table above is the 2026-11-11 build's
+measurement. Existing installs: `git pull`, `./install.sh sushi pins`, `bin/texas-split restart`. See
+[CHANGELOG.md](CHANGELOG.md).
+
 **Update 2026-11-13, a fix:** a request whose thinking reached its budget (`reasoning_budget_tokens`, or a
 `reasoning_effort` that sets one) made the engine give the 5090 up and then ignore the budget. It dates from the
 first release and showed the first time a client used budgets. Existing installs: `git pull`,

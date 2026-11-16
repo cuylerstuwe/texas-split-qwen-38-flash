@@ -28,6 +28,24 @@ int gpu_warm_init(void) {
     return g_state > 0 ? 0 : -1;
 }
 
+// R74: a marker in a Metal System Trace: one tick whose command buffer is labelled "r74-mark-<tag>" (measurement
+// only: the engine's alternation windows name themselves in the GPU timeline this way).
+void gpu_warm_mark(int tag) {
+    if (g_state == 0) gpu_warm_init();
+    if (g_state <= 0) return;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        cb.label = [NSString stringWithFormat:@"r74-mark-%d", tag];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        e.label = cb.label;
+        [e setComputePipelineState:g_pso];
+        [e setBuffer:g_buf offset:0 atIndex:0];
+        [e dispatchThreads:MTLSizeMake(256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        [cb commit];
+    }
+}
+
 void gpu_warm_tick(void) {
     if (g_state <= 0) return;
     @autoreleasepool {

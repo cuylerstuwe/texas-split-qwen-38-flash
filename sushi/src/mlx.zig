@@ -364,7 +364,15 @@ pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_k
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
 pub extern "c" fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel;
 pub extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
-pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+/// R74: every kernel application goes through native/lean_kernel.mm, which hands it to mlx-c's
+/// `mlx_fast_metal_kernel_apply` unless SUSHI_R74_LEAN_KERNELS is set and the signature has a plan.
+extern "c" fn sushi_lean_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
+    return sushi_lean_kernel_apply(outputs, cls, inputs, config, s);
+}
+pub extern "c" fn sushi_lean_kernel_stats(v: *[5]u64) void;
+pub extern "c" fn sushi_lean_kernel_mode() c_int;
+pub extern "c" fn sushi_lean_kernel_set(on: c_int) void;
 
 // ── Random ──
 pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;

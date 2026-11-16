@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-11-15: decode +4%, faster short requests, logprobs and agent turns
+
+Existing installs: `git pull`, `./install.sh sushi pins`, `bin/texas-split restart` (Sushi and the host changed; the
+stage server and the driver did not). `./install.sh sushi` now also compiles `sushi/native/lean_kernel.mm`.
+
+Nothing here changes what a request returns: the same operations on the same data (greedy and seeded replies
+byte-identical with and without each change), an exactly lossless acceptance rule, or drafting changes that the
+acceptance rule keeps exact. Each Sushi switch is set by the host; `'0'` (through `TEXAS_SPLIT_SUSHI_ENV`) turns it
+off. Details in `sushi/FORK.md` sections 16-18.
+
+- **Decode +4%, prefill about 3% less time**: host-side time around the Mac's GPU work. Custom kernels after their
+  first application skip MLX's per-application source rebuild (8-17% less CPU per decode round); a split verify
+  queues its n-gram ids ahead of layer 0; the next prefill chunk's n-gram rows are read while the current one runs;
+  the stage copies run on 8 cores; MLX's buffer pool survives chunk boundaries while memory allows.
+- **A second hole in the 2026-11-13 fix**: a thinking budget reached at the boundary where a parked background
+  request resumed still gave the stage up (its state was in the park file); the parked half is now restored first.
+- **Logprobs requests keep MTP drafting**: 66 -> 124-133 tok/s; each token's logprob comes from the verify row that
+  committed it (within 0.007 nats of the serial path's on average, top-5 order identical).
+- **The answer after a reached thinking budget drafts again**: 87-90 -> 144-155 tok/s.
+- **Tool-call turns**: the end-of-turn checkpoint was declined when the next round had been pre-drafted (most
+  tool-call turns), so the next turn prefilled the reply again; it is taken now.
+- **Agent sessions beside short app calls**: a checkpoint where the prompt's first message ends (2048 tokens or more):
+  a new session sharing the block (17.5K tokens in the test) reaches its first token in 0.19 s instead of 2.74 s;
+  the 5090's slot 0 keeps a long finished conversation while shorter requests take extra slots (its next turn's stage
+  seed 12 ms / 49 MB instead of 143 ms / 645 MB at 104K); the idle cache allowance grows with free memory; 16 cache
+  entries instead of 4.
+- **Acceptance by block verification** (Sun et al. 2024): lossless, +0.7% tokens per round at the thinking sampler.
+- **Sampled drafts at the request's own temperature**: unchanged at the thinking sampler (1.0); at 0.7, 11% more
+  accepted drafts per round.
+- **Short requests**: the host no longer waits for the engine's drained acknowledgement when no background request
+  exists (15-66 ms per request; now 2-5 ms before the engine sees it, `TEXAS_SPLIT_FAST_FOREGROUND=0` restores the
+  wait); a foreground reply goes out before the end-of-turn cache work (~27 ms sooner, streamed or not); the token
+  that reaches `max_tokens` is emitted without a draft round or a forward; the cache's count cap evicts short entries
+  first. At the thinking sampler a 1-token call takes 155 ms instead of 240 and a cached short call (31 new tokens, 9
+  generated, streamed) 246 ms instead of 297; with thinking off, 1-token calls ~94 ms instead of ~175.
+- **Host**: the control page is no longer read after it is closed (a host crashed that way at shutdown).
+
+### Validation
+
+Every step was qualified before it reached the service this is developed on: the parking suite 8/8 exact with SSD
+parking with one request at a time and with four, smoke 11/11, the greedy four-turn conversation identical to the
+previous build's, the logprobs and thinking-budget checks, image turns byte-identical to the previous build, and the
+5090 taken away during a split prefill (the request finishes on the Mac). The short-request changes' first
+qualification run caught that replying early to a *background* request let a back-to-back background request be
+refused (429), because the host admits one only once the engine's page says none runs; background replies keep the
+old order. Timings come from split test hosts in OFF/ON/ON/OFF order at nominal thermal pressure with no other GPU
+load and fixed seeds; replies, logprobs and cached-token counts were identical between arms. The README's table is
+still the 2026-11-11 build's measurement. Details in [docs/VALIDATION.md](docs/VALIDATION.md).
+
 ## 2026-11-13: a reached thinking budget lost the 5090 (fixed)
 
 Existing installs: `git pull`, `./install.sh sushi pins`, `bin/texas-split restart` (Sushi changed; the stage server
