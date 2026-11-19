@@ -12,7 +12,8 @@ See README.md and INSTALL.md at the repository root.
 Configuration: texas-split.env at the repository root (written by install.sh; KEY=VALUE lines) and
 TEXAS_SPLIT_* environment variables, which win. The host listens on 127.0.0.1:8003 by default and owns:
 - the stage server (stage/: canon-stage-server, layers 28-47 on the 5090, launched through macuda's
-  nv_shim_step.sh preflight) and the Sushi engine (sushi/) on 127.0.0.1:8014, started in that order;
+  nv_shim_step.sh preflight; the host runs that preflight first and clears a refusal that only says the card
+  was re-enumerated, as after a reboot) and the Sushi engine (sushi/) on 127.0.0.1:8014, started in that order;
 - the API: model ids, request normalization and limits, X-LocalAI-Mode / X-LLM-Priority
   foreground/background with exact-progress parking (priority_control.py: leased holds on
   /v1/scheduler with a private control key, a private IPC page Sushi polls, SSD checkpoints; the
@@ -157,6 +158,16 @@ MAX_BODY = {'foreground': 64 * 1024 ** 2, 'background': 4 * 1024 ** 2}
 # awake from stage launch until this long after it is ready ('always' holds it for the stage's life).
 DISPLAY_HOLD = CFG.get('TEXAS_SPLIT_DISPLAY_HOLD') or 'boot'
 DISPLAY_AFTER_READY = 120
+# macuda's preflight refuses the card after every re-enumeration (a reboot, a sleep/wake or a replug shows as a new
+# TinyGPU dext instance since its record, or as a DART snapshot whose flag has gone) until someone runs
+# tools/dart-stale.sh --clear, and the stage step aborts on it without saying why: every reboot left the service
+# running Mac-only until a person cleared the record. Those two refusals say only that the card was re-enumerated (it
+# comes back reset), so the host clears them itself before each stage launch and logs each clear
+# (egpu-auto-clears.jsonl beside the run directories). Every other refusal (new DART error data, no card on the bus,
+# link down, a wedged dext or server) still leaves the card untouched, with the reasons in the log and /health.
+# TEXAS_SPLIT_EGPU_AUTO_CLEAR=0 restores the manual rule.
+EGPU_REENUM_REASONS = frozenset({'a new dext instance since the record', 'nub re-enumerated since the DART snapshot'})
+EGPU_AUTO_CLEAR = CFG.get('TEXAS_SPLIT_EGPU_AUTO_CLEAR', '1') != '0'
 
 
 _log_lock = threading.Lock()
@@ -165,6 +176,61 @@ _log_lock = threading.Lock()
 def log(msg):
     with _log_lock:
         print(time.strftime('%Y-%m-%d %H:%M:%S ') + msg, flush=True)
+
+
+def egpu_verdict(stdout):
+    """macuda preflight output -> (ok, reasons). An ABORT names every rule that tripped on its verdict line:
+    'VERDICT: ABORT - do not touch the GPU [reason; reason]'. No verdict line (the script failed) is a refusal."""
+    verdicts = [line for line in stdout.splitlines() if line.startswith('VERDICT:')]
+    if not verdicts:
+        return False, ['preflight printed no verdict']
+    if verdicts[-1].startswith('VERDICT: OK'):
+        return True, []
+    m = re.search(r'\[(.*)\]\s*$', verdicts[-1])
+    reasons = [r.strip() for r in m.group(1).split(';') if r.strip()] if m else []
+    return False, reasons or ['unparsed verdict: ' + verdicts[-1][:120]]
+
+
+def boot_epoch(run=subprocess.run):
+    try:
+        out = run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True, timeout=5).stdout
+        return int(re.search(r'sec = (\d+)', out).group(1))
+    except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+        return None
+
+
+def egpu_check(env, clears=None, run=subprocess.run):
+    """macuda's read-only preflight, with a refusal that only says the card was re-enumerated (EGPU_REENUM_REASONS)
+    cleared through tools/dart-stale.sh --clear and checked again. Returns (ok, reasons, record): record describes the
+    automatic clear (also appended to the `clears` file when given), None when there was none."""
+    preflight = ['sh', str(MACUDA / 'tools/preflight.sh')]
+    out = run(preflight, env=env, capture_output=True, text=True, timeout=120).stdout
+    ok, reasons = egpu_verdict(out)
+    if ok or not EGPU_AUTO_CLEAR or not set(reasons) <= EGPU_REENUM_REASONS:
+        return ok, reasons, None
+    rec = dict(when=time.strftime('%Y-%m-%dT%H:%M:%S%z'), action='dart-stale.sh --clear (texas-split host, automatic)',
+               reasons=reasons)
+    boot = boot_epoch(run)
+    if boot:
+        rec['boot'] = time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(boot))
+    m = re.search(r'NEWEST pid (\d+) started (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)', out)
+    if m:
+        rec.update(dext_pid=int(m.group(1)), dext_started=m.group(2))
+        if boot:
+            # the dext starts once the card is matched after boot, minutes later; a label only
+            started = time.mktime(time.strptime(m.group(2), '%Y-%m-%d %H:%M:%S'))
+            rec['cause'] = 'reboot' if started - boot < 1800 else 're-enumerated after boot (replug, sleep/wake or link reset)'
+    rec['clear_rc'] = run(['sh', str(MACUDA / 'tools/dart-stale.sh'), '--clear'], env=env, capture_output=True,
+                          text=True, timeout=30).returncode
+    ok, reasons = egpu_verdict(run(preflight, env=env, capture_output=True, text=True, timeout=120).stdout)
+    rec['after'] = 'OK' if ok else reasons
+    if clears is not None:
+        try:
+            with open(clears, 'a') as f:
+                f.write(json.dumps(rec) + '\n')
+        except OSError:
+            pass
+    return ok, reasons, rec
 
 
 def encode(value):
@@ -452,6 +518,7 @@ class Host:
         self.want_split = not args.mac_only
         self.restore_at = None           # monotonic time of the next attempt to bring the split back
         self.restore_delay = 120
+        self.egpu_refused = None         # the eGPU preflight's reasons at the last stage launch, when it refused
         # Native priority: the private control key, an exclusive checkpoint
         # directory, the private IPC page Sushi polls, and the leased-hold controller.
         if CONTROL_KEY.stat().st_mode & 0o077:
@@ -682,7 +749,8 @@ class Host:
         env.update({k: str(v) for k, v in extra.items() if k.startswith(('QD_', 'QWEN_'))})
         self.hold_display()
         slog = open(self.run_dir / 'stage.log', 'ab', buffering=0)
-        self.ensure_tinygpu_server(env, slog)
+        if self.egpu_preflight(env, slog):
+            self.ensure_tinygpu_server(env, slog)
         self.stage = subprocess.Popen(['sh', str(MACUDA / 'tools/nv_shim_step.sh'), 'local', 'probe', str(STAGE_BIN),
                                        str(STAGE_FIRST), str(STAGE_CAPACITY)], cwd=STAGE_DIR, env=env, stdout=slog,
                                       stderr=subprocess.STDOUT, start_new_session=True)
@@ -695,7 +763,8 @@ class Host:
             if self.stopping.is_set():
                 raise RuntimeError('stopping')
             if self.stage.poll() is not None:
-                raise RuntimeError(f'stage server exited during startup ({self.stage.returncode}); see stage.log')
+                pf = f'; eGPU preflight refused: {"; ".join(self.egpu_refused)}' if self.egpu_refused else ''
+                raise RuntimeError(f'stage server exited during startup ({self.stage.returncode}){pf}; see stage.log')
             if os.path.exists(sock):
                 self.stage_info = dict(first=STAGE_FIRST, capacity=STAGE_CAPACITY, ready_s=round(time.time() - t0, 1))
                 try:
@@ -911,18 +980,36 @@ class Host:
                     pass
                 p.wait(timeout=10)
 
+    def egpu_preflight(self, env, slog):
+        """macuda's read-only preflight, run here before the stage step runs its own (which aborts on any refusal
+        without saying why). A refusal that only says the card was re-enumerated is cleared and checked again
+        (egpu_check). True when the card may be used; otherwise the reasons go to the log and, if the step then aborts,
+        into the launch error (/health's mode_reason)."""
+        self.egpu_refused = None
+        try:
+            ok, reasons, rec = egpu_check(env, clears=self.run_dir.parent / 'egpu-auto-clears.jsonl')
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f'eGPU preflight could not run here ({e}); the stage step runs its own')
+            return False
+        if rec is not None:
+            cause = f' ({rec["cause"]})' if rec.get('cause') else ''
+            note = (f'eGPU: the preflight refused only because the card was re-enumerated{cause}: '
+                    f'{"; ".join(rec["reasons"])}; record cleared automatically, preflight '
+                    + ('OK' if ok else 'still refuses: ' + '; '.join(reasons)))
+            log(note)
+            slog.write(('host: ' + note + '\n').encode())
+        if not ok:
+            self.egpu_refused = reasons
+            log(f'eGPU preflight refuses the card: {"; ".join(reasons)}')
+        return ok
+
     def ensure_tinygpu_server(self, env, slog):
         """The TinyGPU server outlives stage servers. With none listening (after a reboot or a replug) the stage step
         starts one itself, inside its own process group: that group then never empties when the stage server exits, so
         every stop waits out its 90 s and signals the group, killing the TinyGPU server each time. Start it here
-        instead, in a session of its own, after the same read-only preflight the step runs; the step's own `ensure`
-        then finds it listening. Any failure here leaves the step to do it as before."""
+        instead, in a session of its own, once egpu_preflight has passed; the step's own `ensure` then finds it
+        listening. Any failure here leaves the step to do it as before."""
         try:
-            pf = subprocess.run(['sh', str(MACUDA / 'tools/preflight.sh')], env=env, capture_output=True, text=True,
-                                timeout=120)
-            verdict = (pf.stdout.strip().splitlines() or [''])[-1]
-            if 'VERDICT: OK' not in verdict:
-                return
             r = subprocess.run(['sh', str(MACUDA / 'tools/tinygpu-server.sh'), 'ensure'], env=env, capture_output=True,
                                text=True, timeout=60, start_new_session=True)
             slog.write(('host: ' + (r.stdout.strip().splitlines() or ['tinygpu-server ensure: no output'])[-1] + '\n').encode())

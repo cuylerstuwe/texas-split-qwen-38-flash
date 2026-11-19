@@ -119,6 +119,7 @@ variables override the file):
 | `TEXAS_SPLIT_DISPLAY_HOLD` | `boot` | hold the display awake around the GPU's cold boot (`always`: whole life) |
 | `TEXAS_SPLIT_VERIFY_PARKS` | 1 | re-read and byte-compare the stage state after every restore |
 | `TEXAS_SPLIT_FAST_FOREGROUND` | 1 | a foreground request with no background request anywhere skips the wait for the engine's drained acknowledgement (`0`: always wait) |
+| `TEXAS_SPLIT_EGPU_AUTO_CLEAR` | 1 | before each stage launch, clear macuda's preflight record when its only complaint is that the card was re-enumerated (a reboot, sleep/wake or replug), logged in `egpu-auto-clears.jsonl` beside the run directories (`0`: leave it for a person, as before) |
 | `TEXAS_SPLIT_SUSHI_ENV` | — | extra `SUSHI_*` variables for the engine (JSON object), for experiments |
 | `TEXAS_SPLIT_MAX_CONCURRENT` | 1 | requests generating at once, 1–16 (`bin/texas-split concurrency N` writes it); above 1, up to four run through the 5090 on conversation slots (prefill and decode) and the rest run on the Mac |
 | `TEXAS_SPLIT_SLOTS` / `TEXAS_SPLIT_SLOT_ROWS` | 4 / an equal share | conversation slots on the 5090 (at most 4, and at most the concurrency) and the rows each extra slot starts with (Sushi then sizes a slot's rows for each request; `SUSHI_STAGE_SLOT_DYNAMIC=0` in `TEXAS_SPLIT_SUSHI_ENV` keeps the starting share) |
@@ -159,8 +160,10 @@ card (~27 s, the first time after power-on may take longer), then Sushi loads (~
   fault from the card. That record survives a card reset and clears only when the card is re-enumerated:
   replug or power-cycle the enclosure (or reboot). If it reappears after the card works again, macuda's
   `sh third_party/macuda/tools/dart-stale.sh "reason"` records that exact fault data as known, so later
-  preflights only abort on a new fault (`--clear` forgets it). `[a new dext instance since the record]`:
-  the extension restarted; see macuda's `docs/` for its recovery procedure. To share an existing macuda
+  preflights only abort on a new fault (`--clear` forgets it). `[a new dext instance since the record]` and
+  `[nub re-enumerated since the DART snapshot]` mean the card was re-enumerated (a reboot, sleep/wake or replug):
+  the host clears these two itself before each stage launch and logs `record cleared automatically` (see
+  `TEXAS_SPLIT_EGPU_AUTO_CLEAR`); any other reason stays for you, and the host log and `/health` name it. To share an existing macuda
   checkout and its records, set `TEXAS_SPLIT_MACUDA` to it.
 - **`reclaimable memory ... < 82 GiB`**: free memory (quit apps) and `bin/texas-split restart`.
 - **`Pinned file changed since install`**: something was rebuilt; `./install.sh pins`.

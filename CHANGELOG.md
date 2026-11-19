@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-11-19: the 5090 comes back by itself after a reboot
+
+Existing installs: `git pull`, `bin/texas-split restart` (only the host changed).
+
+macuda's preflight refuses the card after every re-enumeration (a reboot, a sleep/wake or a replug: `a new dext
+instance since the record`, or `nub re-enumerated since the DART snapshot`) until someone runs `tools/dart-stale.sh
+--clear`, and the stage step aborts on it without passing on the reasons. So after every reboot the service ran Mac-only,
+retrying the 5090 hourly and failing the same way each time, until a person cleared the record. The host now runs
+the preflight itself before each stage launch (start, restart and every retry). When those two are its only reasons,
+it clears the record, checks again and logs the clear in the host log, `stage.log` and `egpu-auto-clears.jsonl`
+beside the run directories. Any other reason (new DART error data, no card on the bus, link down, a wedged extension
+or server) still leaves the card untouched, and the reasons now appear in the host log and in `/health`'s
+`mode_reason`. Clearing cannot hide a fault: with fault data present and no snapshot, the preflight reads
+`new DART error data`. `TEXAS_SPLIT_EGPU_AUTO_CLEAR=0` keeps the manual rule.
+
+### Validation
+
+`python3 host/tests/test_egpu_preflight.py`: 16 checks with macuda's scripts replaced by fakes (the post-reboot
+verdict, a replug hours after boot, a fault, a wedged server, no card, no verdict, a clear followed by a different
+refusal, the setting off, the host wrapper). On the service this is developed on: the post-reboot records recreated
+by hand, then a restart. The host logged the automatic clear, the 5090 was ready in 30 s, and a request ran split.
+
 ## 2026-11-15: decode +4%, faster short requests, logprobs and agent turns
 
 Existing installs: `git pull`, `./install.sh sushi pins`, `bin/texas-split restart` (Sushi and the host changed; the
